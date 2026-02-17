@@ -1,4 +1,7 @@
+from typing import List, Optional
+
 from vidur.entities.base_entity import BaseEntity
+from vidur.entities.layer_execution_time import LayerExecutionTime
 
 
 class ExecutionTime(BaseEntity):
@@ -24,6 +27,14 @@ class ExecutionTime(BaseEntity):
         prepare_inputs_e2e_time: float,
         process_model_outputs_time: float,
         ray_comm_time: float,
+        # New: per-layer breakdowns and MoE/prefetch parameters
+        layer_executions: Optional[List[LayerExecutionTime]] = None,
+        enable_kv_prefetch: bool = False,
+        # MoE fields
+        moe_routing_time: float = 0.0,
+        moe_expert_compute_time: float = 0.0,
+        moe_expert_load_time: float = 0.0,
+        expert_parallel_comm_time: float = 0.0,
     ) -> None:
         self._id = ExecutionTime.generate_id()
 
@@ -56,7 +67,134 @@ class ExecutionTime(BaseEntity):
         self._process_model_outputs_time = process_model_outputs_time
         self._ray_comm_time = ray_comm_time
 
+        # MoE fields
+        self._moe_routing_time = moe_routing_time
+        self._moe_expert_compute_time = moe_expert_compute_time
+        self._moe_expert_load_time = moe_expert_load_time
+        self._expert_parallel_comm_time = expert_parallel_comm_time
+
+        # Per-layer breakdowns
+        self._enable_kv_prefetch = enable_kv_prefetch
+        self._layer_executions: List[LayerExecutionTime] = (
+            layer_executions if layer_executions is not None else []
+        )
+
+        # Build per-layer breakdowns if not provided
+        if not self._layer_executions:
+            self._build_layer_executions()
+
+        # Apply KV cache prefetch overlap if enabled
+        if self._enable_kv_prefetch:
+            self._apply_kv_prefetch_overlap()
+
+    def _build_layer_executions(self) -> None:
+        """Build per-layer execution time breakdowns from aggregate times."""
+        for i in range(self._num_layers_per_pipeline_stage):
+            attn_compute = (
+                self._attention_layer_pre_proj_execution_time
+                + self._attention_layer_post_proj_execution_time
+                + self._attention_rope_execution_time
+                + self._attention_kv_cache_save_execution_time
+                + self._attention_decode_execution_time
+                + self._attention_prefill_execution_time
+                + self._attn_norm_time
+            )
+
+            is_moe = self._moe_expert_compute_time > 0
+            if is_moe:
+                mlp_compute = (
+                    self._moe_routing_time
+                    + self._moe_expert_compute_time
+                    + self._mlp_norm_time
+                )
+            else:
+                mlp_compute = (
+                    self._mlp_layer_up_proj_execution_time
+                    + self._mlp_layer_down_proj_execution_time
+                    + self._mlp_layer_act_execution_time
+                    + self._mlp_norm_time
+                )
+
+            layer = LayerExecutionTime(
+                layer_index=i,
+                attention_compute_time=attn_compute,
+                mlp_compute_time=mlp_compute,
+                kv_cache_load_time=(
+                    self._attention_decode_execution_time * 0.3
+                    if self._attention_decode_execution_time > 0
+                    else 0.0
+                ),
+                weight_load_time=self._moe_expert_load_time if is_moe else 0.0,
+                tensor_parallel_comm_time=(
+                    self._tensor_parallel_communication_time * 2
+                ),
+                expert_parallel_comm_time=(
+                    self._expert_parallel_comm_time if is_moe else 0.0
+                ),
+                is_moe_layer=is_moe,
+                routing_time=self._moe_routing_time if is_moe else 0.0,
+            )
+            self._layer_executions.append(layer)
+
+    def _apply_kv_prefetch_overlap(self) -> None:
+        """GPU-initiated I/O: prefetch KV cache for next layer overlapped with current compute.
+
+        At the start of layer N, a prefetch of KV cache for layer N+1 is initiated.
+        Layer N+1 cannot start computing until all I/O and comm from layer N is done.
+        The overlap saves time equal to min(current_layer_compute, next_layer_kv_load).
+        """
+        for i in range(len(self._layer_executions) - 1):
+            current = self._layer_executions[i]
+            next_layer = self._layer_executions[i + 1]
+
+            # Prefetch next layer's KV cache during current layer's compute
+            prefetchable = next_layer.kv_cache_load_time
+            available_overlap = current.compute_time
+            overlap = min(prefetchable, available_overlap)
+            next_layer.prefetch_overlap_savings = overlap
+
+    @property
+    def layer_executions(self) -> List[LayerExecutionTime]:
+        return self._layer_executions
+
+    @property
+    def enable_kv_prefetch(self) -> bool:
+        return self._enable_kv_prefetch
+
+    @property
+    def total_prefetch_savings_ms(self) -> float:
+        """Total time saved by KV cache prefetching (ms)."""
+        return sum(l.prefetch_overlap_savings for l in self._layer_executions)
+
+    # ---- MoE properties ----
+
+    @property
+    def moe_routing_time(self) -> float:
+        return self._moe_routing_time
+
+    @property
+    def moe_expert_compute_time(self) -> float:
+        return self._moe_expert_compute_time
+
+    @property
+    def moe_expert_load_time(self) -> float:
+        return self._moe_expert_load_time
+
+    @property
+    def expert_parallel_comm_time(self) -> float:
+        return self._expert_parallel_comm_time
+
+    # ---- Original properties (backward compatible) ----
+
     def _get_mlp_layer_execution_time(self) -> float:
+        if self._moe_expert_compute_time > 0:
+            return (
+                self._moe_routing_time
+                + max(self._moe_expert_compute_time, self._moe_expert_load_time)
+                + self._expert_parallel_comm_time
+                + self._tensor_parallel_communication_time
+                + self._mlp_norm_time
+            )
         return (
             self._mlp_layer_up_proj_execution_time
             + self._mlp_layer_down_proj_execution_time
@@ -179,12 +317,22 @@ class ExecutionTime(BaseEntity):
 
     @property
     def model_time(self) -> float:
-        # we are not counting the execution time for the embedding layer and last softmax layer
+        """Model execution time in seconds."""
+        if self._layer_executions and self._enable_kv_prefetch:
+            # Use per-layer times with prefetch overlap
+            total_layer_time = sum(
+                l.total_time for l in self._layer_executions
+            )
+            pipeline_stage_execution_time = total_layer_time + self._add_time * self._num_layers_per_pipeline_stage
+            return (
+                pipeline_stage_execution_time
+                + self.pipeline_parallel_communication_time
+            ) * 1e-3
+        # Original calculation
         block_execution_time = self._get_block_execution_time()
         pipeline_stage_execution_time = (
             block_execution_time * self._num_layers_per_pipeline_stage
         )
-        # return in seconds
         return (
             pipeline_stage_execution_time + self.pipeline_parallel_communication_time
         ) * 1e-3

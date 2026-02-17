@@ -376,6 +376,10 @@ class MetricsConfig:
         default=False,
         metadata={"help": "Whether to store operation metrics."},
     )
+    store_layer_metrics: bool = field(
+        default=False,
+        metadata={"help": "Whether to store per-layer execution time breakdowns and Gantt plots."},
+    )
     store_token_completion_metrics: bool = field(
         default=False,
         metadata={"help": "Whether to store token completion metrics."},
@@ -442,6 +446,10 @@ class ReplicaConfig:
         default=1,
         metadata={"help": "Tensor parallel size."},
     )
+    expert_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Expert parallel size for MoE models."},
+    )
     device: str = field(
         default="a100",
         metadata={"help": "Device."},
@@ -449,6 +457,10 @@ class ReplicaConfig:
     network_device: str = field(
         default="a100_pairwise_nvlink",
         metadata={"help": "Network device."},
+    )
+    enable_kv_prefetch: bool = field(
+        default=False,
+        metadata={"help": "Enable GPU-initiated KV cache prefetching for next layer."},
     )
 
     def __post_init__(self):

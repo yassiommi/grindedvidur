@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from vidur.config.base_fixed_config import BaseFixedConfig
 from vidur.logger import init_logger
@@ -28,6 +28,32 @@ class BaseModelConfig(BaseFixedConfig):
     rope_scaling: Optional[Dict[str, Any]] = None
     partial_rotary_factor: float = 1.0
     no_tensor_parallel: bool = False
+
+    # MoE fields (defaults for dense models)
+    is_moe: bool = False
+    num_routed_experts: int = 1
+    num_experts_per_tok: int = 1
+    num_shared_experts: int = 0
+    moe_intermediate_size: Optional[int] = None  # None means use mlp_hidden_dim
+
+    # MLA (Multi-head Latent Attention) fields for DeepSeek
+    attention_type: str = "MHA"  # "MHA", "GQA", or "MLA"
+    kv_lora_rank: Optional[int] = None
+    q_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+
+    @property
+    def expert_intermediate_size(self) -> int:
+        """FFN hidden dim used for expert layers."""
+        if self.moe_intermediate_size is not None:
+            return self.moe_intermediate_size
+        return self.mlp_hidden_dim
+
+    @property
+    def head_dim(self) -> int:
+        return self.embedding_dim // self.num_q_heads
 
 
 @dataclass
@@ -212,3 +238,111 @@ class Qwen72BModelConfig(QwenModelConfig):
     @staticmethod
     def get_name():
         return "Qwen/Qwen-72B"
+
+
+# ============================================================
+# MoE Model Configs (based on InferSim model specifications)
+# ============================================================
+
+
+@dataclass
+class DeepSeekV3ModelConfig(BaseModelConfig):
+    """DeepSeek-V3 with MLA attention and 256-expert MoE.
+
+    Architecture uses Multi-head Latent Attention (MLA) with KV LoRA
+    compression and sparse Mixture-of-Experts with 256 routed experts
+    plus 1 shared expert per layer.
+    """
+    num_layers: int = 61
+    num_q_heads: int = 128
+    num_kv_heads: int = 128
+    embedding_dim: int = 7168
+    mlp_hidden_dim: int = 18432  # dense layers (first layer)
+    max_position_embeddings: int = 131072
+    use_gated_mlp: bool = True
+    use_bias: bool = False
+    use_qkv_bias: bool = False
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = True
+    vocab_size: int = 129280
+    rope_theta: Optional[float] = 10000
+
+    # MoE
+    is_moe: bool = True
+    num_routed_experts: int = 256
+    num_experts_per_tok: int = 8
+    num_shared_experts: int = 1
+    moe_intermediate_size: int = 2048
+
+    # MLA (Multi-head Latent Attention)
+    attention_type: str = "MLA"
+    kv_lora_rank: int = 512
+    q_lora_rank: int = 1536
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+
+    @staticmethod
+    def get_name():
+        return "deepseek-ai/DeepSeek-V3"
+
+
+@dataclass
+class Qwen3_30B_A3BModelConfig(BaseModelConfig):
+    """Qwen3-30B-A3B: MoE model with 128 routed experts, 8 active per token."""
+    num_layers: int = 48
+    num_q_heads: int = 32
+    num_kv_heads: int = 4
+    embedding_dim: int = 4096
+    mlp_hidden_dim: int = 11008  # dense fallback
+    max_position_embeddings: int = 131072
+    use_gated_mlp: bool = True
+    use_bias: bool = False
+    use_qkv_bias: bool = True
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = True
+    vocab_size: int = 151936
+    rope_theta: Optional[float] = 1000000
+
+    # MoE
+    is_moe: bool = True
+    num_routed_experts: int = 128
+    num_experts_per_tok: int = 8
+    num_shared_experts: int = 1
+    moe_intermediate_size: int = 1408
+
+    @staticmethod
+    def get_name():
+        return "Qwen/Qwen3-30B-A3B"
+
+
+@dataclass
+class Mixtral8x7BModelConfig(BaseModelConfig):
+    """Mixtral-8x7B: MoE model with 8 routed experts, 2 active per token."""
+    num_layers: int = 32
+    num_q_heads: int = 32
+    num_kv_heads: int = 8
+    embedding_dim: int = 4096
+    mlp_hidden_dim: int = 14336
+    max_position_embeddings: int = 32768
+    use_gated_mlp: bool = True
+    use_bias: bool = False
+    use_qkv_bias: bool = False
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = True
+    vocab_size: int = 32000
+    rope_theta: Optional[float] = 1000000
+
+    # MoE
+    is_moe: bool = True
+    num_routed_experts: int = 8
+    num_experts_per_tok: int = 2
+    num_shared_experts: int = 0
+    moe_intermediate_size: int = 14336
+
+    @staticmethod
+    def get_name():
+        return "mistralai/Mixtral-8x7B-v0.1"

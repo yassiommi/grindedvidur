@@ -22,6 +22,7 @@ from vidur.metrics.constants import (
     TokenMetricsTimeDistribution,
 )
 from vidur.metrics.data_series import DataSeries
+from vidur.metrics.gantt_plotter import LayerTimingStore
 from vidur.metrics.series_average_meter import SeriesAverageMeter
 from vidur.utils.mfu_calculator import MFUCalculator
 
@@ -233,6 +234,9 @@ class MetricsStore:
                     )
                 )
                 self._replica_mfu[replica_idx][stage_idx].put(0, 0)
+
+        # Per-layer timing store for Gantt plots
+        self._layer_timing_store = LayerTimingStore(self._config.output_dir)
 
         self._init_wandb()
 
@@ -484,6 +488,13 @@ class MetricsStore:
         self._store_operation_metrics(dir_plot_path)
         self._store_utilization_metrics(dir_plot_path)
 
+        # Per-layer Gantt plots and data export
+        if self._config.store_layer_metrics:
+            self._layer_timing_store.save_json()
+            self._layer_timing_store.save_csv()
+            self._layer_timing_store.plot_gantt()
+            self._layer_timing_store.plot_summary()
+
     @if_write_metrics
     def on_request_arrival(self, time: float, request: Request) -> None:
         if not self._config.store_request_metrics:
@@ -702,6 +713,16 @@ class MetricsStore:
         self._replica_busy_time[replica_id - 1][stage_id - 1].put(time, 100)
         mfu = self._mfu_calculator.get_mfu(batch_stage)
         self._replica_mfu[replica_id - 1][stage_id - 1].put(time, mfu)
+
+        # Record per-layer timings for Gantt plots
+        if self._config.store_layer_metrics:
+            self._layer_timing_store.record_batch(
+                batch_id=batch_stage._batch_id,
+                replica_id=replica_id,
+                stage_id=stage_id,
+                execution_time=execution_time,
+                batch_start_time=time,
+            )
 
         if not self._config.store_operation_metrics:
             return

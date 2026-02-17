@@ -19,6 +19,11 @@ class OperationMetrics(enum.Enum):
     ADD = "add"
     INPUT_LAYERNORM = "input_layernorm"
     POST_ATTENTION_LAYERNORM = "post_attention_layernorm"
+    # MoE-specific operations
+    MOE_ROUTING = "moe_routing"
+    MOE_EXPERT_COMPUTE = "moe_expert_compute"
+    MOE_EXPERT_LOAD = "moe_expert_load"
+    MOE_EXPERT_PARALLEL_COMM = "moe_expert_parallel_comm"
 
 
 class CpuOperationMetrics(enum.Enum):

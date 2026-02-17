@@ -28,6 +28,7 @@ class BaseExecutionTimePredictor(ABC):
         self._num_layers_per_pipeline_stage = (
             self._model_config.num_layers // self._replica_config.num_pipeline_stages
         )
+        self._enable_kv_prefetch = replica_config.enable_kv_prefetch
 
     def get_execution_time(self, batch: Batch, pipeline_stage: int) -> ExecutionTime:
         if pipeline_stage == self._replica_config.num_pipeline_stages - 1:
@@ -43,6 +44,12 @@ class BaseExecutionTimePredictor(ABC):
             tensor_parallel_communication_time = (
                 self._get_tensor_parallel_communication_time(batch)
             )
+
+        # MoE times (default to 0 for dense models)
+        moe_routing_time = self._get_moe_routing_time(batch)
+        moe_expert_compute_time = self._get_moe_expert_compute_time(batch)
+        moe_expert_load_time = self._get_moe_expert_load_time(batch)
+        expert_parallel_comm_time = self._get_expert_parallel_comm_time(batch)
 
         return ExecutionTime(
             self._num_layers_per_pipeline_stage,
@@ -65,6 +72,11 @@ class BaseExecutionTimePredictor(ABC):
             self._get_prepare_inputs_e2e_time(batch),
             self._get_process_model_outputs_time(batch),
             self._get_ray_comm_time(batch),
+            enable_kv_prefetch=self._enable_kv_prefetch,
+            moe_routing_time=moe_routing_time,
+            moe_expert_compute_time=moe_expert_compute_time,
+            moe_expert_load_time=moe_expert_load_time,
+            expert_parallel_comm_time=expert_parallel_comm_time,
         )
 
     @abstractmethod
@@ -142,3 +154,16 @@ class BaseExecutionTimePredictor(ABC):
     @abstractmethod
     def _get_add_layer_act_execution_time(self, batch: Batch) -> float:
         pass
+
+    # MoE methods - default to 0 for dense models, overridden in MoE-aware predictors
+    def _get_moe_routing_time(self, batch: Batch) -> float:
+        return 0.0
+
+    def _get_moe_expert_compute_time(self, batch: Batch) -> float:
+        return 0.0
+
+    def _get_moe_expert_load_time(self, batch: Batch) -> float:
+        return 0.0
+
+    def _get_expert_parallel_comm_time(self, batch: Batch) -> float:
+        return 0.0
