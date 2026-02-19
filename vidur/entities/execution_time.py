@@ -35,6 +35,12 @@ class ExecutionTime(BaseEntity):
         moe_expert_compute_time: float = 0.0,
         moe_expert_load_time: float = 0.0,
         expert_parallel_comm_time: float = 0.0,
+        # Bandwidth-based KV cache load time per layer (ms), computed from
+        # HBM bandwidth following InferSim's approach.  Used ONLY for
+        # per-layer Gantt breakdown and prefetch-savings calculation — the
+        # profiled attention_decode_execution_time already includes KV loading
+        # implicitly, so this is *not* added to model_time.
+        kv_cache_load_time_per_layer: float = 0.0,
     ) -> None:
         self._id = ExecutionTime.generate_id()
 
@@ -72,6 +78,9 @@ class ExecutionTime(BaseEntity):
         self._moe_expert_compute_time = moe_expert_compute_time
         self._moe_expert_load_time = moe_expert_load_time
         self._expert_parallel_comm_time = expert_parallel_comm_time
+
+        # Bandwidth-based KV I/O estimate (ms) — for Gantt and prefetch only
+        self._kv_cache_load_time_per_layer = kv_cache_load_time_per_layer
 
         # Per-layer breakdowns
         self._enable_kv_prefetch = enable_kv_prefetch
@@ -119,11 +128,7 @@ class ExecutionTime(BaseEntity):
                 layer_index=i,
                 attention_compute_time=attn_compute,
                 mlp_compute_time=mlp_compute,
-                kv_cache_load_time=(
-                    self._attention_decode_execution_time * 0.3
-                    if self._attention_decode_execution_time > 0
-                    else 0.0
-                ),
+                kv_cache_load_time=self._kv_cache_load_time_per_layer,
                 weight_load_time=self._moe_expert_load_time if is_moe else 0.0,
                 tensor_parallel_comm_time=(
                     self._tensor_parallel_communication_time * 2
@@ -317,25 +322,30 @@ class ExecutionTime(BaseEntity):
 
     @property
     def model_time(self) -> float:
-        """Model execution time in seconds."""
-        if self._layer_executions and self._enable_kv_prefetch:
-            # Use per-layer times with prefetch overlap
-            total_layer_time = sum(
-                l.total_time for l in self._layer_executions
-            )
-            pipeline_stage_execution_time = total_layer_time + self._add_time * self._num_layers_per_pipeline_stage
-            return (
-                pipeline_stage_execution_time
-                + self.pipeline_parallel_communication_time
-            ) * 1e-3
-        # Original calculation
+        """Model execution time in seconds.
+
+        The base time always comes from the profiled per-operation values
+        (attention_decode_execution_time etc.), which already implicitly
+        include KV cache loading.
+
+        When KV prefetch is enabled, we subtract the prefetch savings
+        (computed from the *bandwidth-based* KV load estimate) from
+        the profiled base time.  This avoids double-counting: the base
+        time uses real profiled values, and only the prefetch *delta*
+        comes from the first-principles bandwidth model.
+        """
         block_execution_time = self._get_block_execution_time()
         pipeline_stage_execution_time = (
             block_execution_time * self._num_layers_per_pipeline_stage
         )
-        return (
+        base_ms = (
             pipeline_stage_execution_time + self.pipeline_parallel_communication_time
-        ) * 1e-3
+        )
+
+        if self._enable_kv_prefetch and self._layer_executions:
+            base_ms -= self.total_prefetch_savings_ms
+
+        return base_ms * 1e-3
 
     @property
     def model_time_ms(self) -> float:

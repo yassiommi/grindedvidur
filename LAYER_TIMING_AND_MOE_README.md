@@ -49,6 +49,28 @@ These operations are bounded by different resources:
 - **I/O-bound**: KV cache loading, expert weight loading limited by HBM bandwidth
 - **Communication-bound**: All-reduce, expert dispatch/combine limited by NVLink/RDMA
 
+### How I/O is Simulated
+
+Vidur uses two complementary approaches for I/O:
+
+1. **Profiled attention time (base model_time):** Vidur's sklearn-based predictor trains on real GPU kernel traces, so `attention_decode_execution_time` already *implicitly* includes KV cache loading — the profiled kernel's wall-clock time captures whichever resource (compute or memory bandwidth) was the bottleneck.
+
+2. **Bandwidth-based KV load estimate (for prefetch and Gantt):** Following InferSim, we separately compute a first-principles KV cache load time from HBM bandwidth:
+   ```
+   kv_load_time_per_layer = kv_bytes_per_token * avg_kv_length * decode_batch_size / (HBM_bandwidth * efficiency)
+   ```
+   where:
+   - MHA/GQA: `kv_bytes_per_token = 2 * num_kv_heads * head_dim * bytes_per_element`
+   - MLA (DeepSeek-V3): `kv_bytes_per_token = (kv_lora_rank + qk_rope_head_dim) * bytes_per_element`
+   - `efficiency = 0.80` (real workloads achieve ~80% of peak HBM bandwidth)
+   - Bandwidth values come from `device_sku_config` (e.g., A100: 2039 GB/s, H100: 3350 GB/s)
+
+   This bandwidth-based estimate is used for:
+   - Populating `LayerExecutionTime.kv_cache_load_time` in the per-layer Gantt visualization
+   - Computing KV prefetch overlap savings: `overlap = min(current_compute, next_kv_load)`
+
+   It is **not** added to the base `model_time` (which uses profiled values), avoiding double-counting.
+
 ### Per-Layer Execution Breakdown
 
 Each layer now tracks via `LayerExecutionTime`:
@@ -57,8 +79,8 @@ Each layer now tracks via `LayerExecutionTime`:
 |-----------|-------------|-------|
 | `attention_compute_time` | All attention ops (projections + core + norm) | Compute |
 | `mlp_compute_time` | FFN/MoE compute (projections or expert GEMM) | Compute |
-| `kv_cache_load_time` | Loading KV cache from HBM for decode attention | I/O |
-| `weight_load_time` | Loading expert weights from HBM (MoE only) | I/O |
+| `kv_cache_load_time` | KV cache load time from HBM bandwidth model (for Gantt/prefetch) | I/O (bandwidth) |
+| `weight_load_time` | Loading expert weights from HBM (MoE only) | I/O (bandwidth) |
 | `tensor_parallel_comm_time` | TP all-reduce communication | Communication |
 | `expert_parallel_comm_time` | EP dispatch/combine (MoE only) | Communication |
 | `prefetch_overlap_savings` | Time saved by KV prefetching | Optimization |
@@ -242,10 +264,11 @@ python -m vidur.main \
 - `vidur/execution_time_predictor/moe_execution_time_predictor.py` - MoE-aware predictor
 
 **Modified:**
-- `vidur/entities/execution_time.py` - Extended with per-layer breakdowns, MoE fields, prefetch logic
+- `vidur/entities/execution_time.py` - Extended with per-layer breakdowns, MoE fields, prefetch logic, bandwidth-based KV I/O
 - `vidur/config/model_config.py` - Added MoE/MLA fields and DeepSeek/Mixtral/Qwen configs
 - `vidur/config/config.py` - Added `enable_kv_prefetch`, `expert_parallel_size`, `store_layer_metrics`
-- `vidur/execution_time_predictor/base_execution_time_predictor.py` - MoE method hooks
+- `vidur/config/device_sku_config.py` - Added `memory_bandwidth_gb_per_s` to all device SKU configs
+- `vidur/execution_time_predictor/base_execution_time_predictor.py` - MoE method hooks, bandwidth-based `_get_kv_cache_load_time()`
 - `vidur/metrics/metrics_store.py` - Layer timing integration
 - `vidur/metrics/constants.py` - MoE operation metrics
 
@@ -278,11 +301,12 @@ MetricsStore.plot()
 
 ## Integration with InferSim
 
-InferSim provides the analytical framework for MoE timing estimation:
+InferSim provides the analytical framework for MoE timing and KV I/O estimation:
 
 - **FLOPs calculation**: `2*M*N*K` per GEMM, with separate counts for routed and shared experts
 - **MFU (Model FLOPS Utilization)**: Empirical measurements from GPU kernel benchmarks (DeepGEMM, FlashAttention-3, FlashInfer)
-- **I/O modeling**: Expert weight loading bounded by HBM bandwidth (e.g., 2744 GB/s for H800 at 80% efficiency)
+- **KV cache I/O modeling**: `kv_load_time = kv_bytes_per_token * kv_length * batch_size / memory_bandwidth`, where bandwidth comes from `device_sku_config` with 80% efficiency. InferSim returns `max(attn_compute, kv_load)` per layer. Vidur uses the same bandwidth formula for the per-layer Gantt visualization and KV prefetch savings, while keeping its sklearn-profiled base time for the overall model_time.
+- **Expert weight I/O**: `load_time = expert_params * local_experts / memory_bandwidth`, capturing whether expert layers are compute-bound or I/O-bound via `max(compute, load)`
 - **Communication**: Bandwidth-delay model for NVLink and RDMA, with DeepEP-specific dispatch/combine patterns
 
-Vidur's `MoEExecutionTimePredictor` implements these calculations using the same methodology, allowing Vidur's event-driven simulation to accurately model MoE inference at scale.
+Vidur's `MoEExecutionTimePredictor` implements the MoE calculations, and `base_execution_time_predictor` implements the bandwidth-based KV load estimation, allowing Vidur's event-driven simulation to model MoE inference and KV prefetching at scale.

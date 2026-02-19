@@ -67,8 +67,9 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
         dc = self._replica_config.device_config
         self._gpu_fp16_tflops = dc.fp16_flops / 1e12  # Convert to TFLOPS
         self._gpu_memory_gb = dc.total_memory_gb
-        # Estimate memory bandwidth from device type
-        self._gpu_mem_bw_gbs = self._estimate_mem_bandwidth()
+        # Use device config bandwidth (GB/s) with 80% efficiency factor
+        raw_bw = getattr(dc, 'memory_bandwidth_gb_per_s', 0.0)
+        self._gpu_mem_bw_gbs = raw_bw * 0.8 if raw_bw > 0 else 2039 * 0.8
 
         # Expert params size (3 matrices: gate, up, down for gated MLP)
         bytes_per_param = 2  # FP16
@@ -87,18 +88,6 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
             f"{self._num_shared_experts} shared, "
             f"EP={self._expert_parallel_size}"
         )
-
-    def _estimate_mem_bandwidth(self) -> float:
-        """Estimate GPU memory bandwidth in GB/s from device config."""
-        device_type = self._replica_config.device.lower()
-        bandwidth_map = {
-            "a100": 2039,
-            "h100": 3350,
-            "h200": 4800,
-            "h800": 2744,
-            "a40": 696,
-        }
-        return bandwidth_map.get(device_type, 2039) * 0.8  # 80% efficiency
 
     @staticmethod
     def _gemm_flops(m: int, k: int, n: int) -> float:
