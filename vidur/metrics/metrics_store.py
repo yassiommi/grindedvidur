@@ -370,6 +370,22 @@ class MetricsStore:
             file_name="cpu_operation_metrics",
         )
 
+    def _store_request_metrics_csv_only(self):
+        """Save request metrics CSV without generating plots."""
+        if not self._config.store_request_metrics:
+            return
+
+        all_request_metrics = list(
+            self._request_metrics_time_distributions.values()
+        ) + list(self._request_metrics_histogram.values())
+
+        self._save_as_csv(
+            dataseries_list=all_request_metrics,
+            key_to_join=REQUEST_ID_STR,
+            base_path=self._config.output_dir,
+            file_name="request_metrics",
+        )
+
     def _store_request_metrics(self, base_plot_path: str):
         if not self._config.store_request_metrics:
             return
@@ -482,18 +498,31 @@ class MetricsStore:
         dir_plot_path = f"{self._config.output_dir}/plots"
         os.makedirs(dir_plot_path, exist_ok=True)
 
-        self._store_request_metrics(dir_plot_path)
-        self._store_batch_metrics(dir_plot_path)
-        self._store_completion_metrics(dir_plot_path)
-        self._store_operation_metrics(dir_plot_path)
-        self._store_utilization_metrics(dir_plot_path)
+        # Save CSV data first (always works), then try plots (may fail without Chrome)
+        try:
+            self._store_request_metrics(dir_plot_path)
+        except RuntimeError as e:
+            logger.warning(f"Plot generation failed (install Chrome for plots): {e}")
+            # Still save CSV data even if plots fail
+            self._store_request_metrics_csv_only()
+
+        try:
+            self._store_batch_metrics(dir_plot_path)
+            self._store_completion_metrics(dir_plot_path)
+            self._store_operation_metrics(dir_plot_path)
+            self._store_utilization_metrics(dir_plot_path)
+        except RuntimeError as e:
+            logger.warning(f"Some plot generation failed: {e}")
 
         # Per-layer Gantt plots and data export
         if self._config.store_layer_metrics:
             self._layer_timing_store.save_json()
             self._layer_timing_store.save_csv()
-            self._layer_timing_store.plot_gantt()
-            self._layer_timing_store.plot_summary()
+            try:
+                self._layer_timing_store.plot_gantt()
+                self._layer_timing_store.plot_summary()
+            except RuntimeError as e:
+                logger.warning(f"Layer Gantt plot generation failed: {e}")
 
     @if_write_metrics
     def on_request_arrival(self, time: float, request: Request) -> None:

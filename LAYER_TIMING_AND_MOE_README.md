@@ -263,6 +263,111 @@ python -m vidur.main \
 
 ---
 
+## Example Outputs
+
+The `example_outputs/` directory contains actual simulation results from running the examples above.
+
+### Llama-2-7b (Dense, A100, TP=1, Prefetch=ON)
+
+**Command:**
+```bash
+python -m vidur.main \
+    --replica_config_model_name "meta-llama/Llama-2-7b-hf" \
+    --replica_config_device a100 \
+    --replica_config_enable_kv_prefetch \
+    --metrics_config_store_layer_metrics
+```
+
+**Request-Level Results** (128 requests, 2048 prefill + 512 decode tokens each):
+
+| Metric | Value |
+|--------|-------|
+| Simulation time | 235.08s |
+| Mean E2E latency | 337.4 ms |
+| Mean TTFT (time to first token) | 139.3 ms |
+| Mean TPOT (time per output token) | 0.39 ms/token |
+| P99 E2E latency | 368.0 ms |
+
+**Per-Layer Timing** (averaged across decode batches):
+
+| Component | Avg Time (ms) | Description |
+|-----------|--------------|-------------|
+| `attention_compute_time` | 0.14 | Attention projections + core |
+| `mlp_compute_time` | 0.18 | FFN up/down/gate projections |
+| `kv_cache_load_time` | 1.58 | KV cache PCIe transfer (31.5 GB/s) |
+| `tensor_parallel_comm_time` | 0.00 | No TP (single GPU) |
+| `prefetch_overlap_savings` | 0.31 | DMA overlap with compute |
+| **total_time** | **1.59** | Per-layer decode step |
+
+**Gantt Chart** (`example_outputs/llama_2_7b/layer_gantt_batch_0.png`):
+
+The batch 0 Gantt chart shows a prefill batch where all 32 layers are compute-dominated (green bars). With TP=1, there is no communication overhead. The per-layer time is ~1.14 ms, dominated by attention and MLP GEMM operations.
+
+**Summary Plot** (`example_outputs/llama_2_7b/layer_timing_summary.png`):
+
+The stacked bar summary (averaged across all batches including decode) shows that Llama-2-7b on a single A100 is I/O-bound during decode: KV cache loading from host via PCIe (blue, ~1.58 ms) dominates over compute (green, ~0.33 ms). The red dashed prefetch savings line shows ~0.31 ms saved per layer by overlapping KV DMA with compute. Layer 0 has higher effective I/O since it gets no prefetch benefit (no preceding layer to overlap with).
+
+### DeepSeek-V3 (MoE, A100 DGX, TP=8, EP=8, Prefetch=ON)
+
+**Command:**
+```bash
+python -m vidur.main \
+    --replica_config_model_name "deepseek-ai/DeepSeek-V3" \
+    --replica_config_device a100 \
+    --replica_config_network_device a100_dgx \
+    --replica_config_tensor_parallel_size 8 \
+    --replica_config_expert_parallel_size 8 \
+    --replica_config_enable_kv_prefetch \
+    --metrics_config_store_layer_metrics
+```
+
+**Request-Level Results** (128 requests, 2048 prefill + 512 decode tokens each):
+
+| Metric | Value |
+|--------|-------|
+| Simulation time | 242.38s |
+| Mean E2E latency | 4977.0 ms |
+| Mean TTFT (time to first token) | 237.5 ms |
+| Mean TPOT (time per output token) | 9.26 ms/token |
+| P99 E2E latency | 6825.4 ms |
+
+**Per-Layer Timing** (averaged across decode batches):
+
+| Component | Avg Time (ms) | Description |
+|-----------|--------------|-------------|
+| `attention_compute_time` | 0.08 | MLA attention (compressed KV) |
+| `mlp_compute_time` | 0.14 | MoE expert GEMM (8 of 256 experts) |
+| `kv_cache_load_time` | 0.29 | KV cache PCIe transfer (MLA: smaller KV) |
+| `tensor_parallel_comm_time` | 0.13 | TP=8 all-reduce over NVLink |
+| `prefetch_overlap_savings` | 0.18 | DMA overlap with compute |
+| **total_time** | **0.46** | Per-layer decode step |
+
+**Gantt Chart** (`example_outputs/deepseek_v3/layer_gantt_batch_0.png`):
+
+The batch 0 Gantt shows all 61 layers of DeepSeek-V3 with a clear compute (green) + communication (orange) split. With TP=8, the all-reduce communication cost (~0.31 ms) is significant — roughly 30% of per-layer time. Compute takes ~0.70 ms per layer.
+
+**Summary Plot** (`example_outputs/deepseek_v3/layer_timing_summary.png`):
+
+The stacked bar summary shows a balanced profile across compute (green, ~0.22 ms), I/O (blue, ~0.10 ms effective after prefetch), and communication (orange, ~0.13 ms). DeepSeek-V3's MLA attention significantly reduces KV cache size (kv_lora_rank=512 vs full multi-head), leading to much smaller I/O costs compared to Llama-2-7b. The prefetch savings line (red dashed, ~0.18 ms) nearly eliminates the I/O bottleneck.
+
+### Output Files
+
+Each simulation run produces in `simulator_output/<timestamp>/`:
+
+| File | Description |
+|------|-------------|
+| `config.json` | Full simulation configuration |
+| `request_metrics.csv` | Per-request E2E latency, TTFT, TPOT, scheduling delay |
+| `layer_timings.csv` | Per-layer, per-batch timing breakdown (can be very large) |
+| `layer_timings.json` | Same data in JSON format |
+| `plots/layer_gantt_batch_N.png` | Per-batch Gantt chart |
+| `plots/layer_timing_summary.png` | Averaged stacked bar summary |
+| `chrome_trace.json` | Chrome trace viewer format (open in `chrome://tracing`) |
+
+The `example_outputs/` directory contains sample outputs from both runs above, including request metrics CSV, config JSON, layer timing CSV sample (first 200 rows), and Gantt/summary plots.
+
+---
+
 ## Architecture
 
 ### New/Modified Files
