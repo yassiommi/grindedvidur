@@ -91,9 +91,8 @@ class ExecutionTime(BaseEntity):
         if not self._layer_executions:
             self._build_layer_executions()
 
-        # Apply KV cache prefetch overlap if enabled
-        if self._enable_kv_prefetch:
-            self._apply_kv_prefetch_overlap()
+        # Schedule layers with overlap across hardware streams
+        self._schedule_layer_streams()
 
     def _build_layer_executions(self) -> None:
         """Build per-layer execution time breakdowns from aggregate times."""
@@ -140,22 +139,102 @@ class ExecutionTime(BaseEntity):
             )
             self._layer_executions.append(layer)
 
-    def _apply_kv_prefetch_overlap(self) -> None:
-        """GPU-initiated I/O: prefetch KV cache for next layer overlapped with current compute.
+    def _schedule_layer_streams(self) -> None:
+        """Schedule layers across three hardware streams with overlap.
 
-        At the start of layer N, a prefetch of KV cache for layer N+1 is initiated.
-        Layer N+1 cannot start computing until all I/O and comm from layer N is done.
-        The overlap saves time equal to min(current_layer_compute, next_layer_kv_load).
+        Hardware streams (can operate concurrently):
+          SM:   Compute (attention + MLP GEMMs)
+          DMA:  PCIe transfers (KV cache prefetch for next layer)
+          NCCL: All-reduce communication (runs after compute)
+
+        Scheduling rules:
+          1. Layer N compute can start when:
+             - SM is free (previous layer's comm finished)
+             - DMA finished loading layer N's KV (if prefetched by layer N-1)
+          2. DMA prefetch of layer N+1's KV starts at same time as layer N compute
+          3. NCCL all-reduce starts after layer N's SM compute finishes
+          4. MoE weight loading overlaps with expert compute: max(compute, load)
+
+        Without prefetch enabled, I/O runs sequentially before compute.
         """
-        for i in range(len(self._layer_executions) - 1):
-            current = self._layer_executions[i]
-            next_layer = self._layer_executions[i + 1]
+        if not self._layer_executions:
+            return
 
-            # Prefetch next layer's KV cache during current layer's compute
-            prefetchable = next_layer.kv_cache_load_time
-            available_overlap = current.compute_time
-            overlap = min(prefetchable, available_overlap)
-            next_layer.prefetch_overlap_savings = overlap
+        # Track absolute time (ms) when each stream becomes free
+        sm_free = 0.0    # When SM (compute + NCCL) finishes
+        dma_free = 0.0   # When DMA engine finishes
+
+        for i, layer in enumerate(self._layer_executions):
+            compute_dur = layer.compute_time
+            io_dur = layer.io_time          # KV load + weight load
+            comm_dur = layer.comm_time      # all-reduce + EP comm
+
+            if self._enable_kv_prefetch:
+                # Layer N's KV was prefetched by layer N-1's DMA.
+                # Layer N can start compute when BOTH:
+                #   - SM is free (prev layer's comm done)
+                #   - DMA is free (this layer's KV prefetch done)
+                layer_start = max(sm_free, dma_free)
+
+                # SM: runs compute starting at layer_start
+                compute_start_abs = layer_start
+                compute_end_abs = compute_start_abs + compute_dur
+
+                # DMA: starts prefetching NEXT layer's KV at the same time as compute
+                # For this layer, the DMA loads the next layer's KV cache
+                if i < len(self._layer_executions) - 1:
+                    next_io = self._layer_executions[i + 1].io_time
+                else:
+                    next_io = 0.0
+                dma_start_abs = compute_start_abs
+                dma_end_abs = dma_start_abs + next_io
+
+                # Prefetch savings: how much of next layer's I/O overlaps with compute
+                if i < len(self._layer_executions) - 1:
+                    overlap = min(compute_dur, next_io)
+                    self._layer_executions[i + 1].prefetch_overlap_savings = overlap
+
+                # NCCL: starts after compute finishes
+                comm_start_abs = compute_end_abs
+                comm_end_abs = comm_start_abs + comm_dur
+
+                # Record per-stream intervals relative to layer_start
+                layer.compute_start = compute_start_abs - layer_start
+                layer.compute_end = compute_end_abs - layer_start
+                layer.io_start = dma_start_abs - layer_start
+                layer.io_end = dma_end_abs - layer_start
+                layer.comm_start = comm_start_abs - layer_start
+                layer.comm_end = comm_end_abs - layer_start
+
+                # Update stream free times
+                sm_free = comm_end_abs
+                dma_free = dma_end_abs
+
+            else:
+                # No prefetch: I/O runs sequentially before compute
+                layer_start = sm_free
+
+                # I/O first (must load KV before compute can use it)
+                io_start_abs = layer_start
+                io_end_abs = io_start_abs + io_dur
+
+                # Compute after I/O
+                compute_start_abs = io_end_abs
+                compute_end_abs = compute_start_abs + compute_dur
+
+                # Comm after compute
+                comm_start_abs = compute_end_abs
+                comm_end_abs = comm_start_abs + comm_dur
+
+                layer.compute_start = compute_start_abs - layer_start
+                layer.compute_end = compute_end_abs - layer_start
+                layer.io_start = io_start_abs - layer_start
+                layer.io_end = io_end_abs - layer_start
+                layer.comm_start = comm_start_abs - layer_start
+                layer.comm_end = comm_end_abs - layer_start
+
+                sm_free = comm_end_abs
+                dma_free = io_end_abs
 
     @property
     def layer_executions(self) -> List[LayerExecutionTime]:

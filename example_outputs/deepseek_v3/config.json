@@ -55,7 +55,7 @@
             },
             "node_config": {
                 "num_devices_per_node": 8,
-                "intra_node_bw_gb_per_s": 0.0,
+                "intra_node_bw_gb_per_s": 600.0,
                 "device_sku_type": 2,
                 "name": "a100_dgx"
             }
@@ -147,7 +147,7 @@
         "subsamples": null,
         "min_batch_index": null,
         "max_batch_index": null,
-        "output_dir": "simulator_output/2026-02-20_12-28-32-270146",
+        "output_dir": "simulator_output/2026-02-20_16-29-55-829375",
         "cache_dir": "cache"
     }
 }

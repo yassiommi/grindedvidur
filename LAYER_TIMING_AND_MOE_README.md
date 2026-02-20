@@ -114,11 +114,16 @@ Layer N+1:                     [===Compute===][=Remaining KV=][===Comm===]
 
 When `--metrics_config_store_layer_metrics` is set, the simulator produces:
 
-1. **Per-batch Gantt charts** (`plots/layer_gantt_batch_N.png`): Horizontal bar chart showing each layer's compute (green), I/O (blue), and communication (orange) time, with prefetch savings shown as red hatching.
+1. **Per-batch timeline Gantt** (`plots/layer_gantt_batch_N.png`): Each layer is one row. X-axis is wall-clock time (ms). Three hardware streams are drawn as overlapping bars within each row:
+   - **SM (green)**: Compute — dark green for attention, light green for MLP/MoE
+   - **DMA (blue)**: KV cache PCIe transfer — drawn below compute, temporally overlapping
+   - **NCCL (orange)**: All-reduce communication — drawn above compute, starts after SM finishes
+
+   When prefetch is enabled, the DMA bar for layer N starts at the same time as layer N's compute, showing the I/O overlap. The layer cadence is determined by `max(compute + comm, dma_remaining)`.
 
 2. **Summary plot** (`plots/layer_timing_summary.png`): Stacked bar chart averaging all batches, showing the time distribution across layers.
 
-3. **Raw data** (`layer_timings.json`, `layer_timings.csv`): Full per-layer timing data for custom analysis.
+3. **Raw data** (`layer_timings.json`, `layer_timings.csv`): Full per-layer timing data including per-stream start/end offsets for custom analysis.
 
 ---
 
@@ -299,9 +304,11 @@ python -m vidur.main \
 | `prefetch_overlap_savings` | 0.31 | DMA overlap with compute |
 | **total_time** | **1.59** | Per-layer decode step |
 
-**Gantt Chart** (`example_outputs/llama_2_7b/layer_gantt_batch_0.png`):
+**Gantt Charts** (`example_outputs/llama_2_7b/`):
 
-The batch 0 Gantt chart shows a prefill batch where all 32 layers are compute-dominated (green bars). With TP=1, there is no communication overhead. The per-layer time is ~1.14 ms, dominated by attention and MLP GEMM operations.
+The timeline Gantt shows each layer as a row with overlapping stream bars:
+- `layer_gantt_batch_0_prefill.png`: Prefill batch — all 32 layers show only compute (dark green = attention, light green = MLP). With TP=1, no communication bars. Time progresses left-to-right, ~1.14 ms per layer.
+- `layer_gantt_batch_4_decode.png`: Decode batch — now I/O (blue, KV DMA over PCIe) is visible overlapping with compute. The blue bars extend past the green compute, showing the system is **I/O-bound**. The DMA prefetch for layer N+1 runs concurrently with layer N's compute. Layer 31 has no I/O bar (last layer, nothing to prefetch).
 
 **Summary Plot** (`example_outputs/llama_2_7b/layer_timing_summary.png`):
 
@@ -342,9 +349,11 @@ python -m vidur.main \
 | `prefetch_overlap_savings` | 0.18 | DMA overlap with compute |
 | **total_time** | **0.46** | Per-layer decode step |
 
-**Gantt Chart** (`example_outputs/deepseek_v3/layer_gantt_batch_0.png`):
+**Gantt Charts** (`example_outputs/deepseek_v3/`):
 
-The batch 0 Gantt shows all 61 layers of DeepSeek-V3 with a clear compute (green) + communication (orange) split. With TP=8, the all-reduce communication cost (~0.31 ms) is significant — roughly 30% of per-layer time. Compute takes ~0.70 ms per layer.
+The timeline Gantt shows all three hardware streams per layer:
+- `layer_gantt_batch_0_prefill.png`: Prefill, TP=8 — green compute blocks followed by orange all-reduce communication. The compute-then-comm pattern is clearly visible, with the staircase showing how communication serializes after compute.
+- `layer_gantt_batch_4_decode.png`: Decode, TP=8, prefetch=ON — all three streams visible: green compute, blue I/O (DMA, nearly invisible since MLA compresses KV), and orange comm. The I/O is almost fully hidden behind compute, showing that MLA's small KV cache makes DMA prefetch very effective (savings=5.23ms).
 
 **Summary Plot** (`example_outputs/deepseek_v3/layer_timing_summary.png`):
 
