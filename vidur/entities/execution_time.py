@@ -35,11 +35,10 @@ class ExecutionTime(BaseEntity):
         moe_expert_compute_time: float = 0.0,
         moe_expert_load_time: float = 0.0,
         expert_parallel_comm_time: float = 0.0,
-        # Bandwidth-based KV cache load time per layer (ms), computed from
-        # HBM bandwidth following InferSim's approach.  Used ONLY for
-        # per-layer Gantt breakdown and prefetch-savings calculation — the
-        # profiled attention_decode_execution_time already includes KV loading
-        # implicitly, so this is *not* added to model_time.
+        # KV cache load time per layer (ms), computed as kv_bytes / PCIe_bw.
+        # Used ONLY for per-layer Gantt breakdown and prefetch-savings
+        # calculation — the profiled attention_decode_execution_time already
+        # includes KV loading implicitly, so this is *not* added to model_time.
         kv_cache_load_time_per_layer: float = 0.0,
     ) -> None:
         self._id = ExecutionTime.generate_id()
@@ -79,7 +78,7 @@ class ExecutionTime(BaseEntity):
         self._moe_expert_load_time = moe_expert_load_time
         self._expert_parallel_comm_time = expert_parallel_comm_time
 
-        # Bandwidth-based KV I/O estimate (ms) — for Gantt and prefetch only
+        # PCIe-based KV I/O estimate (ms) — for Gantt and prefetch only
         self._kv_cache_load_time_per_layer = kv_cache_load_time_per_layer
 
         # Per-layer breakdowns

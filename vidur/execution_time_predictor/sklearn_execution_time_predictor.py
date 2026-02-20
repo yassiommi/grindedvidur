@@ -43,6 +43,10 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
         )
         os.makedirs(self._cache_dir, exist_ok=True)
 
+        # For MoE models, profiling data comes from a fallback dense model.
+        # _profiling_config holds the model config used for data filtering.
+        self._profiling_config = type(self._model_config).get_profiling_config()
+
         # These overheads are only for GQA models
         self._attention_prefill_batching_overhead_fraction = (
             (self._config.attention_prefill_batching_overhead_fraction)
@@ -96,7 +100,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             input_files[i] = (
                 input_files[i]
                 .replace("{DEVICE}", self._replica_config.device)
-                .replace("{MODEL}", self._model_config.get_name())
+                .replace("{MODEL}", self._model_config.get_profiling_name())
                 .replace("{NETWORK_DEVICE}", self._replica_config.network_device)
             )
 
@@ -116,13 +120,14 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             f"self._num_tensor_parallel_workers: {self._replica_config.tensor_parallel_size}"
         )
 
+        pc = self._profiling_config
         df = df[
-            (df["n_head"] == self._model_config.num_q_heads)
-            & (df["n_kv_head"] == self._model_config.num_kv_heads)
-            & (df["n_embd"] == self._model_config.embedding_dim)
-            & (df["n_expanded_embd"] == self._model_config.mlp_hidden_dim)
-            & (df["use_gated_mlp"] == self._model_config.use_gated_mlp)
-            & (df["vocab_size"] == self._model_config.vocab_size)
+            (df["n_head"] == pc.num_q_heads)
+            & (df["n_kv_head"] == pc.num_kv_heads)
+            & (df["n_embd"] == pc.embedding_dim)
+            & (df["n_expanded_embd"] == pc.mlp_hidden_dim)
+            & (df["use_gated_mlp"] == pc.use_gated_mlp)
+            & (df["vocab_size"] == pc.vocab_size)
             & (
                 df["num_tensor_parallel_workers"]
                 == self._replica_config.tensor_parallel_size
@@ -152,10 +157,11 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
             else:
                 df.fillna({column: 0}, inplace=True)
 
+        pc = self._profiling_config
         return df[
-            (df["n_embd"] == self._model_config.embedding_dim)
-            & (df["n_q_head"] == self._model_config.num_q_heads)
-            & (df["n_kv_head"] == self._model_config.num_kv_heads)
+            (df["n_embd"] == pc.embedding_dim)
+            & (df["n_q_head"] == pc.num_q_heads)
+            & (df["n_kv_head"] == pc.num_kv_heads)
             & (df["block_size"] == self._block_size)
             & (
                 df["num_tensor_parallel_workers"]
@@ -187,7 +193,7 @@ class SklearnExecutionTimePredictor(BaseExecutionTimePredictor):
     def _load_cpu_overhead_df(self, file_path: str) -> pd.DataFrame:
         df = self._read_input_file(file_path)
         filtered_df = df[
-            (df["model_name"] == self._model_config.get_name())
+            (df["model_name"] == self._profiling_config.get_name())
             & (
                 df["tensor_parallel_degree"]
                 == self._replica_config.tensor_parallel_size

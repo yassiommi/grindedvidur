@@ -46,30 +46,32 @@ In transformer inference, each layer performs:
 
 These operations are bounded by different resources:
 - **Compute-bound**: GEMM operations (projections, expert compute) limited by GPU FLOPS
-- **I/O-bound**: KV cache loading, expert weight loading limited by HBM bandwidth
+- **I/O-bound**: KV cache loading bounded by PCIe bandwidth; expert weight loading bounded by HBM bandwidth
 - **Communication-bound**: All-reduce, expert dispatch/combine limited by NVLink/RDMA
 
 ### How I/O is Simulated
 
-Vidur uses two complementary approaches for I/O:
+KV cache I/O is modeled as a PCIe transfer — the KV cache for the next layer is prefetched from host memory to GPU memory over the PCIe bus:
 
-1. **Profiled attention time (base model_time):** Vidur's sklearn-based predictor trains on real GPU kernel traces, so `attention_decode_execution_time` already *implicitly* includes KV cache loading — the profiled kernel's wall-clock time captures whichever resource (compute or memory bandwidth) was the bottleneck.
+```
+kv_load_time_per_layer = kv_bytes / PCIe_bandwidth
+```
 
-2. **Bandwidth-based KV load estimate (for prefetch and Gantt):** Following InferSim, we separately compute a first-principles KV cache load time from HBM bandwidth:
-   ```
-   kv_load_time_per_layer = kv_bytes_per_token * avg_kv_length * decode_batch_size / (HBM_bandwidth * efficiency)
-   ```
-   where:
-   - MHA/GQA: `kv_bytes_per_token = 2 * num_kv_heads * head_dim * bytes_per_element`
-   - MLA (DeepSeek-V3): `kv_bytes_per_token = (kv_lora_rank + qk_rope_head_dim) * bytes_per_element`
-   - `efficiency = 0.80` (real workloads achieve ~80% of peak HBM bandwidth)
-   - Bandwidth values come from `device_sku_config` (e.g., A100: 2039 GB/s, H100: 3350 GB/s)
+where:
+- `kv_bytes = kv_bytes_per_token * avg_kv_length * decode_batch_size`
+- MHA/GQA: `kv_bytes_per_token = 2 * num_kv_heads * head_dim * bytes_per_element`
+- MLA (DeepSeek-V3): `kv_bytes_per_token = (kv_lora_rank + qk_rope_head_dim) * bytes_per_element`
+- `PCIe_bandwidth = pcie_bandwidth_gb_per_s * 0.80` (80% efficiency)
+- PCIe bandwidth values from `device_sku_config` (A40: 31.5 GB/s PCIe4 x16, A100: 31.5 GB/s, H100: 64 GB/s PCIe5 x16)
 
-   This bandwidth-based estimate is used for:
-   - Populating `LayerExecutionTime.kv_cache_load_time` in the per-layer Gantt visualization
-   - Computing KV prefetch overlap savings: `overlap = min(current_compute, next_kv_load)`
+Expert weight loading (MoE) uses HBM bandwidth instead, since expert weights are already in GPU memory:
+- `expert_load_time = expert_params * local_experts / (HBM_bandwidth * 0.80)`
 
-   It is **not** added to the base `model_time` (which uses profiled values), avoiding double-counting.
+Vidur's sklearn-based predictor trains on real GPU kernel traces, so `attention_decode_execution_time` already implicitly includes KV cache loading from the profiled kernel's wall-clock time. The PCIe-based `kv_load_time` is used for:
+- Populating `LayerExecutionTime.kv_cache_load_time` in the per-layer Gantt visualization
+- Computing KV prefetch overlap savings: `overlap = min(current_compute, next_kv_load)`
+
+It is **not** added to the base `model_time` (which uses profiled values), avoiding double-counting. When prefetch is enabled, `model_time = base_profiled_time - total_prefetch_savings`.
 
 ### Per-Layer Execution Breakdown
 
@@ -79,8 +81,8 @@ Each layer now tracks via `LayerExecutionTime`:
 |-----------|-------------|-------|
 | `attention_compute_time` | All attention ops (projections + core + norm) | Compute |
 | `mlp_compute_time` | FFN/MoE compute (projections or expert GEMM) | Compute |
-| `kv_cache_load_time` | KV cache load time from HBM bandwidth model (for Gantt/prefetch) | I/O (bandwidth) |
-| `weight_load_time` | Loading expert weights from HBM (MoE only) | I/O (bandwidth) |
+| `kv_cache_load_time` | KV cache transfer time from host via PCIe (for Gantt/prefetch) | I/O (PCIe) |
+| `weight_load_time` | Loading expert weights from HBM (MoE only) | I/O (HBM) |
 | `tensor_parallel_comm_time` | TP all-reduce communication | Communication |
 | `expert_parallel_comm_time` | EP dispatch/combine (MoE only) | Communication |
 | `prefetch_overlap_savings` | Time saved by KV prefetching | Optimization |
@@ -106,11 +108,11 @@ Layer N+1:                     [===Compute===][=Remaining KV=][===Comm===]
 - Overlap = min(current_layer_compute_time, next_layer_kv_cache_load_time)
 - The last layer gets no prefetch benefit (no layer N+1)
 
-**Enable with:** `--replica_config_enable_kv_prefetch true`
+**Enable with:** `--replica_config_enable_kv_prefetch`
 
 ### Gantt-Style Visualization
 
-When `--metrics_config_store_layer_metrics true` is set, the simulator produces:
+When `--metrics_config_store_layer_metrics` is set, the simulator produces:
 
 1. **Per-batch Gantt charts** (`plots/layer_gantt_batch_N.png`): Horizontal bar chart showing each layer's compute (green), I/O (blue), and communication (orange) time, with prefetch savings shown as red hatching.
 
@@ -200,15 +202,17 @@ DeepEP is the optimized implementation used for DeepSeek-V3 at scale (128 GPUs).
 
 **ReplicaConfig:**
 ```
---replica_config_enable_kv_prefetch true/false  # GPU-initiated KV prefetching
---replica_config_expert_parallel_size N          # Expert parallel degree
+--replica_config_enable_kv_prefetch          # GPU-initiated KV prefetching (flag, no value)
+--replica_config_expert_parallel_size N      # Expert parallel degree
 --replica_config_model_name "deepseek-ai/DeepSeek-V3"  # MoE model
 ```
 
 **MetricsConfig:**
 ```
---metrics_config_store_layer_metrics true  # Enable per-layer Gantt plots
+--metrics_config_store_layer_metrics         # Enable per-layer Gantt plots (flag, no value)
 ```
+
+Note: Boolean flags use `--flag` to enable and `--no-flag` to disable (no `true`/`false` value).
 
 **Model Config (BaseModelConfig) new fields:**
 - `is_moe`: Whether the model uses MoE
@@ -228,8 +232,8 @@ DeepEP is the optimized implementation used for DeepSeek-V3 at scale (128 GPUs).
 python -m vidur.main \
     --replica_config_model_name "meta-llama/Llama-2-7b-hf" \
     --replica_config_device a100 \
-    --replica_config_enable_kv_prefetch true \
-    --metrics_config_store_layer_metrics true
+    --replica_config_enable_kv_prefetch \
+    --metrics_config_store_layer_metrics
 ```
 
 ### DeepSeek-V3 MoE simulation
@@ -237,11 +241,16 @@ python -m vidur.main \
 python -m vidur.main \
     --replica_config_model_name "deepseek-ai/DeepSeek-V3" \
     --replica_config_device a100 \
+    --replica_config_network_device a100_dgx \
     --replica_config_tensor_parallel_size 8 \
     --replica_config_expert_parallel_size 8 \
-    --replica_config_enable_kv_prefetch true \
-    --metrics_config_store_layer_metrics true
+    --replica_config_enable_kv_prefetch \
+    --metrics_config_store_layer_metrics
 ```
+
+Note: TP=8 requires `a100_dgx` network device (DGX has 8-GPU NVSwitch topology).
+MoE models use profiling data from a similar dense model (e.g., Meta-Llama-3-70B for DeepSeek-V3)
+with MoE-specific timing computed analytically.
 
 ### Mixtral-8x7B
 ```bash
@@ -249,7 +258,7 @@ python -m vidur.main \
     --replica_config_model_name "mistralai/Mixtral-8x7B-v0.1" \
     --replica_config_device a100 \
     --replica_config_tensor_parallel_size 2 \
-    --metrics_config_store_layer_metrics true
+    --metrics_config_store_layer_metrics
 ```
 
 ---
@@ -267,8 +276,9 @@ python -m vidur.main \
 - `vidur/entities/execution_time.py` - Extended with per-layer breakdowns, MoE fields, prefetch logic, bandwidth-based KV I/O
 - `vidur/config/model_config.py` - Added MoE/MLA fields and DeepSeek/Mixtral/Qwen configs
 - `vidur/config/config.py` - Added `enable_kv_prefetch`, `expert_parallel_size`, `store_layer_metrics`
-- `vidur/config/device_sku_config.py` - Added `memory_bandwidth_gb_per_s` to all device SKU configs
-- `vidur/execution_time_predictor/base_execution_time_predictor.py` - MoE method hooks, bandwidth-based `_get_kv_cache_load_time()`
+- `vidur/config/device_sku_config.py` - Added `memory_bandwidth_gb_per_s` and `pcie_bandwidth_gb_per_s` to all device SKU configs
+- `vidur/execution_time_predictor/base_execution_time_predictor.py` - MoE method hooks, PCIe-based `_get_kv_cache_load_time()`
+- `vidur/execution_time_predictor/sklearn_execution_time_predictor.py` - Uses `get_profiling_name()` for profiling data lookup
 - `vidur/metrics/metrics_store.py` - Layer timing integration
 - `vidur/metrics/constants.py` - MoE operation metrics
 
@@ -305,8 +315,8 @@ InferSim provides the analytical framework for MoE timing and KV I/O estimation:
 
 - **FLOPs calculation**: `2*M*N*K` per GEMM, with separate counts for routed and shared experts
 - **MFU (Model FLOPS Utilization)**: Empirical measurements from GPU kernel benchmarks (DeepGEMM, FlashAttention-3, FlashInfer)
-- **KV cache I/O modeling**: `kv_load_time = kv_bytes_per_token * kv_length * batch_size / memory_bandwidth`, where bandwidth comes from `device_sku_config` with 80% efficiency. InferSim returns `max(attn_compute, kv_load)` per layer. Vidur uses the same bandwidth formula for the per-layer Gantt visualization and KV prefetch savings, while keeping its sklearn-profiled base time for the overall model_time.
-- **Expert weight I/O**: `load_time = expert_params * local_experts / memory_bandwidth`, capturing whether expert layers are compute-bound or I/O-bound via `max(compute, load)`
+- **KV cache I/O modeling**: `kv_load_time = kv_bytes / PCIe_bandwidth`. The KV cache for the next layer is transferred from host memory over PCIe. Vidur uses PCIe bandwidth from `device_sku_config` (with 80% efficiency) for the per-layer Gantt visualization and prefetch savings, while keeping its sklearn-profiled base time for the overall model_time.
+- **Expert weight I/O**: `load_time = expert_params * local_experts / HBM_bandwidth`, using HBM bandwidth since expert weights reside in GPU memory. Captures whether expert layers are compute-bound or I/O-bound via `max(compute, load)`.
 - **Communication**: Bandwidth-delay model for NVLink and RDMA, with DeepEP-specific dispatch/combine patterns
 
-Vidur's `MoEExecutionTimePredictor` implements the MoE calculations, and `base_execution_time_predictor` implements the bandwidth-based KV load estimation, allowing Vidur's event-driven simulation to model MoE inference and KV prefetching at scale.
+Vidur's `MoEExecutionTimePredictor` implements the MoE calculations, and `base_execution_time_predictor` implements the PCIe-based KV cache load estimation, allowing Vidur's event-driven simulation to model MoE inference and KV prefetching at scale.

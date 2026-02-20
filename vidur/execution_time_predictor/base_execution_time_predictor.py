@@ -9,9 +9,9 @@ from vidur.config import (
 from vidur.entities import Batch, ExecutionTime
 
 
-# Efficiency factor applied to raw peak HBM bandwidth.
-# Real workloads achieve ~80% of peak due to access patterns, TLB misses, etc.
-_MEM_BW_EFFICIENCY = 0.8
+# Efficiency factor applied to raw peak bandwidth (PCIe / HBM).
+# Real workloads achieve ~80% of peak due to protocol overhead, access patterns, etc.
+_BW_EFFICIENCY = 0.8
 
 
 class BaseExecutionTimePredictor(ABC):
@@ -35,10 +35,15 @@ class BaseExecutionTimePredictor(ABC):
         )
         self._enable_kv_prefetch = replica_config.enable_kv_prefetch
 
-        # Effective HBM bandwidth in bytes/s for I/O modeling
+        # PCIe bandwidth in bytes/s for KV cache I/O modeling.
+        # KV cache prefetching transfers data from host memory to GPU over PCIe.
         device_config = replica_config.device_config
-        raw_bw = getattr(device_config, 'memory_bandwidth_gb_per_s', 0.0)
-        self._mem_bw_bytes_per_s = raw_bw * _MEM_BW_EFFICIENCY * (1024 ** 3)
+        pcie_bw = getattr(device_config, 'pcie_bandwidth_gb_per_s', 0.0)
+        self._pcie_bw_bytes_per_s = pcie_bw * _BW_EFFICIENCY * (1024 ** 3)
+
+        # HBM bandwidth in bytes/s (used for expert weight loading in MoE)
+        hbm_bw = getattr(device_config, 'memory_bandwidth_gb_per_s', 0.0)
+        self._mem_bw_bytes_per_s = hbm_bw * _BW_EFFICIENCY * (1024 ** 3)
 
         # KV cache bytes per token per layer (for bandwidth-based load time)
         self._kv_bytes_per_token_per_layer = self._compute_kv_bytes_per_token_per_layer()
@@ -62,14 +67,14 @@ class BaseExecutionTimePredictor(ABC):
         return 2 * mc.num_kv_heads * head_dim * bytes_per_element
 
     def _get_kv_cache_load_time(self, batch: Batch) -> float:
-        """KV cache load time per layer in ms, computed from HBM bandwidth.
+        """KV cache load time per layer in ms, computed from PCIe bandwidth.
 
-        Following InferSim (layers/attn.py):
-            kv_load_time = kv_bytes_per_token * kv_len * batch_size / mem_bw
+        Models KV cache being transferred from host memory to GPU over PCIe:
+            kv_load_time = kv_bytes / PCIe_bandwidth
 
         Returns 0 if no decode tokens or no bandwidth info available.
         """
-        if self._mem_bw_bytes_per_s <= 0:
+        if self._pcie_bw_bytes_per_s <= 0:
             return 0.0
 
         # Collect decode batch size and average KV length from the batch
@@ -85,9 +90,9 @@ class BaseExecutionTimePredictor(ABC):
 
         avg_kv_len = total_kv_tokens / decode_bs
 
-        # bytes = kv_bytes_per_token_per_layer * avg_kv_len * decode_bs
+        # kv_bytes / PCIe_bandwidth
         total_bytes = self._kv_bytes_per_token_per_layer * avg_kv_len * decode_bs
-        load_time_s = total_bytes / self._mem_bw_bytes_per_s
+        load_time_s = total_bytes / self._pcie_bw_bytes_per_s
         return load_time_s * 1e3  # ms
 
     def get_execution_time(self, batch: Batch, pipeline_stage: int) -> ExecutionTime:

@@ -55,6 +55,29 @@ class BaseModelConfig(BaseFixedConfig):
     def head_dim(self) -> int:
         return self.embedding_dim // self.num_q_heads
 
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        """Model name used for profiling data file lookup.
+
+        Dense models use their own name.  MoE models fall back to a
+        similar dense model whose profiling data is available.
+        Override in MoE subclasses.
+        """
+        return cls.get_name()
+
+    @classmethod
+    def get_profiling_config(cls) -> "BaseModelConfig":
+        """Return the model config used for profiling data filtering.
+
+        Dense models return their own config.  MoE models return the
+        fallback model's config so that the profiling data filter
+        (n_head, n_embd, etc.) matches the available profiling data.
+        """
+        profiling_name = cls.get_profiling_name()
+        if profiling_name != cls.get_name():
+            return BaseModelConfig.create_from_name(profiling_name)
+        return cls()
+
 
 @dataclass
 class Llama2ModelConfig(BaseModelConfig):
@@ -287,6 +310,10 @@ class DeepSeekV3ModelConfig(BaseModelConfig):
     def get_name():
         return "deepseek-ai/DeepSeek-V3"
 
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "meta-llama/Meta-Llama-3-70B"
+
 
 @dataclass
 class Qwen3_30B_A3BModelConfig(BaseModelConfig):
@@ -317,6 +344,10 @@ class Qwen3_30B_A3BModelConfig(BaseModelConfig):
     def get_name():
         return "Qwen/Qwen3-30B-A3B"
 
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "meta-llama/Meta-Llama-3-8B"
+
 
 @dataclass
 class Mixtral8x7BModelConfig(BaseModelConfig):
@@ -346,3 +377,7 @@ class Mixtral8x7BModelConfig(BaseModelConfig):
     @staticmethod
     def get_name():
         return "mistralai/Mixtral-8x7B-v0.1"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "meta-llama/Llama-2-7b-hf"
