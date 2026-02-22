@@ -1,0 +1,35 @@
+{
+  "description": "IO vs Compute crossover analysis: KV cache load time grows with sequence length while compute stays relatively constant",
+  "finding": "DeepSeek-V3 is IO-bound in 60.3% of decode batches on A100 PCIe Gen4. Llama-2-7b is IO-bound in nearly all decode batches due to larger KV per token (MHA vs MLA).",
+  "deepseek_v3": {
+    "device": "A100 PCIe Gen4 31.5 GB/s",
+    "config": "TP=8, EP=8, MLA kv_lora_rank=512",
+    "total_decode_batches": 22096,
+    "io_bound_pct": 60.3,
+    "kv_load_range_ms": [
+      0.0872,
+      0.9246
+    ],
+    "compute_range_ms": [
+      0.2041,
+      0.7601
+    ],
+    "median_io_compute_ratio": 1.389,
+    "analytical_crossover_kv_len": 38480
+  },
+  "llama_2_7b": {
+    "device": "A100 PCIe Gen4 31.5 GB/s",
+    "config": "TP=1, MHA",
+    "total_decode_batches": 57639,
+    "io_bound_pct": 100.0,
+    "kv_load_range_ms": [
+      1.2407,
+      4.3869
+    ],
+    "compute_range_ms": [
+      0.3119,
+      1.319
+    ],
+    "median_io_compute_ratio": 4.485
+  }
+}

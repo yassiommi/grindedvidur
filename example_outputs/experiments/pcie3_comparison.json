@@ -1,0 +1,39 @@
+{
+  "description": "PCIe Gen3 (16 GB/s) vs Gen4 (31.5 GB/s) impact on KV cache I/O",
+  "llama_2_7b": {
+    "pcie4_31.5gbps": {
+      "avg_kv_load_ms": 1.5831,
+      "avg_compute_ms": 0.3206,
+      "io_compute_ratio": 4.94,
+      "avg_prefetch_savings_ms": 0.3106,
+      "mean_e2e_latency_ms": 337.4,
+      "mean_tpot_ms": 0.387
+    },
+    "pcie3_16gbps": {
+      "avg_kv_load_ms": 3.1168,
+      "avg_compute_ms": 0.3206,
+      "io_compute_ratio": 9.72,
+      "avg_prefetch_savings_ms": 0.3106,
+      "mean_e2e_latency_ms": 337.2,
+      "mean_tpot_ms": 0.3867
+    }
+  },
+  "deepseek_v3": {
+    "pcie4_31.5gbps": {
+      "avg_kv_load_ms": 0.3202,
+      "avg_compute_ms": 0.2184,
+      "io_compute_ratio": 1.47,
+      "avg_prefetch_savings_ms": 0.1938,
+      "mean_e2e_latency_ms": 4977.0,
+      "mean_tpot_ms": 9.2567
+    },
+    "pcie3_16gbps": {
+      "avg_kv_load_ms": 0.6139,
+      "avg_compute_ms": 0.2183,
+      "io_compute_ratio": 2.81,
+      "avg_prefetch_savings_ms": 0.2052,
+      "mean_e2e_latency_ms": 4578.2,
+      "mean_tpot_ms": 8.5699
+    }
+  }
+}

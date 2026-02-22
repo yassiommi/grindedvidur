@@ -1,0 +1,86 @@
+{
+  "description": "DeepSeek-V3 IO vs Compute: varying QPS to change decode batch sizes",
+  "model": "deepseek-ai/DeepSeek-V3",
+  "device": "A100 (PCIe Gen4 31.5 GB/s)",
+  "config": "TP=8, EP=8, prefetch=ON",
+  "sweep_results": [
+    {
+      "qps": 0.5,
+      "total_decode_batches": 22096,
+      "io_bound_batches": 13319,
+      "io_bound_pct": 60.3,
+      "avg_kv_load_ms": 0.2904,
+      "avg_compute_ms": 0.2164,
+      "max_kv_load_ms": 0.9246,
+      "max_compute_ms": 0.7601,
+      "median_ratio": 1.389,
+      "p90_ratio": 2.393,
+      "p95_ratio": 2.907
+    },
+    {
+      "qps": 1.0,
+      "total_decode_batches": 22096,
+      "io_bound_batches": 13319,
+      "io_bound_pct": 60.3,
+      "avg_kv_load_ms": 0.2904,
+      "avg_compute_ms": 0.2164,
+      "max_kv_load_ms": 0.9246,
+      "max_compute_ms": 0.7601,
+      "median_ratio": 1.389,
+      "p90_ratio": 2.393,
+      "p95_ratio": 2.907
+    },
+    {
+      "qps": 2.0,
+      "total_decode_batches": 22096,
+      "io_bound_batches": 13319,
+      "io_bound_pct": 60.3,
+      "avg_kv_load_ms": 0.2904,
+      "avg_compute_ms": 0.2164,
+      "max_kv_load_ms": 0.9246,
+      "max_compute_ms": 0.7601,
+      "median_ratio": 1.389,
+      "p90_ratio": 2.393,
+      "p95_ratio": 2.907
+    },
+    {
+      "qps": 4.0,
+      "total_decode_batches": 22096,
+      "io_bound_batches": 13319,
+      "io_bound_pct": 60.3,
+      "avg_kv_load_ms": 0.2904,
+      "avg_compute_ms": 0.2164,
+      "max_kv_load_ms": 0.9246,
+      "max_compute_ms": 0.7601,
+      "median_ratio": 1.389,
+      "p90_ratio": 2.393,
+      "p95_ratio": 2.907
+    },
+    {
+      "qps": 8.0,
+      "total_decode_batches": 22096,
+      "io_bound_batches": 13319,
+      "io_bound_pct": 60.3,
+      "avg_kv_load_ms": 0.2904,
+      "avg_compute_ms": 0.2164,
+      "max_kv_load_ms": 0.9246,
+      "max_compute_ms": 0.7601,
+      "median_ratio": 1.389,
+      "p90_ratio": 2.393,
+      "p95_ratio": 2.907
+    },
+    {
+      "qps": 16.0,
+      "total_decode_batches": 22096,
+      "io_bound_batches": 13319,
+      "io_bound_pct": 60.3,
+      "avg_kv_load_ms": 0.2904,
+      "avg_compute_ms": 0.2164,
+      "max_kv_load_ms": 0.9246,
+      "max_compute_ms": 0.7601,
+      "median_ratio": 1.389,
+      "p90_ratio": 2.393,
+      "p95_ratio": 2.907
+    }
+  ]
+}
