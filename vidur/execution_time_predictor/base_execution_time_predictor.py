@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import List, Optional
 
 from vidur.config import (
     BaseExecutionTimePredictorConfig,
@@ -116,6 +117,9 @@ class BaseExecutionTimePredictor(ABC):
         moe_expert_load_time = self._get_moe_expert_load_time(batch)
         expert_parallel_comm_time = self._get_expert_parallel_comm_time(batch)
 
+        # Per-layer weight load times (CPU-offloaded vs GPU-resident)
+        per_layer_weight_load_times = self._get_per_layer_weight_load_times()
+
         # Bandwidth-based KV cache load time per layer
         kv_cache_load_time = self._get_kv_cache_load_time(batch)
 
@@ -146,6 +150,7 @@ class BaseExecutionTimePredictor(ABC):
             moe_expert_load_time=moe_expert_load_time,
             expert_parallel_comm_time=expert_parallel_comm_time,
             kv_cache_load_time_per_layer=kv_cache_load_time,
+            per_layer_weight_load_times=per_layer_weight_load_times,
         )
 
     @abstractmethod
@@ -223,6 +228,13 @@ class BaseExecutionTimePredictor(ABC):
     @abstractmethod
     def _get_add_layer_act_execution_time(self, batch: Batch) -> float:
         pass
+
+    # Per-layer weight load times - returns None by default (uniform loading).
+    # Overridden in MoE-aware predictors to support CPU-offloaded weights.
+    def _get_per_layer_weight_load_times(self) -> Optional[List[float]]:
+        if hasattr(self, 'get_per_layer_weight_load_times'):
+            return self.get_per_layer_weight_load_times()
+        return None
 
     # MoE methods - default to 0 for dense models, overridden in MoE-aware predictors
     def _get_moe_routing_time(self, batch: Batch) -> float:

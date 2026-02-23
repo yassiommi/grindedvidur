@@ -8,12 +8,12 @@ from vidur.config import (
     MetricsConfig,
     ReplicaConfig,
 )
-from vidur.execution_time_predictor.sklearn_execution_time_predictor import (
-    SklearnExecutionTimePredictor,
+from vidur.execution_time_predictor.moe_execution_time_predictor import (
+    MoEExecutionTimePredictor,
 )
 
 
-class LinearRegressionExecutionTimePredictor(SklearnExecutionTimePredictor):
+class LinearRegressionExecutionTimePredictor(MoEExecutionTimePredictor):
     def __init__(
         self,
         predictor_config: LinearRegressionExecutionTimePredictorConfig,

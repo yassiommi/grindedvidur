@@ -12,9 +12,15 @@ Based on InferSim's simulation methodology:
   - Latency = GFLOPs / (GPU_TFLOPS * 1024 * MFU)
   - Expert loading time = expert_params / memory_bandwidth
   - MoE layer time = max(compute_time, load_time) + shared_expert_time
+
+Supports CPU-offloaded expert weights (--n_cpu_moe N):
+  - First N MoE layers load expert weights over PCIe (CPU -> GPU)
+  - Remaining layers load from GPU HBM (fast path)
+  - Enables memory/latency tradeoff analysis
 """
 
 import math
+from typing import List
 
 from vidur.config import (
     BaseExecutionTimePredictorConfig,
@@ -50,6 +56,7 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
 
         self._is_moe = getattr(self._model_config, 'is_moe', False)
         self._expert_parallel_size = getattr(replica_config, 'expert_parallel_size', 1)
+        self._n_cpu_moe = getattr(replica_config, 'n_cpu_moe', 0)
 
         if self._is_moe:
             self._setup_moe_params()
@@ -65,7 +72,7 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
 
         # GPU specs for FLOPs-based estimation
         dc = self._replica_config.device_config
-        self._gpu_fp16_tflops = dc.fp16_flops / 1e12  # Convert to TFLOPS
+        self._gpu_fp16_tflops = dc.fp16_tflops  # Already in TFLOPS
         self._gpu_memory_gb = dc.total_memory_gb
         # Use device config bandwidth (GB/s) with 80% efficiency factor
         raw_bw = getattr(dc, 'memory_bandwidth_gb_per_s', 0.0)
@@ -82,12 +89,30 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
         # Default MFU for MoE GEMM operations (from InferSim benchmarks)
         self._moe_gemm_mfu = 0.15  # Grouped GEMM typically achieves lower MFU
 
+        # Precompute per-layer weight load times for CPU (PCIe) vs GPU (HBM)
+        total_expert_bytes = self._expert_params_bytes * self._local_experts
+        hbm_bw_bytes = self._gpu_mem_bw_gbs * 1024 * 1024 * 1024
+        pcie_bw_bytes = self._pcie_bw_bytes_per_s  # Already includes 0.8 efficiency
+
+        self._weight_load_hbm_ms = (total_expert_bytes / hbm_bw_bytes) * 1e3
+        self._weight_load_pcie_ms = (
+            (total_expert_bytes / pcie_bw_bytes) * 1e3 if pcie_bw_bytes > 0
+            else self._weight_load_hbm_ms
+        )
+
         logger.info(
             f"MoE config: {self._num_routed_experts} experts, "
             f"{self._num_experts_per_tok} per token, "
             f"{self._num_shared_experts} shared, "
-            f"EP={self._expert_parallel_size}"
+            f"EP={self._expert_parallel_size}, "
+            f"n_cpu_moe={self._n_cpu_moe}"
         )
+        if self._n_cpu_moe > 0:
+            logger.info(
+                f"  CPU-offloaded weight load: {self._weight_load_pcie_ms:.4f} ms/layer (PCIe), "
+                f"GPU-resident weight load: {self._weight_load_hbm_ms:.4f} ms/layer (HBM), "
+                f"ratio: {self._weight_load_pcie_ms / max(self._weight_load_hbm_ms, 1e-12):.1f}x"
+            )
 
     @staticmethod
     def _gemm_flops(m: int, k: int, n: int) -> float:
@@ -147,13 +172,33 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
         """Expert weight loading time from HBM (I/O bound).
 
         Following InferSim: load_time = expert_params * local_experts / mem_bandwidth
+
+        This returns the *default* (GPU-resident) load time.  Per-layer
+        differentiation (CPU vs GPU) is handled via get_per_layer_weight_load_times().
         """
         if not self._is_moe:
             return 0.0
 
-        total_expert_bytes = self._expert_params_bytes * self._local_experts
-        load_time_s = total_expert_bytes / (self._gpu_mem_bw_gbs * 1024 * 1024 * 1024)
-        return load_time_s * 1e3  # ms
+        return self._weight_load_hbm_ms
+
+    def get_per_layer_weight_load_times(self) -> List[float]:
+        """Return per-layer expert weight load times accounting for CPU offloading.
+
+        Layers 0..n_cpu_moe-1: load weights over PCIe (CPU-resident)
+        Layers n_cpu_moe..end:  load weights from HBM (GPU-resident)
+
+        Returns a list of length num_layers_per_pipeline_stage.
+        """
+        if not self._is_moe:
+            return [0.0] * self._num_layers_per_pipeline_stage
+
+        result = []
+        for i in range(self._num_layers_per_pipeline_stage):
+            if i < self._n_cpu_moe:
+                result.append(self._weight_load_pcie_ms)
+            else:
+                result.append(self._weight_load_hbm_ms)
+        return result
 
     def _get_expert_parallel_comm_time(self, batch: Batch) -> float:
         """Expert parallelism dispatch/combine communication time.

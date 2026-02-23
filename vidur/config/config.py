@@ -462,6 +462,13 @@ class ReplicaConfig:
         default=False,
         metadata={"help": "Enable GPU-initiated KV cache prefetching for next layer."},
     )
+    n_cpu_moe: int = field(
+        default=0,
+        metadata={
+            "help": "Keep MoE expert weights of the first N layers on CPU. "
+                    "These layers load weights over PCIe instead of from GPU HBM."
+        },
+    )
 
     def __post_init__(self):
         self.world_size = self.num_pipeline_stages * self.tensor_parallel_size

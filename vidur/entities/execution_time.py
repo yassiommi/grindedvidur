@@ -40,6 +40,11 @@ class ExecutionTime(BaseEntity):
         # calculation — the profiled attention_decode_execution_time already
         # includes KV loading implicitly, so this is *not* added to model_time.
         kv_cache_load_time_per_layer: float = 0.0,
+        # Per-layer expert weight load times (ms).  When n_cpu_moe > 0,
+        # the first N entries use PCIe bandwidth (slow) and the rest use
+        # HBM bandwidth (fast).  None means uniform (all layers use
+        # moe_expert_load_time).
+        per_layer_weight_load_times: Optional[List[float]] = None,
     ) -> None:
         self._id = ExecutionTime.generate_id()
 
@@ -81,6 +86,9 @@ class ExecutionTime(BaseEntity):
         # PCIe-based KV I/O estimate (ms) — for Gantt and prefetch only
         self._kv_cache_load_time_per_layer = kv_cache_load_time_per_layer
 
+        # Per-layer expert weight load times (CPU-offloaded vs GPU-resident)
+        self._per_layer_weight_load_times = per_layer_weight_load_times
+
         # Per-layer breakdowns
         self._enable_kv_prefetch = enable_kv_prefetch
         self._layer_executions: List[LayerExecutionTime] = (
@@ -95,7 +103,12 @@ class ExecutionTime(BaseEntity):
         self._schedule_layer_streams()
 
     def _build_layer_executions(self) -> None:
-        """Build per-layer execution time breakdowns from aggregate times."""
+        """Build per-layer execution time breakdowns from aggregate times.
+
+        When per_layer_weight_load_times is provided (n_cpu_moe > 0),
+        each layer gets its own weight_load_time reflecting whether
+        expert weights are on CPU (PCIe) or GPU (HBM).
+        """
         for i in range(self._num_layers_per_pipeline_stage):
             attn_compute = (
                 self._attention_layer_pre_proj_execution_time
@@ -114,6 +127,11 @@ class ExecutionTime(BaseEntity):
                     + self._moe_expert_compute_time
                     + self._mlp_norm_time
                 )
+                # Use per-layer weight load time if available
+                if self._per_layer_weight_load_times is not None:
+                    layer_weight_load = self._per_layer_weight_load_times[i]
+                else:
+                    layer_weight_load = self._moe_expert_load_time
             else:
                 mlp_compute = (
                     self._mlp_layer_up_proj_execution_time
@@ -121,13 +139,14 @@ class ExecutionTime(BaseEntity):
                     + self._mlp_layer_act_execution_time
                     + self._mlp_norm_time
                 )
+                layer_weight_load = 0.0
 
             layer = LayerExecutionTime(
                 layer_index=i,
                 attention_compute_time=attn_compute,
                 mlp_compute_time=mlp_compute,
                 kv_cache_load_time=self._kv_cache_load_time_per_layer,
-                weight_load_time=self._moe_expert_load_time if is_moe else 0.0,
+                weight_load_time=layer_weight_load,
                 tensor_parallel_comm_time=(
                     self._tensor_parallel_communication_time * 2
                 ),
@@ -269,11 +288,16 @@ class ExecutionTime(BaseEntity):
 
     # ---- Original properties (backward compatible) ----
 
-    def _get_mlp_layer_execution_time(self) -> float:
+    def _get_mlp_layer_execution_time(self, layer_idx: int = 0) -> float:
         if self._moe_expert_compute_time > 0:
+            # Use per-layer weight load time if available (n_cpu_moe)
+            if self._per_layer_weight_load_times is not None:
+                load_time = self._per_layer_weight_load_times[layer_idx]
+            else:
+                load_time = self._moe_expert_load_time
             return (
                 self._moe_routing_time
-                + max(self._moe_expert_compute_time, self._moe_expert_load_time)
+                + max(self._moe_expert_compute_time, load_time)
                 + self._expert_parallel_comm_time
                 + self._tensor_parallel_communication_time
                 + self._mlp_norm_time
@@ -298,10 +322,10 @@ class ExecutionTime(BaseEntity):
             + self._attn_norm_time
         )
 
-    def _get_block_execution_time(self) -> float:
+    def _get_block_execution_time(self, layer_idx: int = 0) -> float:
         return (
             self._get_attention_layer_execution_time()
-            + self._get_mlp_layer_execution_time()
+            + self._get_mlp_layer_execution_time(layer_idx)
             + self._add_time
         )
 
@@ -406,16 +430,27 @@ class ExecutionTime(BaseEntity):
         (attention_decode_execution_time etc.), which already implicitly
         include KV cache loading.
 
+        When per_layer_weight_load_times is set (n_cpu_moe > 0), each
+        layer may have a different MLP execution time due to CPU vs GPU
+        weight loading, so we sum per-layer instead of multiplying.
+
         When KV prefetch is enabled, we subtract the prefetch savings
         (computed from the *bandwidth-based* KV load estimate) from
         the profiled base time.  This avoids double-counting: the base
         time uses real profiled values, and only the prefetch *delta*
         comes from the first-principles bandwidth model.
         """
-        block_execution_time = self._get_block_execution_time()
-        pipeline_stage_execution_time = (
-            block_execution_time * self._num_layers_per_pipeline_stage
-        )
+        if self._per_layer_weight_load_times is not None:
+            # Per-layer sum: each layer may have different weight load time
+            pipeline_stage_execution_time = sum(
+                self._get_block_execution_time(i)
+                for i in range(self._num_layers_per_pipeline_stage)
+            )
+        else:
+            block_execution_time = self._get_block_execution_time()
+            pipeline_stage_execution_time = (
+                block_execution_time * self._num_layers_per_pipeline_stage
+            )
         base_ms = (
             pipeline_stage_execution_time + self.pipeline_parallel_communication_time
         )
