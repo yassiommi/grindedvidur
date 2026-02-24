@@ -20,9 +20,6 @@
 
 Large MoE models like Qwen3-Coder-Next (80B total / 3B active) present a unique deployment challenge: the model's total weight exceeds typical single-GPU VRAM, but its *active* compute footprint is tiny. This creates a scenario where keeping some expert weights on CPU memory and computing them there can actually *outperform* dynamically transferring weights to GPU over PCIe.
 
-A real-world user reported this exact observation:
-
-> "With `n_cpu_moe 37`, the 37 CPU layers cost about 25–35 ms, plus ~5 ms GPU compute → **~30 TPS**. But dynamically transferring ~1.5 GB over PCIe Gen4 at ~25 GB/s takes 40–60 ms → **~20 TPS**. This only happens when VRAM < total model weights."
 
 This experiment quantifies both strategies across varying `n_cpu_moe` values and VRAM levels, identifying the exact crossover point where each strategy wins.
 
