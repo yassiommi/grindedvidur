@@ -350,6 +350,46 @@ class Qwen3_30B_A3BModelConfig(BaseModelConfig):
 
 
 @dataclass
+class Qwen3CoderNext80B_A3BModelConfig(BaseModelConfig):
+    """Qwen3-Coder-Next 80B-A3B: Hybrid Transformer-Mamba MoE.
+
+    80B total params, 3B active per token.  512 routed experts with
+    10 active per token plus 1 shared expert.  Hybrid attention uses
+    Gated DeltaNet (3/4 of layers) + Gated Attention (1/4 of layers);
+    modeled here as GQA for profiling purposes.
+    """
+    num_layers: int = 48
+    num_q_heads: int = 16
+    num_kv_heads: int = 2
+    embedding_dim: int = 2048
+    mlp_hidden_dim: int = 5504  # dense fallback
+    max_position_embeddings: int = 262144
+    use_gated_mlp: bool = True
+    use_bias: bool = False
+    use_qkv_bias: bool = True
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = True
+    vocab_size: int = 151936
+    rope_theta: Optional[float] = 1000000
+
+    # MoE: 512 routed experts, 10 active/token, 1 shared
+    is_moe: bool = True
+    num_routed_experts: int = 512
+    num_experts_per_tok: int = 10
+    num_shared_experts: int = 1
+    moe_intermediate_size: int = 512
+
+    @staticmethod
+    def get_name():
+        return "Qwen/Qwen3-Coder-Next-80B-A3B"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "meta-llama/Meta-Llama-3-8B"
+
+
+@dataclass
 class Mixtral8x7BModelConfig(BaseModelConfig):
     """Mixtral-8x7B: MoE model with 8 routed experts, 2 active per token."""
     num_layers: int = 32

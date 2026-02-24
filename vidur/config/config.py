@@ -469,6 +469,13 @@ class ReplicaConfig:
                     "These layers load weights over PCIe instead of from GPU HBM."
         },
     )
+    weight_bytes_per_param: int = field(
+        default=2,
+        metadata={
+            "help": "Bytes per parameter for expert weights. "
+                    "2 for FP16/BF16, 1 for FP8 (E4M3/E5M2)."
+        },
+    )
 
     def __post_init__(self):
         self.world_size = self.num_pipeline_stages * self.tensor_parallel_size

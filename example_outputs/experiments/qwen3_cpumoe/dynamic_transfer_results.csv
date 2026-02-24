@@ -1,0 +1,7 @@
+vram_gb,strategy,layers_in_vram,deficit_layers,xfer_mb,pcie_xfer_ms,deficit_ms,resident_ms,total_ms_per_token,tps
+24,dynamic_transfer,7,41,1230.0,47.666,47.666,3.185,50.851,19.67
+32,dynamic_transfer,12,36,1080.0,41.853,41.853,5.46,47.313,21.14
+40,dynamic_transfer,18,30,900.0,34.877,34.877,8.19,43.067,23.22
+48,dynamic_transfer,23,25,750.0,29.064,29.064,10.465,39.529,25.3
+64,dynamic_transfer,34,14,420.0,16.276,16.276,15.47,31.746,31.5
+80,dynamic_transfer,44,4,120.0,4.65,4.65,20.02,24.67,40.53

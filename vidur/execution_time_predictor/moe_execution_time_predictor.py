@@ -79,9 +79,9 @@ class MoEExecutionTimePredictor(SklearnExecutionTimePredictor):
         self._gpu_mem_bw_gbs = raw_bw * 0.8 if raw_bw > 0 else 2039 * 0.8
 
         # Expert params size (3 matrices: gate, up, down for gated MLP)
-        bytes_per_param = 2  # FP16
+        self._bytes_per_param = getattr(self._replica_config, 'weight_bytes_per_param', 2)
         self._expert_params_bytes = (
-            3 * self._hidden_size * self._expert_intermediate_size * bytes_per_param
+            3 * self._hidden_size * self._expert_intermediate_size * self._bytes_per_param
         )
         # Number of local experts per GPU
         self._local_experts = max(1, self._num_routed_experts // self._expert_parallel_size)
