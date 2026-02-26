@@ -199,30 +199,60 @@ This result has profound implications for deployment:
 
 ---
 
-## 7. Experiment 4: Prefetch Overlap Timeline <a name="7-experiment-4"></a>
+## 7. Experiment 4: Prefetch Overlap Budget <a name="7-experiment-4"></a>
 
 ### Question
-How effectively does deterministic prefetching hide the Engram lookup latency?
+How effectively does the GPU compute of preceding layers hide the Engram DMA transfer from host DRAM?
 
-### The Deterministic Prefetch Advantage
+### The Key Mechanism
 
-Unlike MoE expert routing (which depends on activations that aren't known until the router runs), Engram addresses depend only on input token IDs.  This means:
+Unlike MoE expert routing (which depends on activations that aren't known until the router computes them), Engram addresses are **deterministic** -- they depend only on input token IDs.  This means the DMA engine can begin the host-DRAM transfer the moment token IDs arrive, while the GPU computes earlier layers on its SM units:
 
-1. **Before layer 0 even starts**, all Engram addresses can be computed
-2. The DMA engine begins transferring Engram embeddings from host DRAM
-3. By the time layers 2 and 15 need the data, it's already in GPU memory
+```
+SM:   [===Layer 0===][===Layer 1===][===Layer 2: uses Engram data===]
+DMA:  [--Engram L2 prefetch--]       ^
+                                     |
+                              data ready here
+                              (DMA finished during Layer 0)
+```
 
-![Prefetch Timeline](example_outputs/experiments/engram_analysis/exp4_prefetch_timeline.png)
-*Figure 5: Execution timeline showing all 30 layers of Engram-27B. Layers 2 and 15 (marked "Engram") show minimal residual lookup time after prefetching.*
+The **overlap budget** for Engram at layer E is:
 
-### Quantitative Results
+```
+budget = sum(compute_time[i] for i in range(E))
+```
 
-| Engram Layer | Raw Lookup (ms) | After Prefetch (ms) | Overlap % |
-|-------------|----------------|--------------------| ----------|
-| Layer 2 | 0.0484 | 0.0048 | 90% |
-| Layer 15 | 0.0484 | 0.0048 | 90% |
+If `budget >= lookup_time`, the DMA finishes before layer E needs the data, and the lookup adds **zero** latency.
 
-The prefetch savings are modest in absolute terms (0.087 ms total) because the raw lookup bytes are small.  But the *mechanism* is what matters: it guarantees that Engram never becomes a latency bottleneck regardless of batch size or table size.
+### Results: Budget/Lookup Ratio Across Batch Sizes
+
+| Batch Size | Layer 2 Budget | Layer 2 Lookup | Ratio | Layer 15 Budget | Layer 15 Lookup | Ratio |
+|------------|---------------|----------------|-------|-----------------|-----------------|-------|
+| 1 | 0.013 ms | 0.002 ms | **9x** | 0.097 ms | 0.002 ms | **64x** |
+| 32 | 0.413 ms | 0.048 ms | **9x** | 3.097 ms | 0.048 ms | **64x** |
+| 128 | 1.651 ms | 0.194 ms | **9x** | 12.387 ms | 0.194 ms | **64x** |
+| 1024 | 13.211 ms | 1.550 ms | **9x** | 99.098 ms | 1.550 ms | **64x** |
+
+**The DMA never stalls.** Even at batch_size=1024, the compute budget exceeds the lookup time by 9-64x.  This is because both compute and lookup scale linearly with batch size -- the ratio is a structural constant determined by the number of preceding layers and the compute-to-bandwidth ratio, not by the workload.
+
+For layer 2: 2 preceding layers provide 9x the required DMA time.
+For layer 15: 15 preceding layers provide 64x the required DMA time.
+
+![Prefetch Overlap Budget](example_outputs/experiments/engram_analysis/exp4_prefetch_overlap.png)
+*Figure 5: Top-left/right: Compute budget vs DMA lookup time for layers 2 and 15 (the green region is the hidden I/O). Bottom-left: Budget/lookup ratio on log scale -- always well above the stall threshold. Bottom-right: Two-stream timeline showing DMA finishing well before SM needs the data.*
+
+### Why This Matters
+
+This is qualitatively different from MoE expert weight prefetching:
+
+| Property | MoE Expert Weights | Engram Memory |
+|----------|-------------------|---------------|
+| Address known when? | After router runs (activation-dependent) | Before layer 0 (input-dependent) |
+| Transfer size | Large (full expert GEMMs) | Small (embedding vectors only) |
+| Prefetchable? | Only with speculation | **Always, deterministically** |
+| Budget/lookup ratio | Often < 1 (stalls) | **9-64x** (never stalls) |
+
+The Engram module's I/O is structurally invisible in the execution timeline.
 
 ---
 

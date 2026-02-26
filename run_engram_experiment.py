@@ -385,13 +385,36 @@ def compute_layer_timings(
             # Fusion: element-wise add to residual stream, negligible
             t.engram_fusion_ms = 0.001 * batch_size / 128
 
-            # Prefetch overlap: Engram addresses are deterministic (depend only
-            # on input tokens, not activations).  The DMA engine can start the
-            # transfer while the GPU computes earlier layers.
-            if enable_engram_prefetch:
-                t.engram_prefetch_overlap_ms = t.engram_lookup_ms * 0.9
+            # Prefetch overlap is computed in a second pass (below) once
+            # all layers have their compute times.
 
         layers.append(t)
+
+    # ── Second pass: compute exact prefetch overlap for Engram layers ──
+    # Because Engram addresses are deterministic (depend only on input
+    # token IDs, not on activations), the DMA engine can begin the
+    # host-DRAM transfer as soon as the token IDs are known -- which is
+    # before layer 0 even starts.  The transfer runs on the DMA engine
+    # concurrently with the SM compute of preceding layers.
+    #
+    # For Engram at layer E, the available overlap budget is:
+    #   overlap_budget = sum(layer[i].compute_ms for i in range(E))
+    # because the SM is busy with layers 0..E-1 while DMA fetches data.
+    #
+    # The actual overlap = min(engram_lookup_ms, overlap_budget).
+    # If the budget exceeds the lookup time, the DMA finishes before
+    # layer E starts -> the lookup is fully hidden (zero added latency).
+    if enable_engram_prefetch:
+        for layer in layers:
+            if not layer.is_engram_layer:
+                continue
+            # Sum compute time of all layers that run BEFORE this one
+            budget = sum(
+                layers[j].compute_ms for j in range(layer.layer_index)
+            )
+            layer.engram_prefetch_overlap_ms = min(
+                layer.engram_lookup_ms, budget
+            )
 
     return layers
 
@@ -947,136 +970,262 @@ def experiment_3_host_memory_offload(gpu: GPUSpec):
 
 
 # ╔════════════════════════════════════════════════════════════╗
-# ║  Section 7: Experiment 4 -- Prefetch Overlap Timeline      ║
+# ║  Section 7: Experiment 4 -- Prefetch Overlap Budget         ║
+# ║                                                             ║
+# ║  The central question: how much GPU compute time from       ║
+# ║  preceding layers is available to hide each Engram DMA      ║
+# ║  transfer from host DRAM?                                   ║
 # ╚════════════════════════════════════════════════════════════╝
 
-def experiment_4_prefetch_timeline(gpu: GPUSpec):
-    """Visualize how Engram prefetching overlaps with GPU compute.
+def experiment_4_prefetch_overlap(gpu: GPUSpec):
+    """Analyze exactly how the compute of preceding layers hides Engram I/O.
 
-    Because Engram addresses are deterministic (depend only on input
-    token IDs, not activations), the DMA engine can start transferring
-    data from host DRAM while the GPU processes earlier layers.
+    Engram addresses are **deterministic**: they depend only on input
+    token IDs, not on activations.  This means the DMA engine can begin
+    fetching Engram data from host DRAM the moment token IDs are known --
+    before layer 0 even starts computing.
+
+    For each Engram layer E, the "overlap budget" is the total SM compute
+    time of layers 0..E-1.  The DMA runs concurrently on a separate
+    engine.  If budget >= lookup_time, the transfer finishes before
+    layer E needs the data, and the lookup is fully hidden.
+
+    Timeline (for Engram at layer 2):
+
+      SM:   [===Layer 0===][===Layer 1===][===Layer 2: uses Engram data===]
+      DMA:  [--Engram L2 prefetch--]       ^
+                                           |
+                                    data ready here
+                                    (DMA finished during L0)
+
+    This experiment:
+    1. Computes the exact overlap budget for each Engram layer
+    2. Sweeps batch size to show when (if ever) the DMA becomes a bottleneck
+    3. Finds the critical batch size where budget = lookup time
+    4. Visualizes the dual-stream SM/DMA timeline
     """
     print("\n" + "=" * 70)
-    print("  EXPERIMENT 4: Prefetch Overlap Timeline")
+    print("  EXPERIMENT 4: Prefetch Overlap Budget Analysis")
     print("=" * 70)
 
-    batch_size = 32
-    layers = compute_layer_timings(ENGRAM_27B, gpu, batch_size,
+    # ── Part A: Overlap budget breakdown for Engram-27B ──────────
+    batch_sizes = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    overlap_data = []
+
+    for bs in batch_sizes:
+        layers = compute_layer_timings(ENGRAM_27B, gpu, bs,
+                                        enable_engram_prefetch=True)
+
+        for layer in layers:
+            if not layer.is_engram_layer:
+                continue
+
+            # Compute time of all preceding layers (the overlap budget)
+            budget_ms = sum(layers[j].compute_ms for j in range(layer.layer_index))
+            lookup_ms = layer.engram_lookup_ms
+            hidden_ms = layer.engram_prefetch_overlap_ms
+            exposed_ms = max(0.0, lookup_ms - hidden_ms)
+            ratio = budget_ms / lookup_ms if lookup_ms > 0 else float('inf')
+
+            overlap_data.append({
+                "batch_size": bs,
+                "engram_layer": layer.layer_index,
+                "budget_ms": budget_ms,
+                "lookup_ms": lookup_ms,
+                "hidden_ms": hidden_ms,
+                "exposed_ms": exposed_ms,
+                "budget_to_lookup_ratio": ratio,
+                "fully_hidden": exposed_ms < 1e-9,
+            })
+
+    # Print table
+    print(f"\n  Engram-27B on {gpu.name}: Engram at layers [2, 15]")
+    print(f"  {'':4s}  {'--- Layer 2 ---':^44s}  {'--- Layer 15 ---':^44s}")
+    print(f"  {'BS':>4s}  {'Budget':>8s} {'Lookup':>8s} {'Ratio':>8s} {'Hidden?':>8s}"
+          f"  {'Budget':>8s} {'Lookup':>8s} {'Ratio':>8s} {'Hidden?':>8s}")
+    for bs in batch_sizes:
+        rows = [d for d in overlap_data if d["batch_size"] == bs]
+        l2 = next((r for r in rows if r["engram_layer"] == 2), None)
+        l15 = next((r for r in rows if r["engram_layer"] == 15), None)
+        if l2 and l15:
+            print(f"  {bs:>4d}  "
+                  f"{l2['budget_ms']:8.4f} {l2['lookup_ms']:8.4f} "
+                  f"{l2['budget_to_lookup_ratio']:7.0f}x "
+                  f"{'YES' if l2['fully_hidden'] else 'NO':>7s}  "
+                  f"{l15['budget_ms']:8.4f} {l15['lookup_ms']:8.4f} "
+                  f"{l15['budget_to_lookup_ratio']:7.0f}x "
+                  f"{'YES' if l15['fully_hidden'] else 'NO':>7s}")
+
+    # ── Part B: Find critical batch size where DMA would stall ──
+    # For each Engram layer, find the batch size where lookup_ms > budget_ms
+    print(f"\n  Critical batch size analysis:")
+    for engram_li in [2, 15]:
+        rows = [d for d in overlap_data if d["engram_layer"] == engram_li]
+        stall_bs = None
+        for r in rows:
+            if not r["fully_hidden"]:
+                stall_bs = r["batch_size"]
+                break
+        if stall_bs:
+            print(f"    Layer {engram_li}: DMA stalls at batch_size >= {stall_bs}")
+        else:
+            print(f"    Layer {engram_li}: DMA NEVER stalls (budget always exceeds "
+                  f"lookup, even at batch={batch_sizes[-1]})")
+            # Compute the theoretical critical batch size
+            # budget = 2 * per_layer_compute(bs) (for layer 2)
+            # lookup = bytes_per_token * bs / pcie_bw
+            # At critical: budget = lookup
+            # per_layer_compute scales with bs, lookup scales with bs
+            # So ratio is roughly constant -- compute grows at least as
+            # fast as lookup
+            min_ratio = min(r["budget_to_lookup_ratio"] for r in rows)
+            print(f"    Layer {engram_li}: Minimum budget/lookup ratio = "
+                  f"{min_ratio:.0f}x (compute grows >= I/O)")
+
+    # ── Plot 1: Overlap budget visualization ──────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+    # Top-left: Budget vs Lookup for Layer 2 across batch sizes
+    ax = axes[0][0]
+    l2_data = [d for d in overlap_data if d["engram_layer"] == 2]
+    bs_vals = [d["batch_size"] for d in l2_data]
+    budgets = [d["budget_ms"] for d in l2_data]
+    lookups = [d["lookup_ms"] for d in l2_data]
+
+    ax.plot(bs_vals, budgets, "o-", color="#2ecc71", linewidth=2.5,
+            markersize=8, label="Compute budget (layers 0-1)")
+    ax.plot(bs_vals, lookups, "s-", color="#e74c3c", linewidth=2.5,
+            markersize=8, label="Engram DMA lookup time")
+    ax.fill_between(bs_vals, lookups, budgets, alpha=0.15, color="#2ecc71",
+                     where=[b >= l for b, l in zip(budgets, lookups)],
+                     label="Hidden by compute")
+
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Time (ms)")
+    ax.set_title("Layer 2: Overlap Budget vs DMA Lookup\n"
+                 "(Budget = compute time of layers 0-1)",
+                 fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.set_xscale("log", base=2)
+    ax.grid(alpha=0.3)
+
+    # Top-right: Budget vs Lookup for Layer 15
+    ax = axes[0][1]
+    l15_data = [d for d in overlap_data if d["engram_layer"] == 15]
+    bs_vals = [d["batch_size"] for d in l15_data]
+    budgets = [d["budget_ms"] for d in l15_data]
+    lookups = [d["lookup_ms"] for d in l15_data]
+
+    ax.plot(bs_vals, budgets, "o-", color="#2ecc71", linewidth=2.5,
+            markersize=8, label="Compute budget (layers 0-14)")
+    ax.plot(bs_vals, lookups, "s-", color="#e74c3c", linewidth=2.5,
+            markersize=8, label="Engram DMA lookup time")
+    ax.fill_between(bs_vals, lookups, budgets, alpha=0.15, color="#2ecc71",
+                     where=[b >= l for b, l in zip(budgets, lookups)],
+                     label="Hidden by compute")
+
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Time (ms)")
+    ax.set_title("Layer 15: Overlap Budget vs DMA Lookup\n"
+                 "(Budget = compute time of layers 0-14)",
+                 fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.set_xscale("log", base=2)
+    ax.grid(alpha=0.3)
+
+    # Bottom-left: Budget/Lookup ratio (how many times over the DMA fits)
+    ax = axes[1][0]
+    l2_ratios = [d["budget_to_lookup_ratio"] for d in l2_data]
+    l15_ratios = [d["budget_to_lookup_ratio"] for d in l15_data]
+    bs_vals = [d["batch_size"] for d in l2_data]
+
+    ax.plot(bs_vals, l2_ratios, "o-", color="#3498db", linewidth=2.5,
+            markersize=8, label="Layer 2 (budget from 2 layers)")
+    ax.plot(bs_vals, l15_ratios, "s-", color="#9b59b6", linewidth=2.5,
+            markersize=8, label="Layer 15 (budget from 15 layers)")
+    ax.axhline(y=1, color="#e74c3c", linestyle="--", linewidth=2,
+               label="Stall threshold (ratio < 1)")
+
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Budget / Lookup Ratio")
+    ax.set_title("How Many Times the Compute Budget\nExceeds the DMA Transfer",
+                 fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3)
+
+    # Bottom-right: Two-stream timeline diagram for batch=32
+    ax = axes[1][1]
+    bs = 32
+    layers = compute_layer_timings(ENGRAM_27B, gpu, bs,
                                     enable_engram_prefetch=True)
 
-    # Build Gantt chart
-    fig, ax = plt.subplots(figsize=(16, 9))
+    # SM stream: cumulative compute per layer
+    sm_times = []
+    sm_x = 0.0
+    for l in layers:
+        sm_times.append((sm_x, l.compute_ms, l.layer_index, l.is_engram_layer))
+        sm_x += l.compute_ms
 
-    colors = {
-        "attention": "#3498db",
-        "moe_compute": "#2ecc71",
-        "moe_routing": "#f1c40f",
-        "shared_expert": "#1abc9c",
-        "expert_io": "#e67e22",
-        "engram_lookup": "#e74c3c",
-        "engram_gating": "#c0392b",
-    }
+    # DMA stream: Engram transfers (start at time 0, run concurrently)
+    dma_transfers = []
+    for l in layers:
+        if l.is_engram_layer:
+            dma_transfers.append((l.layer_index, l.engram_lookup_ms))
 
-    y_positions = list(range(len(layers) - 1, -1, -1))
-    cumulative_time = 0.0
+    # Draw SM stream (top bar)
+    y_sm = 1.0
+    y_dma = 0.0
+    for start, dur, li, is_eng in sm_times:
+        color = "#e74c3c" if is_eng else "#2ecc71"
+        alpha = 1.0 if is_eng else 0.7
+        ax.barh(y_sm, dur, left=start, height=0.35, color=color,
+                edgecolor="black", linewidth=0.3, alpha=alpha)
+        if li % 5 == 0 or is_eng:
+            ax.text(start + dur / 2, y_sm, f"L{li}", ha="center", va="center",
+                    fontsize=6, fontweight="bold" if is_eng else "normal")
 
-    for i, (layer, y) in enumerate(zip(layers, y_positions)):
-        x_offset = cumulative_time
+    # Draw DMA stream (bottom bar) -- starts at time 0
+    dma_x = 0.0
+    for engram_li, dma_dur in dma_transfers:
+        ax.barh(y_dma, dma_dur, left=dma_x, height=0.35, color="#f39c12",
+                edgecolor="black", linewidth=0.5, alpha=0.9)
+        ax.text(dma_x + dma_dur / 2, y_dma, f"L{engram_li}\nDMA",
+                ha="center", va="center", fontsize=6, fontweight="bold")
 
-        # Attention
-        if layer.attention_compute_ms > 0:
-            ax.barh(y, layer.attention_compute_ms, left=x_offset, height=0.6,
-                    color=colors["attention"], edgecolor="black", linewidth=0.3,
-                    alpha=0.85)
-            x_offset += layer.attention_compute_ms
+        # Draw arrow from DMA completion to when SM needs it
+        sm_start_of_engram = sum(layers[j].compute_ms for j in range(engram_li))
+        dma_end = dma_x + dma_dur
+        ax.annotate("", xy=(sm_start_of_engram, y_sm - 0.17),
+                    xytext=(dma_end, y_dma + 0.17),
+                    arrowprops=dict(arrowstyle="->", color="#2ecc71",
+                                   lw=2, connectionstyle="arc3,rad=-0.2"))
+        ax.text((dma_end + sm_start_of_engram) / 2, 0.5,
+                f"ready\n{sm_start_of_engram - dma_end:.3f}ms\nearly",
+                ha="center", va="center", fontsize=7, color="#2ecc71",
+                fontweight="bold")
 
-        # Expert I/O (overlapped with compute as max(compute, io))
-        # Show the io as a thin bar below
-        if layer.expert_weight_load_ms > 0:
-            ax.barh(y - 0.3, layer.expert_weight_load_ms,
-                    left=cumulative_time + layer.attention_compute_ms,
-                    height=0.2, color=colors["expert_io"],
-                    edgecolor="black", linewidth=0.2, alpha=0.6)
+        dma_x = dma_end  # next DMA starts after this one
 
-        # MoE routing
-        if layer.moe_routing_ms > 0:
-            ax.barh(y, layer.moe_routing_ms, left=x_offset, height=0.6,
-                    color=colors["moe_routing"], edgecolor="black", linewidth=0.3,
-                    alpha=0.85)
-            x_offset += layer.moe_routing_ms
-
-        # MoE expert compute
-        if layer.moe_expert_compute_ms > 0:
-            ax.barh(y, layer.moe_expert_compute_ms, left=x_offset, height=0.6,
-                    color=colors["moe_compute"], edgecolor="black", linewidth=0.3,
-                    alpha=0.85)
-            x_offset += layer.moe_expert_compute_ms
-
-        # Shared expert
-        if layer.shared_expert_compute_ms > 0:
-            ax.barh(y, layer.shared_expert_compute_ms, left=x_offset, height=0.6,
-                    color=colors["shared_expert"], edgecolor="black", linewidth=0.3,
-                    alpha=0.85)
-            x_offset += layer.shared_expert_compute_ms
-
-        # Engram
-        if layer.is_engram_layer:
-            effective_lookup = max(0, layer.engram_lookup_ms - layer.engram_prefetch_overlap_ms)
-            if effective_lookup > 0:
-                ax.barh(y, effective_lookup, left=x_offset, height=0.6,
-                        color=colors["engram_lookup"], edgecolor="black",
-                        linewidth=0.3, alpha=0.85)
-                x_offset += effective_lookup
-
-            if layer.engram_gating_ms > 0:
-                ax.barh(y, layer.engram_gating_ms, left=x_offset, height=0.6,
-                        color=colors["engram_gating"], edgecolor="black",
-                        linewidth=0.3, alpha=0.85)
-                x_offset += layer.engram_gating_ms
-
-            # Mark Engram layer
-            ax.annotate("Engram", xy=(cumulative_time - 0.01, y),
-                        fontsize=7, fontweight="bold", color="#e74c3c",
-                        ha="right", va="center")
-
-        cumulative_time = x_offset
-
-    # Legend
-    legend_patches = [
-        mpatches.Patch(color=colors["attention"], label="Attention"),
-        mpatches.Patch(color=colors["moe_routing"], label="MoE Router"),
-        mpatches.Patch(color=colors["moe_compute"], label="Expert Compute"),
-        mpatches.Patch(color=colors["shared_expert"], label="Shared Expert"),
-        mpatches.Patch(color=colors["expert_io"], label="Expert Weight I/O (HBM, overlapped)"),
-        mpatches.Patch(color=colors["engram_lookup"], label="Engram Lookup (after prefetch)"),
-        mpatches.Patch(color=colors["engram_gating"], label="Engram Gating"),
-    ]
-    ax.legend(handles=legend_patches, loc="lower right", fontsize=8, ncol=2)
-
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels([f"L{i}" for i in range(len(layers))], fontsize=7)
+    ax.set_yticks([y_dma, y_sm])
+    ax.set_yticklabels(["DMA\n(PCIe)", "SM\n(GPU)"], fontsize=9, fontweight="bold")
     ax.set_xlabel("Time (ms)")
-    ax.set_title(f"Engram-27B Execution Timeline (batch={batch_size}, {gpu.name})\n"
-                 f"Engram modules at layers 2 and 15 with deterministic prefetching",
+    ax.set_title(f"Two-Stream Timeline (batch={bs})\n"
+                 f"DMA finishes well before SM needs the data",
                  fontweight="bold")
+    ax.set_ylim(-0.5, 1.7)
     ax.grid(axis="x", alpha=0.3)
 
+    plt.suptitle(f"Engram Prefetch Overlap Budget Analysis ({gpu.name})\n"
+                 f"How preceding layers' compute hides Engram DMA transfers",
+                 fontsize=13, fontweight="bold", y=1.03)
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "exp4_prefetch_timeline.png"),
+    plt.savefig(os.path.join(OUT_DIR, "exp4_prefetch_overlap.png"),
                 bbox_inches="tight", dpi=150)
     plt.close()
 
-    total_ms = sum(l.total_ms for l in layers)
-    total_saved = sum(l.engram_prefetch_overlap_ms for l in layers)
-    print(f"\n  Total forward pass: {total_ms:.3f} ms")
-    print(f"  Total prefetch savings: {total_saved:.3f} ms")
-    for l in layers:
-        if l.is_engram_layer:
-            print(f"    Layer {l.layer_index}: "
-                  f"lookup={l.engram_lookup_ms:.4f}ms, "
-                  f"gating={l.engram_gating_ms:.4f}ms, "
-                  f"prefetch_saved={l.engram_prefetch_overlap_ms:.4f}ms")
+    return overlap_data
 
 
 # ╔════════════════════════════════════════════════════════════╗
@@ -1358,7 +1507,7 @@ def main():
     all_results["exp1"] = experiment_1_moe_vs_engram(gpu)
     all_results["exp2"] = experiment_2_sparsity_allocation(gpu)
     all_results["exp3"] = experiment_3_host_memory_offload(gpu)
-    experiment_4_prefetch_timeline(gpu)
+    all_results["exp4"] = experiment_4_prefetch_overlap(gpu)
     all_results["exp5"] = experiment_5_v3_scale_projection(gpu)
     all_results["exp6"] = experiment_6_hardware_comparison()
 
