@@ -315,6 +315,146 @@ class DeepSeekV3ModelConfig(BaseModelConfig):
         return "meta-llama/Meta-Llama-3-70B"
 
 
+# ============================================================
+# Engram Model Configs (Conditional Memory via Scalable Lookup)
+#
+# From "Conditional Memory via Scalable Lookup: A New Axis of
+# Sparsity for Large Language Models" (arXiv:2601.07372).
+# Engram adds a deterministic N-gram memory module to MoE,
+# reallocating sparse parameters from routed experts to a
+# static embedding table with O(1) lookup.
+# ============================================================
+
+
+@dataclass
+class EngramBaseModelConfig(BaseModelConfig):
+    """Base config for Engram paper models (30-block backbone, hidden=2560).
+
+    All Engram models share a 30-block Transformer backbone with:
+    - Hidden size 2560, 32 attention heads
+    - Multi-head Latent Attention (MLA) via mHC (expansion rate 4)
+    - DeepSeek-V3 tokenizer (128k vocab)
+    """
+    num_layers: int = 30
+    num_q_heads: int = 32
+    num_kv_heads: int = 32
+    embedding_dim: int = 2560
+    mlp_hidden_dim: int = 10240  # expansion rate 4
+    max_position_embeddings: int = 32768
+    use_gated_mlp: bool = True
+    use_bias: bool = False
+    use_qkv_bias: bool = False
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = True
+    vocab_size: int = 129280  # DeepSeek-V3 tokenizer
+    rope_theta: Optional[float] = 10000
+
+    # Engram-specific fields
+    has_engram: bool = False
+    engram_layers: List = field(default_factory=list)  # layer indices with Engram module
+    engram_num_heads: int = 0          # number of hash heads (H)
+    engram_dim: int = 0                # embedding dimension per head
+    engram_ngram_sizes: List = field(default_factory=list)  # N-gram orders [2,3]
+    engram_total_params_b: float = 0.0  # total Engram table size in billions
+    engram_compressed_vocab_size: int = 0  # vocabulary after tokenizer compression
+
+    @staticmethod
+    def get_name():
+        return "deepseek-ai/Engram-Base"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "microsoft/phi-2"
+
+
+@dataclass
+class Engram27BModelConfig(EngramBaseModelConfig):
+    """Engram-27B: MoE + Conditional Memory (26.7B total params).
+
+    Derived from MoE-27B by reducing routed experts from 72 to 55
+    and reallocating freed parameters to a 5.7B Engram memory module
+    (rho=74.3%). Engram module inserted at layers 2 and 15 with
+    N={2,3}, 8 heads, dimension 1280.
+    """
+    # MoE (reduced from 72 to 55 routed experts)
+    is_moe: bool = True
+    num_routed_experts: int = 55
+    num_experts_per_tok: int = 6
+    num_shared_experts: int = 2
+    moe_intermediate_size: int = 2560  # expert FFN hidden dim
+
+    # Engram module
+    has_engram: bool = True
+    engram_layers: List = field(default_factory=lambda: [2, 15])
+    engram_num_heads: int = 8
+    engram_dim: int = 1280
+    engram_ngram_sizes: List = field(default_factory=lambda: [2, 3])
+    engram_total_params_b: float = 5.7
+    engram_compressed_vocab_size: int = 99456  # ~23% reduction from 129280
+
+    @staticmethod
+    def get_name():
+        return "deepseek-ai/Engram-27B"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "microsoft/phi-2"
+
+
+@dataclass
+class MoE27BModelConfig(EngramBaseModelConfig):
+    """MoE-27B: Pure MoE baseline (26.7B total params, no Engram).
+
+    72 routed experts with 2 shared experts, top-6 activation.
+    This is the iso-parameter baseline for Engram-27B.
+    """
+    is_moe: bool = True
+    num_routed_experts: int = 72
+    num_experts_per_tok: int = 6
+    num_shared_experts: int = 2
+    moe_intermediate_size: int = 2560
+
+    @staticmethod
+    def get_name():
+        return "deepseek-ai/MoE-27B"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "microsoft/phi-2"
+
+
+@dataclass
+class Engram40BModelConfig(EngramBaseModelConfig):
+    """Engram-40B: Scaled-up Engram (39.5B total params).
+
+    Same backbone as Engram-27B but with larger Engram memory
+    (18.5B params) while keeping activated parameters fixed.
+    """
+    is_moe: bool = True
+    num_routed_experts: int = 55
+    num_experts_per_tok: int = 6
+    num_shared_experts: int = 2
+    moe_intermediate_size: int = 2560
+
+    # Larger Engram memory
+    has_engram: bool = True
+    engram_layers: List = field(default_factory=lambda: [2, 15])
+    engram_num_heads: int = 8
+    engram_dim: int = 1280
+    engram_ngram_sizes: List = field(default_factory=lambda: [2, 3])
+    engram_total_params_b: float = 18.5
+    engram_compressed_vocab_size: int = 99456
+
+    @staticmethod
+    def get_name():
+        return "deepseek-ai/Engram-40B"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "microsoft/phi-2"
+
+
 @dataclass
 class Qwen3_30B_A3BModelConfig(BaseModelConfig):
     """Qwen3-30B-A3B: MoE model with 128 routed experts, 8 active per token."""
