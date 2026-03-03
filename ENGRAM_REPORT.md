@@ -15,7 +15,8 @@
 7. [Experiment 4: Prefetch Overlap Timeline](#7-experiment-4)
 8. [Experiment 5: V3-Scale Projection](#8-experiment-5)
 9. [Experiment 6: Hardware Comparison](#9-experiment-6)
-10. [Key Findings and Conclusions](#10-conclusions)
+10. [Experiment 7: N-gram Size Comparison](#10-experiment-7)
+11. [Key Findings and Conclusions](#11-conclusions)
 
 ---
 
@@ -322,7 +323,105 @@ This is actually a positive result: Engram's benefits are **hardware-agnostic** 
 
 ---
 
-## 10. Key Findings and Conclusions <a name="10-conclusions"></a>
+## 10. Experiment 7: N-gram Size Comparison <a name="10-experiment-7"></a>
+
+### Question
+How do different N-gram configurations (e.g., using {2,3}-grams vs {4,5}-grams) affect the per-token I/O size, table utilization, hash collisions, and prefetch overlap budget?
+
+### Background
+
+The Engram module uses N-gram hash lookups: for each N-gram size in the configuration, it hashes the last N token IDs to index into the table and fetches one embedding vector per head.  The per-token I/O is:
+
+```
+bytes_per_token = H_heads * engram_dim * bytes_per_param * |ngram_sizes|
+```
+
+So the **number** of N-gram sizes directly multiplies the DMA transfer per token.  Meanwhile, higher N-gram values create exponentially larger natural vocabulary spaces (V^N), which affects how aggressively the hash must compress and thus the collision rate.
+
+### Configurations Tested
+
+| Config | N-gram Sizes | Bytes/token | vs {2,3} | Context Window |
+|--------|-------------|-------------|----------|----------------|
+| {2} | bigrams only | 20,480 | 0.5x | 2 tokens |
+| {3} | trigrams only | 20,480 | 0.5x | 3 tokens |
+| {2,3} | bi+trigrams | 40,960 | **1.0x** (paper) | 2-3 tokens |
+| {4,5} | 4+5-grams | 40,960 | 1.0x | 4-5 tokens |
+| {3,4,5} | tri+4+5-grams | 61,440 | 1.5x | 3-5 tokens |
+| {2,3,4,5} | all four | 81,920 | 2.0x | 2-5 tokens |
+
+### Part A: Per-token I/O Scaling
+
+The I/O cost scales strictly linearly with the number of N-gram sizes -- the **values** of N don't affect I/O at all, only the **count** does.  {2,3} and {4,5} have identical per-token I/O (both have 2 N-gram sizes), but {2,3,4,5} doubles it to 4 lookups per token.
+
+At batch=32 on A100 (PCIe Gen4, 31.5 GB/s effective):
+
+| Config | Total lookup bytes | DMA time (bs=32) |
+|--------|-------------------|------------------|
+| {2} or {3} | 655 KB | 0.024 ms |
+| {2,3} or {4,5} | 1.3 MB | 0.048 ms |
+| {3,4,5} | 1.9 MB | 0.073 ms |
+| {2,3,4,5} | 2.6 MB | 0.097 ms |
+
+### Part B: Hash Collision Analysis
+
+Higher N-gram values create vastly larger vocabulary spaces that must be compressed into the same number of table rows:
+
+| Config | Natural Space (max N) | Table Rows per N-gram | Collision Rate |
+|--------|----------------------|----------------------|----------------|
+| {2} | V^2 = 9.9 × 10^9 | 556,641 | 99.994% |
+| {3} | V^3 = 9.8 × 10^14 | 556,641 | ~100% |
+| {2,3} | V^3 = 9.8 × 10^14 | 278,320 | ~100% |
+| {4,5} | V^5 = 9.7 × 10^24 | 278,320 | ~100% |
+| {2,3,4,5} | V^5 = 9.7 × 10^24 | 139,160 | ~100% |
+
+Even bigrams (V^2 ≈ 10^10) vastly exceed the table capacity (~556K rows), so collisions are near-100% for **all** configurations.  This is **by design**: Engram doesn't try to store every N-gram uniquely.  Instead, the multi-head hashing distributes collisions across 8 independent hash functions, and the context-aware gating learns to suppress noise from unhelpful collisions.  The collision rate for higher N-grams (4, 5) is astronomically higher in theory, but in practice the mechanism works the same way -- the learned gating decides how much to trust each retrieved embedding.
+
+### Part C: Forward Pass Latency
+
+Because the prefetch overlap budget always exceeds the DMA time (even at 4 N-gram sizes), all configurations achieve **identical forward pass latency** at typical batch sizes:
+
+| Config | bs=1 | bs=32 | bs=128 | bs=512 | Speedup vs MoE @32 |
+|--------|------|-------|--------|--------|-------------------|
+| {2} | 4.041 ms | 35.696 ms | 36.370 ms | 98.323 ms | 1.264x |
+| {2,3} | 4.041 ms | 35.696 ms | 36.370 ms | 97.547 ms | 1.264x |
+| {4,5} | 4.041 ms | 35.696 ms | 36.370 ms | 97.547 ms | 1.264x |
+| {2,3,4,5} | 4.041 ms | 35.696 ms | 36.370 ms | 95.997 ms | 1.264x |
+
+The latency is identical because the DMA is fully hidden by compute at all tested batch sizes.  The small differences at bs=512 come from the prefetch savings offset in the total computation (more N-grams = slightly more prefetch savings subtracted).
+
+### Part D: Prefetch Overlap Headroom
+
+This is the critical question: does adding more N-gram sizes cause the DMA to stall?
+
+| Config | Layer 2 Ratio | Layer 15 Ratio | DMA Stalls? |
+|--------|--------------|----------------|-------------|
+| {2} | **17.0x** | **127.9x** | Never |
+| {3} | **17.0x** | **127.9x** | Never |
+| {2,3} | **8.5x** | **63.9x** | Never |
+| {4,5} | **8.5x** | **63.9x** | Never |
+| {3,4,5} | **5.7x** | **42.6x** | Never |
+| {2,3,4,5} | **4.3x** | **32.0x** | Never |
+
+Even with 4 N-gram sizes, the compute budget at Layer 2 is still **4.3x** the DMA transfer time.  At Layer 15, the headroom is **32x**.  The ratio drops linearly with the number of N-gram sizes (since DMA time scales linearly while compute budget stays the same), but remains comfortably above the stall threshold of 1.0x.
+
+To stall Layer 2's DMA, you would need roughly 17 N-gram sizes with the current architecture -- far beyond any practical configuration.
+
+![N-gram Comparison](example_outputs/experiments/engram_analysis/exp7_ngram_comparison.png)
+*Figure 8: Six-panel analysis of N-gram configurations. Top-left: Per-token I/O scales linearly with |N-gram sizes|. Top-center: Hash collision rates are near-100% for all configs (by design). Top-right: Forward pass latency is identical across configs at typical batch sizes. Bottom-left: Overhead vs MoE-27B (all negative = all faster). Bottom-center: Prefetch overlap headroom -- all ratios well above stall threshold. Bottom-right: Time breakdown showing Engram I/O is a tiny fraction of total time.*
+
+### Key Insights
+
+1. **The N-gram values don't matter for I/O** -- only the count of N-gram sizes matters.  {2,3} and {4,5} have identical per-token I/O cost.
+
+2. **Collisions are ubiquitous and intentional** -- Even bigrams exceed the table capacity.  The hash collisions are managed by multi-head hashing (diversity) and context-aware gating (learned suppression).  Higher N-grams don't meaningfully change this dynamic.
+
+3. **You can use {2,3,4,5} for free** -- The DMA is still hidden 4.3x over at Layer 2, meaning there's ample budget to add more N-gram context without any latency penalty.
+
+4. **The trade-off is quality, not latency** -- Since all configs have the same latency, the choice of N-gram sizes should be driven entirely by downstream quality metrics (perplexity, benchmark scores).  The paper chose {2,3} as optimal, but the system can accommodate wider N-gram ranges if they improve quality.
+
+---
+
+## 11. Key Findings and Conclusions <a name="11-conclusions"></a>
 
 ### Finding 1: Engram Achieves a Pareto Improvement
 
@@ -345,6 +444,10 @@ At V3 scale, a 100B Engram table offloaded to host DRAM frees ~186 GB of GPU mem
 ### Finding 5: Hardware-Agnostic Benefits
 
 Engram's advantages are consistent across A100 (PCIe Gen4) and H100 (PCIe Gen5) because the lookup bytes are tiny compared to expert weight I/O from HBM.
+
+### Finding 6: N-gram Configuration is a Quality Knob, Not a Latency Knob
+
+Different N-gram configurations ({2}, {2,3}, {4,5}, {2,3,4,5}) have identical forward pass latency because the DMA is fully hidden by compute in all cases.  Per-token I/O scales linearly with the number of N-gram sizes, but even at 4 N-gram sizes the overlap budget headroom remains 4.3x at Layer 2.  This means the choice of N-gram sizes is purely a quality optimization -- the system can accommodate any reasonable configuration without latency impact.
 
 ### Implications for Future Architectures
 
