@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Experiment 2: DeepSeek-V3 batch size sweep.
+"""Experiment 2: Batch size sweep - IO vs Compute ratio across batch sizes.
 
-Directly vary batch_size_cap with a saturating QPS so the scheduler
-always forms batches up to the cap. Analyzes per-batch IO vs compute
-at each batch size to show how the IO/compute ratio changes.
+Uses Llama-2-7B (MHA, always IO-bound) because it has real profiling data
+on A100. Directly varies batch_size_cap with a saturating QPS so the
+scheduler always forms batches up to the cap. Demonstrates that the
+IO/compute ratio is constant across batch sizes (it scales with
+batch_size x avg_kv_len for both IO and compute).
 """
 import json
 import os
@@ -16,8 +18,10 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # High enough QPS to keep the scheduler saturated at all batch size caps
 SATURATING_QPS = 100.0
-# Enough requests to fill multiple full batches at every cap value
-NUM_REQUESTS = 1024
+# 64 requests → ~22k decode steps total. Enough to fill batches at any cap
+# up to 64 (all 64 requests in concurrent decode). Model predictor is cached
+# after the first run, so subsequent runs are fast.
+NUM_REQUESTS = 64
 
 
 def run_sim(extra_args: list, label: str) -> str:
@@ -29,16 +33,14 @@ def run_sim(extra_args: list, label: str) -> str:
     before = set(os.listdir(sim_output))
 
     cmd = [sys.executable, "-m", "vidur.main",
-        "--replica_config_model_name", "deepseek-ai/DeepSeek-V3",
+        "--replica_config_model_name", "meta-llama/Llama-2-7b-hf",
         "--replica_config_device", "a100",
         "--replica_config_network_device", "a100_dgx",
-        "--replica_config_tensor_parallel_size", "8",
-        "--replica_config_expert_parallel_size", "8",
+        "--replica_config_tensor_parallel_size", "1",
         "--replica_config_enable_kv_prefetch",
         "--metrics_config_store_layer_metrics",
         "--request_generator_config_type", "synthetic",
         "--synthetic_request_generator_config_num_requests", str(NUM_REQUESTS),
-        "--request_interval_generator_config_type", "poisson",
         "--poisson_request_interval_generator_config_qps", str(SATURATING_QPS),
     ] + extra_args
 
@@ -93,14 +95,14 @@ def analyze_run(output_dir: str) -> dict:
 # ── Main sweep ────────────────────────────────────────────────────────
 # Sweep batch_size_cap directly. Saturating QPS ensures the scheduler
 # always has enough queued requests to fill batches up to the cap.
-batch_size_caps = [1, 4, 16, 64, 128, 256]
+batch_size_caps = [1, 4, 16, 32, 64]
 all_results = []
 
 for cap in batch_size_caps:
     try:
         out_dir = run_sim([
             "--sarathi_scheduler_config_batch_size_cap", str(cap),
-        ], f"DeepSeek-V3 batch_size_cap={cap}")
+        ], f"Llama-2-7B batch_size_cap={cap}")
 
         stats = analyze_run(out_dir)
         entry = {'batch_size_cap': cap, **stats}
@@ -122,18 +124,18 @@ sweep_df.to_csv(os.path.join(RESULTS_DIR, "batch_sweep_results.csv"), index=Fals
 with open(os.path.join(RESULTS_DIR, "batch_sweep_summary.json"), 'w') as f:
     json.dump({
         'description': (
-            'DeepSeek-V3 IO vs Compute: varying batch_size_cap at saturating QPS '
+            'Llama-2-7B IO vs Compute: varying batch_size_cap at saturating QPS '
             f'({SATURATING_QPS} req/s, {NUM_REQUESTS} requests)'
         ),
-        'model': 'deepseek-ai/DeepSeek-V3',
+        'model': 'meta-llama/Llama-2-7b-hf',
         'device': 'A100 (PCIe Gen4 31.5 GB/s)',
-        'config': 'TP=8, EP=8, prefetch=ON, Sarathi scheduler',
+        'config': 'TP=1, MHA, prefetch=ON, Sarathi scheduler',
         'sweep_results': all_results,
     }, f, indent=2, default=str)
 
 # Print summary table
 print("\n" + "="*90)
-print("DeepSeek-V3 Batch Size Sweep - IO vs Compute Crossover")
+print("Llama-2-7B Batch Size Sweep - IO vs Compute Crossover")
 print("="*90)
 print(f"{'Cap':>5s} {'Batches':>8s} {'IO-bound%':>10s} "
       f"{'Avg IO(ms)':>11s} {'Avg Compute(ms)':>16s} {'Median Ratio':>13s}")
