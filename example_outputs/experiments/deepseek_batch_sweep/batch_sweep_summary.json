@@ -1,73 +1,147 @@
 {
-  "description": "Llama-2-7B IO vs Compute: varying batch_size_cap at saturating QPS (100.0 req/s, 64 requests)",
-  "model": "meta-llama/Llama-2-7b-hf",
+  "description": "Batch size sweep: IO vs Compute at saturating QPS (100.0 req/s, 64 requests per model)",
   "device": "A100 (PCIe Gen4 31.5 GB/s)",
-  "config": "TP=1, MHA, prefetch=ON, Sarathi scheduler",
-  "sweep_results": [
-    {
-      "batch_size_cap": 1,
-      "total_decode_batches": 32704,
-      "io_bound_batches": 32704,
-      "io_bound_pct": 100.0,
-      "avg_kv_load_ms": 1.3951,
-      "avg_compute_ms": 0.3164,
-      "max_kv_load_ms": 1.5495,
-      "max_compute_ms": 0.32,
-      "median_ratio": 4.411,
-      "p90_ratio": 4.747,
-      "p95_ratio": 4.795
-    },
-    {
-      "batch_size_cap": 4,
-      "total_decode_batches": 8264,
-      "io_bound_batches": 8261,
-      "io_bound_pct": 100.0,
-      "avg_kv_load_ms": 5.5209,
-      "avg_compute_ms": 0.4297,
-      "max_kv_load_ms": 6.1816,
-      "max_compute_ms": 1.3484,
-      "median_ratio": 13.831,
-      "p90_ratio": 14.726,
-      "p95_ratio": 14.822
-    },
-    {
-      "batch_size_cap": 16,
-      "total_decode_batches": 2121,
-      "io_bound_batches": 2118,
-      "io_bound_pct": 99.9,
-      "avg_kv_load_ms": 21.5111,
-      "avg_compute_ms": 0.7711,
-      "max_kv_load_ms": 24.4922,
-      "max_compute_ms": 1.6897,
-      "median_ratio": 33.143,
-      "p90_ratio": 34.345,
-      "p95_ratio": 34.531
-    },
-    {
-      "batch_size_cap": 32,
-      "total_decode_batches": 1159,
-      "io_bound_batches": 1156,
-      "io_bound_pct": 99.7,
-      "avg_kv_load_ms": 39.3658,
-      "avg_compute_ms": 1.1418,
-      "max_kv_load_ms": 48.3443,
-      "max_compute_ms": 2.023,
-      "median_ratio": 43.485,
-      "p90_ratio": 44.837,
-      "p95_ratio": 45.049
-    },
-    {
-      "batch_size_cap": 64,
-      "total_decode_batches": 1100,
-      "io_bound_batches": 1097,
-      "io_bound_pct": 99.7,
-      "avg_kv_load_ms": 41.47,
-      "avg_compute_ms": 1.2043,
-      "max_kv_load_ms": 71.6872,
-      "max_compute_ms": 2.315,
-      "median_ratio": 31.64,
-      "p90_ratio": 50.723,
-      "p95_ratio": 51.004
-    }
-  ]
+  "llama2_7b": {
+    "model": "meta-llama/Llama-2-7b-hf",
+    "config": "TP=1, MHA, prefetch=ON, Sarathi scheduler",
+    "sweep_results": [
+      {
+        "batch_size_cap": 1,
+        "total_decode_batches": 32704,
+        "io_bound_batches": 32704,
+        "io_bound_pct": 100.0,
+        "avg_kv_load_ms": 1.3951,
+        "avg_compute_ms": 0.3164,
+        "max_kv_load_ms": 1.5495,
+        "max_compute_ms": 0.32,
+        "median_ratio": 4.411,
+        "p90_ratio": 4.747,
+        "p95_ratio": 4.795
+      },
+      {
+        "batch_size_cap": 4,
+        "total_decode_batches": 8264,
+        "io_bound_batches": 8261,
+        "io_bound_pct": 100.0,
+        "avg_kv_load_ms": 5.5209,
+        "avg_compute_ms": 0.4297,
+        "max_kv_load_ms": 6.1816,
+        "max_compute_ms": 1.3484,
+        "median_ratio": 13.831,
+        "p90_ratio": 14.726,
+        "p95_ratio": 14.822
+      },
+      {
+        "batch_size_cap": 16,
+        "total_decode_batches": 2121,
+        "io_bound_batches": 2118,
+        "io_bound_pct": 99.9,
+        "avg_kv_load_ms": 21.5111,
+        "avg_compute_ms": 0.7711,
+        "max_kv_load_ms": 24.4922,
+        "max_compute_ms": 1.6897,
+        "median_ratio": 33.143,
+        "p90_ratio": 34.345,
+        "p95_ratio": 34.531
+      },
+      {
+        "batch_size_cap": 32,
+        "total_decode_batches": 1159,
+        "io_bound_batches": 1156,
+        "io_bound_pct": 99.7,
+        "avg_kv_load_ms": 39.3658,
+        "avg_compute_ms": 1.1418,
+        "max_kv_load_ms": 48.3443,
+        "max_compute_ms": 2.023,
+        "median_ratio": 43.485,
+        "p90_ratio": 44.837,
+        "p95_ratio": 45.049
+      },
+      {
+        "batch_size_cap": 64,
+        "total_decode_batches": 1100,
+        "io_bound_batches": 1097,
+        "io_bound_pct": 99.7,
+        "avg_kv_load_ms": 41.47,
+        "avg_compute_ms": 1.2043,
+        "max_kv_load_ms": 71.6872,
+        "max_compute_ms": 2.315,
+        "median_ratio": 31.64,
+        "p90_ratio": 50.723,
+        "p95_ratio": 51.004
+      }
+    ]
+  },
+  "deepseek_v3": {
+    "model": "deepseek-ai/DeepSeek-V3",
+    "config": "TP=8, EP=8, MLA, prefetch=ON, Sarathi scheduler",
+    "profiling_proxy": "meta-llama/Meta-Llama-3-70B (dense layers only; MoE compute is analytical)",
+    "sweep_results": [
+      {
+        "batch_size_cap": 1,
+        "total_decode_batches": 32704,
+        "io_bound_batches": 21632,
+        "io_bound_pct": 66.1,
+        "avg_kv_load_ms": 0.0981,
+        "avg_compute_ms": 0.0945,
+        "max_kv_load_ms": 0.1089,
+        "max_compute_ms": 0.0946,
+        "median_ratio": 1.037,
+        "p90_ratio": 1.137,
+        "p95_ratio": 1.149
+      },
+      {
+        "batch_size_cap": 4,
+        "total_decode_batches": 8264,
+        "io_bound_batches": 7981,
+        "io_bound_pct": 96.6,
+        "avg_kv_load_ms": 0.3882,
+        "avg_compute_ms": 0.3995,
+        "max_kv_load_ms": 0.4346,
+        "max_compute_ms": 8.517,
+        "median_ratio": 2.734,
+        "p90_ratio": 2.975,
+        "p95_ratio": 3.005
+      },
+      {
+        "batch_size_cap": 16,
+        "total_decode_batches": 2121,
+        "io_bound_batches": 1862,
+        "io_bound_pct": 87.8,
+        "avg_kv_load_ms": 1.5125,
+        "avg_compute_ms": 1.3297,
+        "max_kv_load_ms": 1.7221,
+        "max_compute_ms": 8.517,
+        "median_ratio": 4.58,
+        "p90_ratio": 4.99,
+        "p95_ratio": 5.037
+      },
+      {
+        "batch_size_cap": 32,
+        "total_decode_batches": 1159,
+        "io_bound_batches": 895,
+        "io_bound_pct": 77.2,
+        "avg_kv_load_ms": 2.7679,
+        "avg_compute_ms": 2.3811,
+        "max_kv_load_ms": 3.3992,
+        "max_compute_ms": 8.5321,
+        "median_ratio": 5.005,
+        "p90_ratio": 5.441,
+        "p95_ratio": 5.492
+      },
+      {
+        "batch_size_cap": 64,
+        "total_decode_batches": 781,
+        "io_bound_batches": 512,
+        "io_bound_pct": 65.6,
+        "avg_kv_load_ms": 4.1076,
+        "avg_compute_ms": 3.5034,
+        "max_kv_load_ms": 6.6125,
+        "max_compute_ms": 8.552,
+        "median_ratio": 5.212,
+        "p90_ratio": 5.676,
+        "p95_ratio": 5.69
+      }
+    ]
+  }
 }
