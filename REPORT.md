@@ -20,7 +20,7 @@
 4. [Experiment Setup](#4-experiment-setup)
 5. [Results: Dense vs. Sparse Architecture (Llama-2-7B vs. DeepSeek-V3)](#5-results-dense-vs-sparse-architecture)
 6. [Results: PCIe Generation Impact on KV Cache I/O](#6-results-pcie-generation-impact)
-7. [Results: Batch Size Sweep and Why Batch Size Is Not the Bottleneck in Sparse Models](#7-results-batch-size-sweep)
+7. [Results: Batch Size Sweep — IO Dominance Grows with Batch Size in Dense MHA Models](#7-results-batch-size-sweep)
 8. [Discussion and Conclusions](#8-discussion-and-conclusions)
 
 ---
@@ -254,7 +254,7 @@ All experiments use the following common configuration:
 |-----------|--------|----------|--------|
 | 1: Architecture comparison | Llama-2-7B, DeepSeek-V3 | Architecture | Dense MHA vs. MoE MLA |
 | 2: PCIe generation | Both | PCIe BW | Gen3 (16 GB/s), Gen4 (31.5 GB/s) |
-| 3: Batch size sweep | DeepSeek-V3 | Batch size cap | 16, 32, 64, 128, 256, 512 |
+| 3: Batch size sweep | Llama-2-7B | Batch size cap | 1, 4, 16, 32, 64 |
 
 ---
 
@@ -388,55 +388,57 @@ For DeepSeek-V3, the slight reduction at Gen3 is an artifact of scheduler behavi
 
 ## 7. Results: Batch Size Sweep
 
-### 7.1 Batch Size Does Not Affect IO/Compute Ratio
+### 7.1 IO/Compute Ratio Grows with Batch Size in Dense MHA Models
 
-![Batch Size Sweep](report_figures/fig7_batch_size_vs_context_length.png)
-*Figure 10: (Left) IO vs. Compute across batch size caps 16-512: both metrics remain constant. (Right) Analytical model showing KV load time scales with context length, not batch size, for MLA models.*
+We swept batch size caps from 1 to 64 for **Llama-2-7B** (MHA, TP=1, A100 PCIe Gen4) using a saturating QPS (100 req/s) with 64 requests and KV prefetch enabled. This model has real GPU profiling data available on A100 and is representative of the MHA IO-bound regime identified in Section 5.
 
-We swept batch size caps from 16 to 512 for DeepSeek-V3:
+| Batch Size Cap | Decode Batches | IO-Bound % | Avg KV Load (ms) | Avg Compute (ms) | Median IO/Compute |
+|---------------|---------------|------------|-----------------|-----------------|-------------------|
+| 1  | 32,704 | 100.0% | 1.3951 | 0.3164 |  4.4× |
+| 4  |  8,264 | 100.0% | 5.5209 | 0.4297 | 13.8× |
+| 16 |  2,121 |  99.9% | 21.511 | 0.7711 | 33.1× |
+| 32 |  1,159 |  99.7% | 39.366 | 1.1418 | 43.5× |
+| 64 |  1,100 |  99.7% | 41.470 | 1.2043 | 31.6× |
 
-| Batch Size Cap | Avg KV Load (ms) | Avg Compute (ms) | IO/Compute Ratio |
-|---------------|-----------------|-----------------|-----------------|
-| 16 | 0.2904 | 0.2164 | 1.34x |
-| 32 | 0.2904 | 0.2164 | 1.34x |
-| 64 | 0.2904 | 0.2164 | 1.34x |
-| 128 | 0.2904 | 0.2164 | 1.34x |
-| 256 | 0.2904 | 0.2164 | 1.34x |
-| 512 | 0.2904 | 0.2164 | 1.34x |
+Two findings stand out:
 
-The IO/Compute ratio is **constant at 1.34x across all batch sizes**. This is a critical finding.
+1. **The model is IO-bound across all batch sizes** — always ≥99.7%, confirming the Section 5 result that MHA is a severe IO bottleneck.
+2. **The IO/Compute ratio is not constant; it rises sharply with batch size** (4.4× → 43.5×), then saturates. This is a new, non-obvious finding that contradicts a naive linear-scaling assumption.
 
-### 7.2 Why Batch Size Is Not the Bottleneck for Sparse Models
+### 7.2 Why the Ratio Increases: Compute Is Latency-Bound at Small Batches
 
-In dense models, increasing batch size increases both compute and IO proportionally (more tokens to attend to, more KV to load). The ratio remains stable. But the absolute times grow, and the system becomes compute-limited when batch GEMM utilization saturates GPU SMs.
+The KV cache load time per layer scales strictly linearly with batch size, as expected from the bandwidth formula:
 
-For sparse MoE models like DeepSeek-V3, the situation is fundamentally different:
-
-**1. Context length, not batch size, determines KV cache IO:**
-
-The KV cache load time per layer is:
 $$T_{\text{kv}} = \frac{kv\_bytes\_per\_token \times avg\_kv\_length \times decode\_bs}{PCIe\_BW \times 0.8}$$
 
-For MLA with `kv_lora_rank=512, qk_rope_head_dim=64`:
-- KV bytes/token/layer = (512 + 64) x 2 = **1,152 bytes**
+From cap=1 to cap=4, KV load scales by ≈4× (1.40 → 5.52 ms). From cap=4 to cap=16, it scales by ≈4× again (5.52 → 21.5 ms). This is textbook bandwidth-bound behavior.
 
-At a fixed context length, doubling batch size doubles both the numerator (more requests) and the total compute (more tokens processed), so the ratio stays constant. The absolute IO time per layer is the same for a batch of 16 requests with 2K context vs. 128 requests with 2K context, because the **per-token KV size is tiny** (1.15 KB).
+**Compute does not scale linearly.** The avg compute at cap=1 is 0.316 ms, but at cap=4 it is only 0.430 ms (1.36× increase for a 4× larger batch). At cap=16 it is 0.771 ms (only 5.8× vs. baseline for 16× batch). This sub-linear scaling has a well-known cause: **MLP GEMMs are latency-bound at tiny batch sizes**.
 
-**2. Expert compute scales sub-linearly with batch size:**
+For decode, each request contributes exactly one new token. The MLP projections are matrix-vector products when batch=1, and small skinny GEMMs when batch=4–16. These operations are memory-bandwidth-bound (HBM reads dominate, ALU throughput is underutilized), and their effective TFLOPS per token grows only slowly as batch increases. As batch grows into the hundreds, the GEMMs become large enough to be compute-bound (ALU-limited), and throughput per token stabilizes. In our experiment this saturation appears around cap=32, where the effective decode batch is ~29 requests.
 
-MoE routed expert compute uses grouped GEMM, which has poor utilization (MFU ~15%) regardless of batch size for decode (batch size = 1 token per request). The grouped GEMM kernel processes `num_experts_per_tok` (8) small matrix multiplications per token. Increasing the decode batch size adds more tokens to route, but each token independently activates 8 out of 256 experts. The total FLOPs scale linearly, but the grouped GEMM MFU doesn't improve significantly because the per-expert batch size remains small.
+The consequence is that IO/Compute ratio = (linear in batch) / (sub-linear in batch) = **grows with batch size** until compute catches up. This makes IO dominance *worse*, not better, as batch size increases for MHA models.
 
-**3. The real bottleneck is context length:**
+### 7.3 Saturation at Cap=32 and Cap=64
 
-The right panel of Figure 10 shows how KV load time scales with context length for different batch sizes. At context length 512, the KV load is negligible (~0.03 ms). At context length 16K, it reaches 0.7 ms for a single request, crossing the compute threshold. This demonstrates that **context length is the primary driver of IO-boundedness** in MoE models, not batch size.
+The cap=32 and cap=64 runs show nearly identical statistics (avg KV load 39.4 ms vs. 41.5 ms, ratio 43.5× vs. 31.6×). With only 64 total requests in the experiment and high QPS, the scheduler can place at most ~29–30 requests in the decode queue simultaneously (some are still in the prefill phase). This means caps above ~30 produce the same effective batch size; the cap is not the binding constraint.
 
-**4. Communication overhead is the true scaling bottleneck:**
+The P90/P95 ratios at cap=64 (50.7× and 51.0×) are higher than the median (31.6×), indicating that tail batches — which are closer to fully saturating the cap — do reach very high IO dominance.
 
-For DeepSeek-V3 with TP=8, each layer requires two all-reduce operations (after attention and after MLP), contributing 0.614 ms/layer of communication overhead. This is **independent of both batch size and context length**, creating a fixed per-token latency floor that dominates at scale.
+### 7.4 Implications for KV Prefetch
 
-### 7.3 Analytical Crossover Point
+KV prefetch savings are bounded by `min(compute_time, next_kv_load_time)`. Since compute is far smaller than IO at every batch size (by 4.4–43.5×), prefetch savings equal the compute time and are **capped by compute throughput, not PCIe bandwidth**. As batch size grows and compute improves (sub-linear GEMM efficiency), the absolute prefetch savings increase slightly, but as a fraction of the growing KV load they become negligible. Concretely:
 
-From the IO crossover analysis, the analytical KV length where IO equals compute for DeepSeek-V3 is approximately **38,480 tokens**. Below this context length, the model is compute-bound in most batches; above it, IO dominates. For our experiments (2K prefill + 512 decode = ~2.5K context on average), the model operates near the boundary, explaining the 60.3% IO-bound observation.
+- At cap=1: prefetch can hide at most 0.32 ms of a 1.40 ms KV load (23%)
+- At cap=16: prefetch can hide at most 0.77 ms of a 21.5 ms KV load (3.6%)
+
+Prefetch is most effective at the smallest batch sizes, where the KV load is small enough that compute time represents a significant fraction of it.
+
+### 7.5 Comparison with the Analytical Crossover Point
+
+From Section 5's architecture comparison, Llama-2-7B has an IO/Compute ratio of ~4.94× at the typical operating point (QPS=0.5, 128 requests, ~2.5K context). The sweep result at cap=1 gives 4.4× — consistent with that baseline, since both represent single-request or near-single-request decode batches at similar context lengths.
+
+The fact that the ratio grows to 43.5× at cap=32 underscores that **dense MHA models become more IO-bottlenecked, not less, as batch size increases** — the opposite of the compute-bottleneck assumption that motivates batching for throughput.
 
 ---
 
@@ -458,8 +460,8 @@ Halving PCIe bandwidth (Gen4 -> Gen3) nearly doubles KV load times for both mode
 **3. KV prefetch savings are bounded by compute time:**
 GPU-initiated prefetching saves `min(compute_time, next_kv_load_time)` per layer. In IO-dominant regimes, this is always the compute time, making prefetch savings constant regardless of PCIe bandwidth. Prefetch is most effective when IO and compute are roughly balanced.
 
-**4. Batch size is not the IO bottleneck for sparse MoE models:**
-Unlike dense models where batch size drives memory pressure, MoE models with MLA have such compact KV caches that batch size has negligible effect on the IO/Compute ratio. The true bottleneck is **context length** (which determines total KV bytes to transfer) and **communication overhead** (which scales with TP degree, not batch size).
+**4. Increasing batch size worsens IO dominance in dense MHA models:**
+The batch size sweep (Section 7) shows that the IO/Compute ratio *grows* with batch size for Llama-2-7B (4.4× at cap=1, 43.5× at cap=32). KV load time scales linearly with batch size (bandwidth-bound), while MLP compute scales sub-linearly (GEMMs are latency-bound at small decode batches). Batching for throughput therefore does not help escape the IO bottleneck in MHA models — it deepens it until compute catches up at large batch sizes. The crossover for KV prefetch effectiveness also shifts: at small batches, prefetch hides ~23% of KV load; at large batches, only ~4%.
 
 **5. Communication is the hidden bottleneck at scale:**
 For DeepSeek-V3 with TP=8, all-reduce communication contributes 0.307 ms per layer x 2 (attention + MLP) = 0.614 ms, which is comparable to the total compute time (0.702 ms). As models scale to more GPUs, communication overhead becomes the dominant factor, making PCIe and batch size optimizations secondary.
@@ -505,7 +507,7 @@ python -m vidur.main \
 
 **Experiment 2 (PCIe Gen3):** Same commands, with A100 `pcie_bandwidth_gb_per_s` patched to 16.0 GB/s.
 
-**Experiment 3 (Batch Size Sweep):** DeepSeek-V3 command with `--vllm_scheduler_config_batch_size_cap` set to 16/32/64/128/256/512.
+**Experiment 3 (Batch Size Sweep):** Llama-2-7B with `--sarathi_scheduler_config_batch_size_cap` set to 1/4/16/32/64 and `--poisson_request_interval_generator_config_qps 100.0` (saturating QPS). Run via `python run_batch_sweep.py`.
 
 **Full experiment runner:** `python run_experiments.py`
 
@@ -524,5 +526,5 @@ All figures in this report are generated by `generate_report_figures.py` and sto
 | 7 | `fig9_request_metrics.png` | Request-level metrics |
 | 8 | `fig8_layer_waterfall_deepseek.png` | Layer execution waterfall |
 | 9 | `fig4_pcie_comparison.png` | PCIe generation impact |
-| 10 | `fig7_batch_size_vs_context_length.png` | Batch size vs. context length |
+| 10 | `fig7_batch_size_vs_context_length.png` | Batch size sweep: IO/compute ratio vs. batch size cap (Llama-2-7B) |
 | 11 | `fig11_summary_table.png` | Complete summary table |
