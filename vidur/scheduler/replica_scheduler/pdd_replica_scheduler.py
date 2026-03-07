@@ -26,11 +26,8 @@ class PddReplicaScheduler(BaseReplicaScheduler):
         )
         self._max_micro_batch_size = self._config.batch_size_cap // self._num_stages
 
-    def on_schedule(self, time: float) -> List[Batch]:
+    def on_schedule(self) -> List[Batch]:
         """Schedule requests from global queue into prefill/decode batches.
-
-        Args:
-            time: Current simulation time
 
         Returns:
             List of batches to execute (prefill or decode batches)
