@@ -50,6 +50,12 @@ class LayerTimingStore:
             "stage_id": stage_id,
             "enable_prefetch": execution_time.enable_kv_prefetch,
             "total_prefetch_savings_ms": execution_time.total_prefetch_savings_ms,
+            # PDD KV transfer metrics
+            "inter_gpu_kv_transfer_time_ms": execution_time.inter_gpu_kv_transfer_time_ms,
+            "inter_gpu_kv_transfer_bytes": execution_time.inter_gpu_kv_transfer_bytes,
+            "effective_inter_gpu_kv_transfer_ms": (
+                execution_time.effective_inter_gpu_kv_transfer_time_ms
+            ),
             "layers": [l.to_dict() for l in layers],
         }
         self._batch_layer_timings.append(record)
@@ -75,6 +81,15 @@ class LayerTimingStore:
                     "replica_id": record["replica_id"],
                     "stage_id": record["stage_id"],
                     "enable_prefetch": record["enable_prefetch"],
+                    "inter_gpu_kv_transfer_time_ms": record.get(
+                        "inter_gpu_kv_transfer_time_ms", 0.0
+                    ),
+                    "inter_gpu_kv_transfer_bytes": record.get(
+                        "inter_gpu_kv_transfer_bytes", 0.0
+                    ),
+                    "effective_inter_gpu_kv_transfer_ms": record.get(
+                        "effective_inter_gpu_kv_transfer_ms", 0.0
+                    ),
                     **layer,
                 })
 

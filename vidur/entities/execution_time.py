@@ -95,6 +95,10 @@ class ExecutionTime(BaseEntity):
             layer_executions if layer_executions is not None else []
         )
 
+        # PDD: Inter-GPU KV cache transfer time (between prefill and decode stages)
+        self._inter_gpu_kv_transfer_time: float = 0.0
+        self._inter_gpu_kv_transfer_bytes: float = 0.0
+
         # Build per-layer breakdowns if not provided
         if not self._layer_executions:
             self._build_layer_executions()
@@ -267,6 +271,49 @@ class ExecutionTime(BaseEntity):
     def total_prefetch_savings_ms(self) -> float:
         """Total time saved by KV cache prefetching (ms)."""
         return sum(l.prefetch_overlap_savings for l in self._layer_executions)
+
+    # ---- PDD (Prefill-Decode Disaggregation) properties ----
+
+    @property
+    def inter_gpu_kv_transfer_time_ms(self) -> float:
+        """Inter-GPU KV cache transfer time in milliseconds (PDD)."""
+        return self._inter_gpu_kv_transfer_time
+
+    @property
+    def inter_gpu_kv_transfer_bytes(self) -> float:
+        """Total KV cache bytes transferred between GPUs (PDD)."""
+        return self._inter_gpu_kv_transfer_bytes
+
+    def set_inter_gpu_kv_transfer(
+        self, transfer_time_ms: float, transfer_bytes: float = 0.0
+    ) -> None:
+        """Set inter-GPU KV cache transfer time (called by KvCacheTransferEvent).
+
+        Args:
+            transfer_time_ms: Transfer latency in milliseconds
+            transfer_bytes: Optional total bytes transferred (for metrics)
+        """
+        self._inter_gpu_kv_transfer_time = transfer_time_ms
+        self._inter_gpu_kv_transfer_bytes = transfer_bytes
+
+    @property
+    def effective_inter_gpu_kv_transfer_time_ms(self) -> float:
+        """Inter-GPU KV transfer time after accounting for overlap with first decode layer compute.
+
+        In PDD, the KV transfer can overlap with the first decode layer's compute
+        if KV prefetch is enabled. This returns the effective (reduced) latency.
+        """
+        if not self._enable_kv_prefetch or not self._layer_executions:
+            return self._inter_gpu_kv_transfer_time
+
+        # Compute time of first decode layer
+        first_layer_compute = (
+            self._layer_executions[0].compute_time if self._layer_executions else 0.0
+        )
+
+        # Overlap is the minimum of transfer time and first layer compute
+        overlap = min(self._inter_gpu_kv_transfer_time, first_layer_compute)
+        return max(0.0, self._inter_gpu_kv_transfer_time - overlap)
 
     # ---- MoE properties ----
 
