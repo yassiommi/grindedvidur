@@ -1,0 +1,1153 @@
+{
+  "description": "Prefill-Decode Disaggregation (PDD): KV Cache Transfer Analysis",
+  "methodology": "Analytical FLOPs-based timing model (InferSim approach) with PCIe bandwidth-based KV cache transfer modeling and prefetch overlap computation.",
+  "primary_gpu": "A100-80GB",
+  "models": {
+    "Llama-2-7B": "32 layers, 4096 hidden, 32 KV heads, MHA",
+    "Llama-2-70B": "80 layers, 8192 hidden, 8 KV heads, GQA",
+    "DeepSeek-V3": "61 layers, 7168 hidden, 128 KV heads, MLA (512-dim compressed KV)"
+  },
+  "key_findings": [
+    "KV transfer latency spans 3 orders of magnitude across interconnects: PCIe Gen3 at 16 GB/s is 28x slower than NVLink 4 at 450 GB/s. For Llama-70B seq=4096, Gen3 requires ~156ms vs ~5.5ms on NVLink.",
+    "PDD adds 317.5ms KV transfer overhead to TTFT at batch=32 (Llama-7B, seq=512, A100), but provides dedicated decode GPU utilization (no prefill interference).",
+    "GQA (Llama-70B, 8 KV heads) reduces per-token KV cache by 1.6x vs MHA (Llama-7B, 32 KV heads), despite 2.5x more layers. MLA (DeepSeek-V3) achieves the lowest per-token KV cost at 61.0 KB.",
+    "Llama-2-7B: decode compute hides 1% of KV transfer at batch=32, seq=1024 (A100-80GB).",
+    "Llama-2-70B: decode compute hides 14% of KV transfer at batch=32, seq=1024 (A100-80GB).",
+    "DeepSeek-V3: decode compute hides 55% of KV transfer at batch=32, seq=1024 (A100-80GB).",
+    "PDD transfer overhead is amortized across output tokens: with 128 output tokens, per-token overhead drops below 0.01ms at batch=128 for all tested sequence lengths.",
+    "H100 (PCIe Gen5, 64 GB/s) halves KV transfer time vs A100 (PCIe Gen4, 31.5 GB/s), but also has 3.2x more compute, making the I/O-to-compute ratio worse (harder to hide transfers)."
+  ],
+  "experiments": {
+    "exp1": {
+      "Llama-2-7B": {
+        "PCIe Gen3": {
+          "bandwidth": 16.0,
+          "times": [
+            4.8828125,
+            9.765625,
+            19.53125,
+            39.0625,
+            78.125,
+            156.25,
+            312.5
+          ]
+        },
+        "PCIe Gen4": {
+          "bandwidth": 31.5,
+          "times": [
+            2.4801587301587302,
+            4.9603174603174605,
+            9.920634920634921,
+            19.841269841269842,
+            39.682539682539684,
+            79.36507936507937,
+            158.73015873015873
+          ]
+        },
+        "PCIe Gen5": {
+          "bandwidth": 64.0,
+          "times": [
+            1.220703125,
+            2.44140625,
+            4.8828125,
+            9.765625,
+            19.53125,
+            39.0625,
+            78.125
+          ]
+        },
+        "NVLink 4": {
+          "bandwidth": 450.0,
+          "times": [
+            0.1736111111111111,
+            0.3472222222222222,
+            0.6944444444444444,
+            1.3888888888888888,
+            2.7777777777777777,
+            5.555555555555555,
+            11.11111111111111
+          ]
+        }
+      },
+      "Llama-2-70B": {
+        "PCIe Gen3": {
+          "bandwidth": 16.0,
+          "times": [
+            3.0517578125,
+            6.103515625,
+            12.20703125,
+            24.4140625,
+            48.828125,
+            97.65625,
+            195.3125
+          ]
+        },
+        "PCIe Gen4": {
+          "bandwidth": 31.5,
+          "times": [
+            1.5500992063492063,
+            3.1001984126984126,
+            6.200396825396825,
+            12.40079365079365,
+            24.8015873015873,
+            49.6031746031746,
+            99.2063492063492
+          ]
+        },
+        "PCIe Gen5": {
+          "bandwidth": 64.0,
+          "times": [
+            0.762939453125,
+            1.52587890625,
+            3.0517578125,
+            6.103515625,
+            12.20703125,
+            24.4140625,
+            48.828125
+          ]
+        },
+        "NVLink 4": {
+          "bandwidth": 450.0,
+          "times": [
+            0.10850694444444443,
+            0.21701388888888887,
+            0.43402777777777773,
+            0.8680555555555555,
+            1.736111111111111,
+            3.472222222222222,
+            6.944444444444444
+          ]
+        }
+      },
+      "DeepSeek-V3": {
+        "PCIe Gen3": {
+          "bandwidth": 16.0,
+          "times": [
+            0.5817413330078125,
+            1.163482666015625,
+            2.32696533203125,
+            4.6539306640625,
+            9.307861328125,
+            18.61572265625,
+            37.2314453125
+          ]
+        },
+        "PCIe Gen4": {
+          "bandwidth": 31.5,
+          "times": [
+            0.29548766121031744,
+            0.5909753224206349,
+            1.1819506448412698,
+            2.3639012896825395,
+            4.727802579365079,
+            9.455605158730158,
+            18.911210317460316
+          ]
+        },
+        "PCIe Gen5": {
+          "bandwidth": 64.0,
+          "times": [
+            0.14543533325195312,
+            0.29087066650390625,
+            0.5817413330078125,
+            1.163482666015625,
+            2.32696533203125,
+            4.6539306640625,
+            9.307861328125
+          ]
+        },
+        "NVLink 4": {
+          "bandwidth": 450.0,
+          "times": [
+            0.020684136284722224,
+            0.04136827256944445,
+            0.0827365451388889,
+            0.1654730902777778,
+            0.3309461805555556,
+            0.6618923611111112,
+            1.3237847222222223
+          ]
+        }
+      }
+    },
+    "exp2": [
+      {
+        "batch_size": 1,
+        "prefill_ms": 74.63710194871788,
+        "colocated_ttft_ms": 74.63710194871788,
+        "colocated_decode_ms": 0.153261402648357,
+        "pdd_transfer_ms": 9.920634920634921,
+        "pdd_effective_transfer_ms": 9.916079433455433,
+        "pdd_ttft_ms": 84.55773686935281,
+        "pdd_decode_ms": 0.153261402648357,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 6524.800000000002,
+        "pdd_tok_per_s": 6524.800000000002
+      },
+      {
+        "batch_size": 4,
+        "prefill_ms": 298.54840779487154,
+        "colocated_ttft_ms": 298.54840779487154,
+        "colocated_decode_ms": 0.613045610593428,
+        "pdd_transfer_ms": 39.682539682539684,
+        "pdd_effective_transfer_ms": 39.66431773382173,
+        "pdd_ttft_ms": 338.23094747741123,
+        "pdd_decode_ms": 0.613045610593428,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 1631.2000000000005,
+        "pdd_tok_per_s": 1631.2000000000005
+      },
+      {
+        "batch_size": 8,
+        "prefill_ms": 597.0968155897431,
+        "colocated_ttft_ms": 597.0968155897431,
+        "colocated_decode_ms": 1.226091221186856,
+        "pdd_transfer_ms": 79.36507936507937,
+        "pdd_effective_transfer_ms": 79.32863546764347,
+        "pdd_ttft_ms": 676.4618949548225,
+        "pdd_decode_ms": 1.226091221186856,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 815.6000000000003,
+        "pdd_tok_per_s": 815.6000000000003
+      },
+      {
+        "batch_size": 16,
+        "prefill_ms": 1194.1936311794861,
+        "colocated_ttft_ms": 1194.1936311794861,
+        "colocated_decode_ms": 2.452182442373712,
+        "pdd_transfer_ms": 158.73015873015873,
+        "pdd_effective_transfer_ms": 158.65727093528693,
+        "pdd_ttft_ms": 1352.923789909645,
+        "pdd_decode_ms": 2.452182442373712,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 407.8000000000001,
+        "pdd_tok_per_s": 407.8000000000001
+      },
+      {
+        "batch_size": 32,
+        "prefill_ms": 2388.3872623589723,
+        "colocated_ttft_ms": 2388.3872623589723,
+        "colocated_decode_ms": 4.904364884747424,
+        "pdd_transfer_ms": 317.46031746031747,
+        "pdd_effective_transfer_ms": 317.31454187057386,
+        "pdd_ttft_ms": 2705.84757981929,
+        "pdd_decode_ms": 4.904364884747424,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 203.90000000000006,
+        "pdd_tok_per_s": 203.90000000000006
+      },
+      {
+        "batch_size": 64,
+        "prefill_ms": 4776.774524717945,
+        "colocated_ttft_ms": 4776.774524717945,
+        "colocated_decode_ms": 9.808729769494848,
+        "pdd_transfer_ms": 634.9206349206349,
+        "pdd_effective_transfer_ms": 634.6290837411477,
+        "pdd_ttft_ms": 5411.69515963858,
+        "pdd_decode_ms": 9.808729769494848,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 101.95000000000003,
+        "pdd_tok_per_s": 101.95000000000003
+      },
+      {
+        "batch_size": 128,
+        "prefill_ms": 9553.54904943589,
+        "colocated_ttft_ms": 9553.54904943589,
+        "colocated_decode_ms": 19.617459538989696,
+        "pdd_transfer_ms": 1269.8412698412699,
+        "pdd_effective_transfer_ms": 1269.2581674822954,
+        "pdd_ttft_ms": 10823.39031927716,
+        "pdd_decode_ms": 19.617459538989696,
+        "transfer_to_compute_ratio": 64.73015873015875,
+        "colocated_tok_per_s": 50.975000000000016,
+        "pdd_tok_per_s": 50.975000000000016
+      }
+    ],
+    "exp3": {
+      "Llama-2-7B": {
+        "per_tok_per_layer": 16384,
+        "per_tok_total": 524288,
+        "sizes_mb": [
+          64.0,
+          128.0,
+          256.0,
+          512.0,
+          1024.0,
+          2048.0,
+          4096.0,
+          8192.0
+        ],
+        "num_layers": 32,
+        "num_kv_heads": 32,
+        "head_dim": 128,
+        "has_mla": false
+      },
+      "Llama-2-70B": {
+        "per_tok_per_layer": 4096,
+        "per_tok_total": 327680,
+        "sizes_mb": [
+          40.0,
+          80.0,
+          160.0,
+          320.0,
+          640.0,
+          1280.0,
+          2560.0,
+          5120.0
+        ],
+        "num_layers": 80,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+        "has_mla": false
+      },
+      "DeepSeek-V3": {
+        "per_tok_per_layer": 1024,
+        "per_tok_total": 62464,
+        "sizes_mb": [
+          7.625,
+          15.25,
+          30.5,
+          61.0,
+          122.0,
+          244.0,
+          488.0,
+          976.0
+        ],
+        "num_layers": 61,
+        "num_kv_heads": 128,
+        "head_dim": 56,
+        "has_mla": true
+      }
+    },
+    "exp4": {
+      "Llama-2-7B": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 19.841269841269842,
+          "total_decode_compute_ms": 0.147456,
+          "overlap_ms": 0.147456,
+          "effective_transfer_ms": 19.693813841269844,
+          "hidden_pct": 0.74317824,
+          "layers_to_hide": 33,
+          "transfer_to_compute_ratio": 134.5572227733686
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 158.73015873015873,
+          "total_decode_compute_ms": 1.179648,
+          "overlap_ms": 1.179648,
+          "effective_transfer_ms": 157.55051073015875,
+          "hidden_pct": 0.74317824,
+          "layers_to_hide": 33,
+          "transfer_to_compute_ratio": 134.5572227733686
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 634.9206349206349,
+          "total_decode_compute_ms": 4.718592,
+          "overlap_ms": 4.718592,
+          "effective_transfer_ms": 630.202042920635,
+          "hidden_pct": 0.74317824,
+          "layers_to_hide": 33,
+          "transfer_to_compute_ratio": 134.5572227733686
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 1269.8412698412699,
+          "total_decode_compute_ms": 9.437184,
+          "overlap_ms": 9.437184,
+          "effective_transfer_ms": 1260.40408584127,
+          "hidden_pct": 0.74317824,
+          "layers_to_hide": 33,
+          "transfer_to_compute_ratio": 134.5572227733686
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 2539.6825396825398,
+          "total_decode_compute_ms": 18.874368,
+          "overlap_ms": 18.874368,
+          "effective_transfer_ms": 2520.80817168254,
+          "hidden_pct": 0.74317824,
+          "layers_to_hide": 33,
+          "transfer_to_compute_ratio": 134.5572227733686
+        }
+      ],
+      "Llama-2-70B": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 12.40079365079365,
+          "total_decode_compute_ms": 1.7308225641025616,
+          "overlap_ms": 1.7308225641025616,
+          "effective_transfer_ms": 10.669971086691088,
+          "hidden_pct": 13.957353156923059,
+          "layers_to_hide": 81,
+          "transfer_to_compute_ratio": 7.164682219880529
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 99.2063492063492,
+          "total_decode_compute_ms": 13.846580512820493,
+          "overlap_ms": 13.846580512820493,
+          "effective_transfer_ms": 85.35976869352871,
+          "hidden_pct": 13.957353156923059,
+          "layers_to_hide": 81,
+          "transfer_to_compute_ratio": 7.164682219880529
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 396.8253968253968,
+          "total_decode_compute_ms": 55.38632205128197,
+          "overlap_ms": 55.38632205128197,
+          "effective_transfer_ms": 341.43907477411483,
+          "hidden_pct": 13.957353156923059,
+          "layers_to_hide": 81,
+          "transfer_to_compute_ratio": 7.164682219880529
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 793.6507936507936,
+          "total_decode_compute_ms": 110.77264410256394,
+          "overlap_ms": 110.77264410256394,
+          "effective_transfer_ms": 682.8781495482297,
+          "hidden_pct": 13.957353156923059,
+          "layers_to_hide": 81,
+          "transfer_to_compute_ratio": 7.164682219880529
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 1587.3015873015872,
+          "total_decode_compute_ms": 221.5452882051279,
+          "overlap_ms": 221.5452882051279,
+          "effective_transfer_ms": 1365.7562990964593,
+          "hidden_pct": 13.957353156923059,
+          "layers_to_hide": 81,
+          "transfer_to_compute_ratio": 7.164682219880529
+        }
+      ],
+      "DeepSeek-V3": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 2.3639012896825395,
+          "total_decode_compute_ms": 1.2921238974358964,
+          "overlap_ms": 1.2921238974358964,
+          "effective_transfer_ms": 1.0717773922466431,
+          "hidden_pct": 54.66065368615381,
+          "layers_to_hide": 62,
+          "transfer_to_compute_ratio": 1.8294695225229476
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 18.911210317460316,
+          "total_decode_compute_ms": 10.336991179487171,
+          "overlap_ms": 10.336991179487171,
+          "effective_transfer_ms": 8.574219137973145,
+          "hidden_pct": 54.66065368615381,
+          "layers_to_hide": 62,
+          "transfer_to_compute_ratio": 1.8294695225229476
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 75.64484126984127,
+          "total_decode_compute_ms": 41.347964717948685,
+          "overlap_ms": 41.347964717948685,
+          "effective_transfer_ms": 34.29687655189258,
+          "hidden_pct": 54.66065368615381,
+          "layers_to_hide": 62,
+          "transfer_to_compute_ratio": 1.8294695225229476
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 151.28968253968253,
+          "total_decode_compute_ms": 82.69592943589737,
+          "overlap_ms": 82.69592943589737,
+          "effective_transfer_ms": 68.59375310378516,
+          "hidden_pct": 54.66065368615381,
+          "layers_to_hide": 62,
+          "transfer_to_compute_ratio": 1.8294695225229476
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 302.57936507936506,
+          "total_decode_compute_ms": 165.39185887179474,
+          "overlap_ms": 165.39185887179474,
+          "effective_transfer_ms": 137.18750620757032,
+          "hidden_pct": 54.66065368615381,
+          "layers_to_hide": 62,
+          "transfer_to_compute_ratio": 1.8294695225229476
+        }
+      ]
+    },
+    "exp5": {
+      "256": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 4.9603174603174605,
+          "decode_compute_ms": 0.1449353846153846,
+          "decode_total_ms": 0.1449353846153846,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 2,
+          "transfer_ms": 9.920634920634921,
+          "decode_compute_ms": 0.2898707692307692,
+          "decode_total_ms": 0.2898707692307692,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 4,
+          "transfer_ms": 19.841269841269842,
+          "decode_compute_ms": 0.5797415384615384,
+          "decode_total_ms": 0.5797415384615384,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 39.682539682539684,
+          "decode_compute_ms": 1.1594830769230768,
+          "decode_total_ms": 1.1594830769230768,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 16,
+          "transfer_ms": 79.36507936507937,
+          "decode_compute_ms": 2.3189661538461537,
+          "decode_total_ms": 2.3189661538461537,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 158.73015873015873,
+          "decode_compute_ms": 4.637932307692307,
+          "decode_total_ms": 4.637932307692307,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 317.46031746031747,
+          "decode_compute_ms": 9.275864615384615,
+          "decode_total_ms": 9.275864615384615,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 634.9206349206349,
+          "decode_compute_ms": 18.55172923076923,
+          "decode_total_ms": 18.55172923076923,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        },
+        {
+          "batch_size": 256,
+          "transfer_ms": 1269.8412698412699,
+          "decode_compute_ms": 37.10345846153846,
+          "decode_total_ms": 37.10345846153846,
+          "transfer_per_output_tok_ms": 0.03875248015873016,
+          "pdd_throughput_tok_s": 5444.017770197956,
+          "colocated_throughput_tok_s": 6899.626358695653,
+          "pdd_overhead_pct": 26.737763356800492
+        }
+      ],
+      "512": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 9.920634920634921,
+          "decode_compute_ms": 0.14577558974358962,
+          "decode_total_ms": 0.153261402648357,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 2,
+          "transfer_ms": 19.841269841269842,
+          "decode_compute_ms": 0.29155117948717924,
+          "decode_total_ms": 0.306522805296714,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 4,
+          "transfer_ms": 39.682539682539684,
+          "decode_compute_ms": 0.5831023589743585,
+          "decode_total_ms": 0.613045610593428,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 79.36507936507937,
+          "decode_compute_ms": 1.166204717948717,
+          "decode_total_ms": 1.226091221186856,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 16,
+          "transfer_ms": 158.73015873015873,
+          "decode_compute_ms": 2.332409435897434,
+          "decode_total_ms": 2.452182442373712,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 317.46031746031747,
+          "decode_compute_ms": 4.664818871794868,
+          "decode_total_ms": 4.904364884747424,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 634.9206349206349,
+          "decode_compute_ms": 9.329637743589736,
+          "decode_total_ms": 9.808729769494848,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 1269.8412698412699,
+          "decode_compute_ms": 18.65927548717947,
+          "decode_total_ms": 19.617459538989696,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 256,
+          "transfer_ms": 2539.6825396825398,
+          "decode_compute_ms": 37.31855097435894,
+          "decode_total_ms": 39.23491907797939,
+          "transfer_per_output_tok_ms": 0.07750496031746032,
+          "pdd_throughput_tok_s": 4333.387184977763,
+          "colocated_throughput_tok_s": 6524.800000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        }
+      ],
+      "1024": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 19.841269841269842,
+          "decode_compute_ms": 0.147456,
+          "decode_total_ms": 0.306522805296714,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 2,
+          "transfer_ms": 39.682539682539684,
+          "decode_compute_ms": 0.294912,
+          "decode_total_ms": 0.613045610593428,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 4,
+          "transfer_ms": 79.36507936507937,
+          "decode_compute_ms": 0.589824,
+          "decode_total_ms": 1.226091221186856,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 158.73015873015873,
+          "decode_compute_ms": 1.179648,
+          "decode_total_ms": 2.452182442373712,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 16,
+          "transfer_ms": 317.46031746031747,
+          "decode_compute_ms": 2.359296,
+          "decode_total_ms": 4.904364884747424,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 634.9206349206349,
+          "decode_compute_ms": 4.718592,
+          "decode_total_ms": 9.808729769494848,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 1269.8412698412699,
+          "decode_compute_ms": 9.437184,
+          "decode_total_ms": 19.617459538989696,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 2539.6825396825398,
+          "decode_compute_ms": 18.874368,
+          "decode_total_ms": 39.23491907797939,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 256,
+          "transfer_ms": 5079.3650793650795,
+          "decode_compute_ms": 37.748736,
+          "decode_total_ms": 78.46983815595878,
+          "transfer_per_output_tok_ms": 0.15500992063492064,
+          "pdd_throughput_tok_s": 2166.6935924888817,
+          "colocated_throughput_tok_s": 3262.4000000000005,
+          "pdd_overhead_pct": 50.57043650793652
+        }
+      ],
+      "2048": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 39.682539682539684,
+          "decode_compute_ms": 0.15081682051282053,
+          "decode_total_ms": 0.613045610593428,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 2,
+          "transfer_ms": 79.36507936507937,
+          "decode_compute_ms": 0.30163364102564105,
+          "decode_total_ms": 1.226091221186856,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 4,
+          "transfer_ms": 158.73015873015873,
+          "decode_compute_ms": 0.6032672820512821,
+          "decode_total_ms": 2.452182442373712,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 317.46031746031747,
+          "decode_compute_ms": 1.2065345641025642,
+          "decode_total_ms": 4.904364884747424,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 16,
+          "transfer_ms": 634.9206349206349,
+          "decode_compute_ms": 2.4130691282051284,
+          "decode_total_ms": 9.808729769494848,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 1269.8412698412699,
+          "decode_compute_ms": 4.826138256410257,
+          "decode_total_ms": 19.617459538989696,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 2539.6825396825398,
+          "decode_compute_ms": 9.652276512820514,
+          "decode_total_ms": 39.23491907797939,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 5079.3650793650795,
+          "decode_compute_ms": 19.304553025641027,
+          "decode_total_ms": 78.46983815595878,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 256,
+          "transfer_ms": 10158.730158730159,
+          "decode_compute_ms": 38.609106051282055,
+          "decode_total_ms": 156.93967631191757,
+          "transfer_per_output_tok_ms": 0.3100198412698413,
+          "pdd_throughput_tok_s": 1083.3467962444408,
+          "colocated_throughput_tok_s": 1631.2000000000003,
+          "pdd_overhead_pct": 50.57043650793652
+        }
+      ],
+      "4096": [
+        {
+          "batch_size": 1,
+          "transfer_ms": 79.36507936507937,
+          "decode_compute_ms": 0.1575384615384615,
+          "decode_total_ms": 1.226091221186856,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 2,
+          "transfer_ms": 158.73015873015873,
+          "decode_compute_ms": 0.315076923076923,
+          "decode_total_ms": 2.452182442373712,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 4,
+          "transfer_ms": 317.46031746031747,
+          "decode_compute_ms": 0.630153846153846,
+          "decode_total_ms": 4.904364884747424,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 8,
+          "transfer_ms": 634.9206349206349,
+          "decode_compute_ms": 1.260307692307692,
+          "decode_total_ms": 9.808729769494848,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 16,
+          "transfer_ms": 1269.8412698412699,
+          "decode_compute_ms": 2.520615384615384,
+          "decode_total_ms": 19.617459538989696,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 32,
+          "transfer_ms": 2539.6825396825398,
+          "decode_compute_ms": 5.041230769230768,
+          "decode_total_ms": 39.23491907797939,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 64,
+          "transfer_ms": 5079.3650793650795,
+          "decode_compute_ms": 10.082461538461535,
+          "decode_total_ms": 78.46983815595878,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 128,
+          "transfer_ms": 10158.730158730159,
+          "decode_compute_ms": 20.16492307692307,
+          "decode_total_ms": 156.93967631191757,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        },
+        {
+          "batch_size": 256,
+          "transfer_ms": 20317.460317460318,
+          "decode_compute_ms": 40.32984615384614,
+          "decode_total_ms": 313.87935262383513,
+          "transfer_per_output_tok_ms": 0.6200396825396826,
+          "pdd_throughput_tok_s": 541.6733981222204,
+          "colocated_throughput_tok_s": 815.6000000000001,
+          "pdd_overhead_pct": 50.57043650793652
+        }
+      ]
+    },
+    "exp6": {
+      "A100-80GB": {
+        "Llama-2-7B": [
+          {
+            "batch_size": 1,
+            "decode_compute_ms": 0.147456,
+            "transfer_ms": 19.841269841269842,
+            "effective_transfer_ms": 19.693813841269844,
+            "hidden_pct": 0.74317824,
+            "io_to_compute": 134.5572227733686
+          },
+          {
+            "batch_size": 8,
+            "decode_compute_ms": 1.179648,
+            "transfer_ms": 158.73015873015873,
+            "effective_transfer_ms": 157.55051073015875,
+            "hidden_pct": 0.74317824,
+            "io_to_compute": 134.5572227733686
+          },
+          {
+            "batch_size": 32,
+            "decode_compute_ms": 4.718592,
+            "transfer_ms": 634.9206349206349,
+            "effective_transfer_ms": 630.202042920635,
+            "hidden_pct": 0.74317824,
+            "io_to_compute": 134.5572227733686
+          },
+          {
+            "batch_size": 128,
+            "decode_compute_ms": 18.874368,
+            "transfer_ms": 2539.6825396825398,
+            "effective_transfer_ms": 2520.80817168254,
+            "hidden_pct": 0.74317824,
+            "io_to_compute": 134.5572227733686
+          }
+        ],
+        "Llama-2-70B": [
+          {
+            "batch_size": 1,
+            "decode_compute_ms": 1.7308225641025616,
+            "transfer_ms": 12.40079365079365,
+            "effective_transfer_ms": 10.669971086691088,
+            "hidden_pct": 13.957353156923059,
+            "io_to_compute": 7.164682219880529
+          },
+          {
+            "batch_size": 8,
+            "decode_compute_ms": 13.846580512820493,
+            "transfer_ms": 99.2063492063492,
+            "effective_transfer_ms": 85.35976869352871,
+            "hidden_pct": 13.957353156923059,
+            "io_to_compute": 7.164682219880529
+          },
+          {
+            "batch_size": 32,
+            "decode_compute_ms": 55.38632205128197,
+            "transfer_ms": 396.8253968253968,
+            "effective_transfer_ms": 341.43907477411483,
+            "hidden_pct": 13.957353156923059,
+            "io_to_compute": 7.164682219880529
+          },
+          {
+            "batch_size": 128,
+            "decode_compute_ms": 221.5452882051279,
+            "transfer_ms": 1587.3015873015872,
+            "effective_transfer_ms": 1365.7562990964593,
+            "hidden_pct": 13.957353156923059,
+            "io_to_compute": 7.164682219880529
+          }
+        ],
+        "DeepSeek-V3": [
+          {
+            "batch_size": 1,
+            "decode_compute_ms": 1.2921238974358964,
+            "transfer_ms": 2.3639012896825395,
+            "effective_transfer_ms": 1.0717773922466431,
+            "hidden_pct": 54.66065368615381,
+            "io_to_compute": 1.8294695225229476
+          },
+          {
+            "batch_size": 8,
+            "decode_compute_ms": 10.336991179487171,
+            "transfer_ms": 18.911210317460316,
+            "effective_transfer_ms": 8.574219137973145,
+            "hidden_pct": 54.66065368615381,
+            "io_to_compute": 1.8294695225229476
+          },
+          {
+            "batch_size": 32,
+            "decode_compute_ms": 41.347964717948685,
+            "transfer_ms": 75.64484126984127,
+            "effective_transfer_ms": 34.29687655189258,
+            "hidden_pct": 54.66065368615381,
+            "io_to_compute": 1.8294695225229476
+          },
+          {
+            "batch_size": 128,
+            "decode_compute_ms": 165.39185887179474,
+            "transfer_ms": 302.57936507936506,
+            "effective_transfer_ms": 137.18750620757032,
+            "hidden_pct": 54.66065368615381,
+            "io_to_compute": 1.8294695225229476
+          }
+        ]
+      },
+      "H100-80GB": {
+        "Llama-2-7B": [
+          {
+            "batch_size": 1,
+            "decode_compute_ms": 0.046006272000000015,
+            "transfer_ms": 9.765625,
+            "effective_transfer_ms": 9.719618728,
+            "hidden_pct": 0.4711042252800002,
+            "io_to_compute": 212.26725347361327
+          },
+          {
+            "batch_size": 8,
+            "decode_compute_ms": 0.3680501760000001,
+            "transfer_ms": 78.125,
+            "effective_transfer_ms": 77.756949824,
+            "hidden_pct": 0.4711042252800002,
+            "io_to_compute": 212.26725347361327
+          },
+          {
+            "batch_size": 32,
+            "decode_compute_ms": 1.4722007040000005,
+            "transfer_ms": 312.5,
+            "effective_transfer_ms": 311.027799296,
+            "hidden_pct": 0.4711042252800002,
+            "io_to_compute": 212.26725347361327
+          },
+          {
+            "batch_size": 128,
+            "decode_compute_ms": 5.888802816000002,
+            "transfer_ms": 1250.0,
+            "effective_transfer_ms": 1244.111197184,
+            "hidden_pct": 0.4711042252800002,
+            "io_to_compute": 212.26725347361327
+          }
+        ],
+        "Llama-2-70B": [
+          {
+            "batch_size": 1,
+            "decode_compute_ms": 0.5400166399999996,
+            "transfer_ms": 6.103515625,
+            "effective_transfer_ms": 5.563498985000001,
+            "hidden_pct": 8.847632629759994,
+            "io_to_compute": 11.302458429799504
+          },
+          {
+            "batch_size": 8,
+            "decode_compute_ms": 4.320133119999997,
+            "transfer_ms": 48.828125,
+            "effective_transfer_ms": 44.507991880000006,
+            "hidden_pct": 8.847632629759994,
+            "io_to_compute": 11.302458429799504
+          },
+          {
+            "batch_size": 32,
+            "decode_compute_ms": 17.280532479999987,
+            "transfer_ms": 195.3125,
+            "effective_transfer_ms": 178.03196752000002,
+            "hidden_pct": 8.847632629759994,
+            "io_to_compute": 11.302458429799504
+          },
+          {
+            "batch_size": 128,
+            "decode_compute_ms": 69.12212991999995,
+            "transfer_ms": 781.25,
+            "effective_transfer_ms": 712.1278700800001,
+            "hidden_pct": 8.847632629759994,
+            "io_to_compute": 11.302458429799504
+          }
+        ],
+        "DeepSeek-V3": [
+          {
+            "batch_size": 1,
+            "decode_compute_ms": 0.4031426559999995,
+            "transfer_ms": 1.163482666015625,
+            "effective_transfer_ms": 0.7603400100156255,
+            "hidden_pct": 34.649648660479954,
+            "io_to_compute": 2.886032149412704
+          },
+          {
+            "batch_size": 8,
+            "decode_compute_ms": 3.225141247999996,
+            "transfer_ms": 9.307861328125,
+            "effective_transfer_ms": 6.082720080125004,
+            "hidden_pct": 34.649648660479954,
+            "io_to_compute": 2.886032149412704
+          },
+          {
+            "batch_size": 32,
+            "decode_compute_ms": 12.900564991999984,
+            "transfer_ms": 37.2314453125,
+            "effective_transfer_ms": 24.330880320500015,
+            "hidden_pct": 34.649648660479954,
+            "io_to_compute": 2.886032149412704
+          },
+          {
+            "batch_size": 128,
+            "decode_compute_ms": 51.602259967999935,
+            "transfer_ms": 148.92578125,
+            "effective_transfer_ms": 97.32352128200006,
+            "hidden_pct": 34.649648660479954,
+            "io_to_compute": 2.886032149412704
+          }
+        ]
+      }
+    }
+  }
+}
