@@ -7,6 +7,9 @@ from vidur.scheduler.replica_scheduler.lightllm_replica_scheduler import (
 from vidur.scheduler.replica_scheduler.orca_replica_scheduler import (
     OrcaReplicaScheduler,
 )
+from vidur.scheduler.replica_scheduler.pdd_replica_scheduler import (
+    PddReplicaScheduler,
+)
 from vidur.scheduler.replica_scheduler.sarathi_replica_scheduler import (
     SarathiReplicaScheduler,
 )
@@ -30,3 +33,4 @@ ReplicaSchedulerRegistry.register(ReplicaSchedulerType.VLLM, VLLMReplicaSchedule
 ReplicaSchedulerRegistry.register(
     ReplicaSchedulerType.LIGHTLLM, LightLLMReplicaScheduler
 )
+ReplicaSchedulerRegistry.register(ReplicaSchedulerType.PDD, PddReplicaScheduler)

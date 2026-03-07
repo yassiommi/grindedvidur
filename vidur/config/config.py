@@ -329,6 +329,41 @@ class SarathiSchedulerConfig(BaseReplicaSchedulerConfig):
 
 
 @dataclass
+class PddSchedulerConfig(BaseReplicaSchedulerConfig):
+    """Configuration for Prefill-Decode Disaggregation (PDD) scheduler.
+
+    This scheduler separates prefill and decode into distinct batch streams,
+    allowing them to be processed on separate GPUs with inter-GPU KV cache
+    transfer modeling.
+    """
+
+    pcie_bandwidth_gbps: float = field(
+        default=50.0,
+        metadata={"help": "PCIe bandwidth in GB/s for KV cache transfers."},
+    )
+    kv_cache_bytes_per_token: float = field(
+        default=0.256,
+        metadata={
+            "help": "KV cache bytes per token (depends on model hidden size and number of heads)."
+        },
+    )
+    enable_kv_prefetch: bool = field(
+        default=True,
+        metadata={
+            "help": "Enable KV prefetch overlap with decode computation to hide transfer latency."
+        },
+    )
+    max_tokens_in_batch: int = field(
+        default=4096,
+        metadata={"help": "Maximum tokens in batch for PDD."},
+    )
+
+    @staticmethod
+    def get_type():
+        return ReplicaSchedulerType.PDD
+
+
+@dataclass
 class MetricsConfig:
     """Metric configuration."""
 

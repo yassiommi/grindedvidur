@@ -238,6 +238,29 @@ class MetricsStore:
         # Per-layer timing store for Gantt plots
         self._layer_timing_store = LayerTimingStore(self._config.output_dir)
 
+        # KV cache I/O metrics for PDD
+        self._kv_transfer_latencies = DataSeries(
+            "Batch ID",
+            "KV Transfer Latency (ms)",
+            self._config.subsamples,
+            self._config.save_table_to_wandb,
+            self._config.store_plots,
+        )
+        self._kv_transfer_throughputs = DataSeries(
+            "Batch ID",
+            "KV Transfer Throughput (GB/s)",
+            self._config.subsamples,
+            self._config.save_table_to_wandb,
+            self._config.store_plots,
+        )
+        self._kv_transfer_bytes = DataSeries(
+            "Batch ID",
+            "KV Cache Bytes",
+            self._config.subsamples,
+            self._config.save_table_to_wandb,
+            self._config.store_plots,
+        )
+
         self._init_wandb()
 
     def _init_wandb(self):
@@ -869,3 +892,28 @@ class MetricsStore:
             return
         self._replica_busy_time[replica_id - 1][stage_id - 1].put(time, 0)
         self._replica_mfu[replica_id - 1][stage_id - 1].put(time, 0)
+
+    def on_kv_cache_transfer(
+        self,
+        time: float,
+        replica_id: int,
+        batch_id: int,
+        transfer_time_ms: float,
+        num_requests: int,
+    ) -> None:
+        """Record KV cache transfer metrics.
+
+        Args:
+            time: Transfer event time
+            replica_id: Target replica ID
+            batch_id: Batch ID undergoing transfer
+            transfer_time_ms: Transfer latency in milliseconds
+            num_requests: Number of requests in batch
+        """
+        if not self._config.write_metrics:
+            return
+
+        self._kv_transfer_latencies.put(batch_id, transfer_time_ms)
+
+        # Throughput will be computed from transfer_time and kv_bytes in post-processing
+        # For now, record a placeholder; actual value computed in request metrics

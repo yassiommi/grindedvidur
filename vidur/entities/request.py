@@ -1,6 +1,7 @@
-from typing import Tuple
+from typing import Tuple, Optional
 
 from vidur.entities.base_entity import BaseEntity
+from vidur.entities.kv_cache_metadata import KvCacheMetadata
 from vidur.logger import init_logger
 
 logger = init_logger(__name__)
@@ -58,6 +59,12 @@ class Request(BaseEntity):
         self._is_prefill_complete = False
 
         self._num_restarts = 0
+
+        # KV cache metadata for PDD (Prefill-Decode Disaggregation)
+        self._kv_cache_metadata: Optional[KvCacheMetadata] = None
+        self._kv_transfer_started_at: float = 0.0
+        self._kv_transfer_completed_at: float = 0.0
+        self._is_kv_transferred: bool = False
 
     @property
     def size(self) -> Tuple[int, int]:
@@ -199,6 +206,68 @@ class Request(BaseEntity):
     def has_started_decode(self) -> bool:
         return self._num_processed_tokens > self._num_prefill_tokens + 1
 
+    @property
+    def kv_cache_metadata(self) -> Optional[KvCacheMetadata]:
+        return self._kv_cache_metadata
+
+    @property
+    def is_kv_transferred(self) -> bool:
+        return self._is_kv_transferred
+
+    @property
+    def kv_transfer_started_at(self) -> float:
+        return self._kv_transfer_started_at
+
+    @property
+    def kv_transfer_completed_at(self) -> float:
+        return self._kv_transfer_completed_at
+
+    def compute_kv_cache_metadata(
+        self, bytes_per_token: float, source_gpu: int = 0, dest_gpu: int = 1
+    ) -> None:
+        """Compute and store KV cache metadata for this request.
+
+        Args:
+            bytes_per_token: KV cache bytes per token
+            source_gpu: Source GPU ID (prefill GPU)
+            dest_gpu: Destination GPU ID (decode GPU)
+        """
+        self._kv_cache_metadata = KvCacheMetadata(
+            request_id=self._id,
+            num_tokens=self._num_prefill_tokens,
+            bytes_per_token=bytes_per_token,
+            source_gpu=source_gpu,
+            dest_gpu=dest_gpu,
+        )
+
+    def on_kv_transfer_start(self, time: float) -> None:
+        """Record KV transfer start time."""
+        self._kv_transfer_started_at = time
+
+    def on_kv_transfer_complete(
+        self, time: float, transfer_time_ms: float, prefetch_overlap_ms: float = 0.0
+    ) -> None:
+        """Record KV transfer completion and metrics.
+
+        Args:
+            time: Completion timestamp
+            transfer_time_ms: Transfer latency in milliseconds
+            prefetch_overlap_ms: Optional prefetch overlap with compute
+        """
+        if self._kv_cache_metadata is None:
+            return
+        self._kv_transfer_completed_at = time
+        self._kv_cache_metadata.transfer_time_ms = transfer_time_ms
+        self._kv_cache_metadata.prefetch_overlap_ms = prefetch_overlap_ms
+        self._kv_cache_metadata.transferred_at = time
+        # Compute transfer throughput in GB/s
+        transfer_time_s = transfer_time_ms / 1000.0
+        if transfer_time_s > 0:
+            self._kv_cache_metadata.transfer_throughput_gbps = (
+                self._kv_cache_metadata.cache_bytes / 1e9 / transfer_time_s
+            )
+        self._is_kv_transferred = True
+
     def on_batch_schedule(
         self,
         time: float,
@@ -269,7 +338,7 @@ class Request(BaseEntity):
         self._preempted = True
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "id": self._id,
             "arrived_at": self._arrived_at,
             "execution_time": self._execution_time,
@@ -290,6 +359,16 @@ class Request(BaseEntity):
             "latest_iteration_completed_at": self._latest_iteration_completed_at,
             "num_restarts": self._num_restarts,
         }
+        if self._kv_cache_metadata is not None:
+            result["kv_cache_bytes"] = self._kv_cache_metadata.cache_bytes
+            result["kv_transfer_time_ms"] = self._kv_cache_metadata.transfer_time_ms
+            result["kv_transfer_throughput_gbps"] = (
+                self._kv_cache_metadata.transfer_throughput_gbps
+            )
+            result["kv_prefetch_overlap_ms"] = (
+                self._kv_cache_metadata.prefetch_overlap_ms
+            )
+        return result
 
     def restart(self):
         logger.debug(f"Restarting request {self._id}")
