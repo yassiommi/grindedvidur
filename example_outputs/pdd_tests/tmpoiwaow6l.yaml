@@ -1,0 +1,30 @@
+cluster_config:
+  num_replicas: 1
+  replica_config:
+    model_name: llama-2-7b
+    num_pipeline_stages: 2
+    tensor_parallel_size: 1
+metrics_config:
+  store_plots: false
+  store_utilization_metrics: false
+  write_json_trace: false
+  write_metrics: true
+replica_scheduler_config:
+  batch_size_cap: 32
+  block_size: 16
+  enable_kv_prefetch: true
+  kv_cache_bytes_per_token: 0.256
+  max_tokens_in_batch: 8192
+  name: pdd
+  pcie_bandwidth_gbps: 16.0
+  watermark_blocks_fraction: 0.01
+request_generator_config:
+  length_config:
+    max_tokens: 512
+    min_tokens: 64
+    type: zipf
+    zipf_factor: 1.5
+  num_requests: 50
+  qps: 2.0
+  seed: 42
+  type: poisson
