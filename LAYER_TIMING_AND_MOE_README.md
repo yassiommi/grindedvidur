@@ -423,6 +423,58 @@ MetricsStore.plot()
 
 ---
 
+## Sparse and IO Profilers (`vidur/profiling/sparse/`)
+
+The `vidur/profiling/sparse/` package provides on-device profiling for MoE-specific operations that cannot be captured by the standard dense-model profiling pipeline. It has three components, each with an impl (the PyTorch model) and a wrapper (the profiling harness).
+
+### MoE MLP Profiler (`sparse_mlp_impl.py`, `sparse_mlp_wrapper.py`)
+
+Builds a single MoE transformer block on-GPU and measures each sub-operation with CUDA event timers:
+
+1. **Router/gating** — a `Linear(hidden, num_experts)` projection followed by softmax and top-K selection. Three separate timers capture the gate GEMM, softmax, and top-K.
+2. **Expert dispatch** — reorganises tokens into per-expert batches (expand + index).
+3. **Grouped expert GEMM** — loops over active experts, running each `ExpertMLP` (gate\_proj \* up\_proj → SiLU → down\_proj) on its assigned token subset. Only `min(num_routed_experts, 64)` expert modules are instantiated to cap GPU memory; overflow tokens reuse expert 0, preserving the GEMM shapes that matter for timing.
+4. **Expert combine** — weighted scatter-add back to token space.
+5. **Shared expert** — a dense MLP applied to all tokens, timed separately.
+
+The wrapper (`SparseMlpWrapper`) runs 2 warmup + 10 active iterations, collects `CudaTimer` stats (or `RecordFunctionTracer` traces), and returns a dict of per-operation median times keyed by token count.
+
+### MLA Attention Profiler (`mla_attention_impl.py`, `mla_attention_wrapper.py`)
+
+Profiles the MLA-specific projection GEMMs that differ from standard MHA/GQA:
+
+- **Q compression**: `q_down_proj` (hidden → q\_lora\_rank) then `q_up_proj` (q\_lora\_rank → heads \* (nope + rope))
+- **KV compression**: `kv_down_proj` (hidden → kv\_lora\_rank + rope\_dim)
+- **KV decompression**: `kv_up_proj` (kv\_lora\_rank → heads \* (nope + v\_head\_dim)), measured separately even though production fuses this into attention
+- **RoPE**: element-wise ops on the rope portions of Q and K
+- **Output projection**: `o_proj` (heads \* v\_head\_dim → hidden)
+
+The actual attention kernel is stubbed (a `torch.randn` of the correct shape) because FlashAttention is profiled by the existing attention profiler; MLA profiling targets only the surrounding projection costs.
+
+### IO Profiler (`io_profiler.py`)
+
+Measures real data-transfer bandwidth using CUDA-event-timed `tensor.copy_()` operations (5 warmup + 20 active, median reported). Three transfer types:
+
+| Method | Source → Dest | What it models |
+|--------|--------------|----------------|
+| `profile_hbm_read` | GPU → GPU (same device) | Expert weight fetch from HBM |
+| `profile_pcie_h2d` | Pinned host → GPU | CPU-offloaded expert weights or KV prefetch |
+| `profile_pcie_d2h` | GPU → pinned host | KV cache offloading to host |
+
+Two higher-level helpers compose these primitives:
+- `profile_expert_weight_load(hidden, intermediate, num_local_experts, source)` — computes the byte count for 3 matrices × N experts and calls the appropriate HBM or PCIe primitive.
+- `profile_kv_cache_transfer(kv_bytes_per_token, num_tokens, batch_size, source)` — likewise for a KV cache batch.
+
+`run_bandwidth_sweep(sizes_bytes)` runs all three transfer types across a list of payload sizes, producing `IOProfileResult` rows with `(transfer_type, size_bytes, latency_ms, bandwidth_gb_per_s)`.
+
+### Orchestration (`main.py`)
+
+The entry point `python -m vidur.profiling.sparse.main` runs all three profilers in sequence for each requested model. It supports Ray for multi-GPU parallelism (round-robin token counts across workers) or single-GPU mode (`--disable_ray`). Outputs are timestamped CSVs (`sparse_mlp.csv`, `mla_attention.csv`, `io_bandwidth.csv`) plus a config YAML, all under `profiling_outputs/sparse/<timestamp>/<model>/`.
+
+Model configs come from a built-in preset dict (DeepSeek-V3, Mixtral, Qwen3-30B, Engram-27B) or are loaded dynamically from `BaseModelConfig` for any registered model name.
+
+---
+
 ## Integration with InferSim
 
 InferSim provides the analytical framework for MoE timing and KV I/O estimation:
