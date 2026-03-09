@@ -30,6 +30,21 @@ class ModelConfig:
         rope_scaling: Optional[Dict[str, Any]] = None,
         partial_rotary_factor: float = 1.0,
         no_tensor_parallel: bool = False,
+        # MoE fields
+        is_moe: bool = False,
+        num_routed_experts: int = 1,
+        num_experts_per_tok: int = 1,
+        num_shared_experts: int = 0,
+        moe_intermediate_size: Optional[int] = None,
+        # MLA fields
+        attention_type: str = "MHA",
+        kv_lora_rank: Optional[int] = None,
+        q_lora_rank: Optional[int] = None,
+        qk_nope_head_dim: Optional[int] = None,
+        qk_rope_head_dim: Optional[int] = None,
+        v_head_dim: Optional[int] = None,
+        # Engram fields (passed through, not used by profiler directly)
+        **kwargs,
     ):
         self.name = name
         self.num_layers = num_layers
@@ -51,6 +66,21 @@ class ModelConfig:
         self.rope_scaling = rope_scaling
         self.is_neox_style = is_neox_style
 
+        # MoE fields
+        self.is_moe = is_moe
+        self.num_routed_experts = num_routed_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_shared_experts = num_shared_experts
+        self.moe_intermediate_size = moe_intermediate_size
+
+        # MLA fields
+        self.attention_type = attention_type
+        self.kv_lora_rank = kv_lora_rank
+        self.q_lora_rank = q_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+
         assert self.norm in ["layer_norm", "rms_norm"]
         assert self.activation in ["gelu", "silu"]
 
@@ -58,6 +88,16 @@ class ModelConfig:
             assert self.activation == "silu"
         else:
             assert self.activation == "gelu"
+
+    @property
+    def expert_intermediate_size(self) -> int:
+        if self.moe_intermediate_size is not None:
+            return self.moe_intermediate_size
+        return self.mlp_hidden_dim
+
+    @property
+    def has_mla(self) -> bool:
+        return self.attention_type == "MLA" and self.kv_lora_rank is not None
 
     @staticmethod
     def from_model_name(model_name: str):
