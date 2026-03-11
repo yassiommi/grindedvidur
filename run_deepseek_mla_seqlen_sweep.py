@@ -2,15 +2,17 @@
 """DeepSeek-V3 MLA Sequence Length Sweep: KV Cache Load vs Compute vs Comm.
 
 Sweeps sequence length from 128K to 10M tokens for a single decode step
-(batch_size=1) and produces a grouped bar chart comparing:
+(batch_size=1) and produces grouped bar charts comparing:
   - KV cache load time (analytical, PCIe Gen4 bandwidth)
   - Compute time (profiling-calibrated: attention projections + HBM-bound
     attention core + MoE expert compute)
   - Communication time (profiling-calibrated: TP allreduce + EP dispatch/combine)
 
+Sweeps over TP={4, 8} with EP=TP to show the effect of tensor parallelism.
+
 Hardware assumptions:
   - A100 GPU, PCIe Gen4 (31.5 GB/s), HBM2e (2039 GB/s)
-  - TP=8, EP=8 on DGX A100 (NVLink 600 GB/s intra-node)
+  - DGX A100 (NVLink 600 GB/s intra-node)
   - Bandwidth efficiency factor: 0.8
 
 DeepSeek-V3 MLA config:
@@ -59,9 +61,11 @@ NUM_SHARED_EXPERTS = 1
 EXPERT_INTERMEDIATE = 2048
 BYTES_PER_PARAM = 2  # FP16
 
-# Parallelism
-TP = 8
-EP = 8
+# Parallelism sweep
+TP_VALUES = [4, 8]
+# Reference TP for profiling-calibrated constants (calibrated at TP=8, EP=8)
+TP_REF = 8
+EP_REF = 8
 
 # MLA KV cache: compressed latent per token per layer
 KV_BYTES_PER_TOKEN = (KV_LORA_RANK + QK_ROPE_HEAD_DIM) * BYTES_PER_PARAM  # 1152 bytes
@@ -91,46 +95,67 @@ EP_COMM_PER_LAYER_MS = 0.05
 
 
 # ── Analytical + profiling-calibrated timing model ───────────────────
-def compute_times_per_layer(seq_len: int) -> dict:
+def compute_times_per_layer(seq_len: int, tp: int) -> dict:
     """Compute per-layer timing breakdown for a single decode step (BS=1).
+
+    Profiling constants were calibrated at TP=8, EP=8. We scale them for
+    other TP/EP values:
+      - Attn projections: each GPU handles num_heads/TP heads → scales as TP_REF/TP
+      - Attn core (HBM-bound KV read): unchanged — MLA compressed KV is
+        head-agnostic, each GPU reads the full cache
+      - MoE compute: EP=TP, each GPU handles more experts → scales as EP_REF/EP
+      - TP allreduce: ring allreduce cost ~ 2(p-1)/p × N/BW → scales accordingly
+      - EP dispatch/combine: similar ring scaling
 
     Returns dict with kv_load_ms, compute_ms, comm_ms (all per layer).
     """
+    ep = tp  # EP = TP (all GPUs participate in both)
+
     # 1. KV cache load time (analytical, PCIe transfer from host → GPU)
     #    The entire KV cache for seq_len tokens must be transferred per layer.
+    #    With MLA, the compressed latent is head-agnostic → each GPU loads full cache.
     kv_bytes = KV_BYTES_PER_TOKEN * seq_len
     kv_load_ms = (kv_bytes / PCIE_EFF_BPS) * 1e3
 
     # 2. Compute time (profiling-calibrated + analytical scaling)
-    #    a) Attention projection overhead (constant, from profiling)
+    #    a) Attention projection overhead: scales with heads per GPU
+    attn_proj_ms = ATTN_PROJ_CONSTANT_MS * (TP_REF / tp)
+
     #    b) Attention core: HBM-bandwidth-bound reading compressed KV cache
-    #       In absorbed MLA, attention reads the full compressed KV from HBM.
+    #       In absorbed MLA, each GPU reads the full compressed KV from HBM.
     #       FLOPs are small relative to HBM bandwidth at BS=1, so time ≈ bytes/HBM_BW.
     attn_core_ms = (kv_bytes / HBM_EFF_BPS) * 1e3
 
-    #    c) MoE expert compute (constant for BS=1, from profiling)
-    compute_ms = ATTN_PROJ_CONSTANT_MS + attn_core_ms + MOE_COMPUTE_CONSTANT_MS
+    #    c) MoE expert compute: scales with experts per GPU
+    moe_compute_ms = MOE_COMPUTE_CONSTANT_MS * (EP_REF / ep)
 
-    # 3. Communication time (profiling-calibrated, constant)
-    #    TP allreduce + EP dispatch/combine. Message sizes are proportional
-    #    to batch_size × hidden_size, independent of seq_len.
-    comm_ms = TP_COMM_PER_LAYER_MS + EP_COMM_PER_LAYER_MS
+    compute_ms = attn_proj_ms + attn_core_ms + moe_compute_ms
+
+    # 3. Communication time
+    #    TP allreduce: ring cost ~ 2(p-1)/p × N/BW. Message size (hidden_size)
+    #    is the same regardless of TP, so cost scales as (p-1)/p.
+    #    EP dispatch/combine: similar ring scaling.
+    tp_comm_ms = TP_COMM_PER_LAYER_MS * ((tp - 1) / tp) / ((TP_REF - 1) / TP_REF)
+    ep_comm_ms = EP_COMM_PER_LAYER_MS * ((ep - 1) / ep) / ((EP_REF - 1) / EP_REF)
+    comm_ms = tp_comm_ms + ep_comm_ms
 
     return {
         "kv_load_ms": kv_load_ms,
         "compute_ms": compute_ms,
         "comm_ms": comm_ms,
-        "attn_proj_ms": ATTN_PROJ_CONSTANT_MS,
+        "attn_proj_ms": attn_proj_ms,
         "attn_core_ms": attn_core_ms,
-        "moe_compute_ms": MOE_COMPUTE_CONSTANT_MS,
+        "moe_compute_ms": moe_compute_ms,
     }
 
 
-def compute_total_times(seq_len: int) -> dict:
+def compute_total_times(seq_len: int, tp: int) -> dict:
     """Total time across all layers for one decode step."""
-    per_layer = compute_times_per_layer(seq_len)
+    per_layer = compute_times_per_layer(seq_len, tp)
     return {
         "seq_len": seq_len,
+        "tp": tp,
+        "ep": tp,
         "kv_load_ms": per_layer["kv_load_ms"] * NUM_LAYERS,
         "compute_ms": per_layer["compute_ms"] * NUM_LAYERS,
         "comm_ms": per_layer["comm_ms"] * NUM_LAYERS,
@@ -155,63 +180,68 @@ SEQ_LENS = [
     10 * 1024 * 1024, # 10M
 ]
 
-results = [compute_total_times(s) for s in SEQ_LENS]
+# results_by_tp[tp] = list of results for each seq_len
+results_by_tp = {}
+for tp in TP_VALUES:
+    results_by_tp[tp] = [compute_total_times(s, tp) for s in SEQ_LENS]
 
 # ── Save results ──────────────────────────────────────────────────────
 summary = {
-    "description": "DeepSeek-V3 MLA sequence length sweep: KV load vs compute vs comm",
+    "description": "DeepSeek-V3 MLA sequence length sweep: KV load vs compute vs comm (TP sweep)",
     "model": "deepseek-ai/DeepSeek-V3",
     "attention_type": "MLA",
     "device": "A100 (PCIe Gen4, 31.5 GB/s)",
     "hbm_bandwidth": f"{HBM_BW_GBS} GB/s",
     "pcie_bandwidth": f"{PCIE_BW_GBS} GB/s (effective: {PCIE_BW_GBS * BW_EFFICIENCY} GB/s)",
-    "parallelism": f"TP={TP}, EP={EP}",
+    "tp_values": TP_VALUES,
     "batch_size": 1,
     "kv_bytes_per_token_per_layer": KV_BYTES_PER_TOKEN,
     "num_layers": NUM_LAYERS,
-    "sweep_results": results,
+    "sweep_results": {str(tp): results_by_tp[tp] for tp in TP_VALUES},
 }
 
 with open(os.path.join(RESULTS_DIR, "seqlen_sweep_results.json"), "w") as f:
     json.dump(summary, f, indent=2, default=str)
 
-# ── Print table ───────────────────────────────────────────────────────
-print("=" * 95)
-print("DeepSeek-V3 MLA Sequence Length Sweep (BS=1, A100 PCIe Gen4)")
-print("=" * 95)
-print(f"{'Seq Len':>10s}  {'KV Load (ms)':>14s}  {'Compute (ms)':>14s}  {'Comm (ms)':>12s}  "
-      f"{'KV/Compute':>11s}  {'KV/Total':>9s}")
-print("-" * 95)
+# ── Print tables ──────────────────────────────────────────────────────
+for tp in TP_VALUES:
+    results = results_by_tp[tp]
+    print()
+    print("=" * 95)
+    print(f"DeepSeek-V3 MLA Sequence Length Sweep (BS=1, A100 PCIe Gen4, TP={tp}, EP={tp})")
+    print("=" * 95)
+    print(f"{'Seq Len':>10s}  {'KV Load (ms)':>14s}  {'Compute (ms)':>14s}  {'Comm (ms)':>12s}  "
+          f"{'KV/Compute':>11s}  {'KV/Total':>9s}")
+    print("-" * 95)
 
-for r in results:
-    total = r["kv_load_ms"] + r["compute_ms"] + r["comm_ms"]
-    seq_label = f"{r['seq_len'] / 1024:.0f}K" if r["seq_len"] < 1024 * 1024 else f"{r['seq_len'] / (1024*1024):.0f}M"
-    print(f"{seq_label:>10s}  {r['kv_load_ms']:>14.1f}  {r['compute_ms']:>14.1f}  "
-          f"{r['comm_ms']:>12.1f}  {r['kv_load_ms']/r['compute_ms']:>10.1f}x  "
-          f"{r['kv_load_ms']/total*100:>8.1f}%")
+    for r in results:
+        total = r["kv_load_ms"] + r["compute_ms"] + r["comm_ms"]
+        seq_label = f"{r['seq_len'] / 1024:.0f}K" if r["seq_len"] < 1024 * 1024 else f"{r['seq_len'] / (1024*1024):.0f}M"
+        print(f"{seq_label:>10s}  {r['kv_load_ms']:>14.1f}  {r['compute_ms']:>14.1f}  "
+              f"{r['comm_ms']:>12.1f}  {r['kv_load_ms']/r['compute_ms']:>10.1f}x  "
+              f"{r['kv_load_ms']/total*100:>8.1f}%")
 
-print("-" * 95)
+    print("-" * 95)
+
 print(f"\nKV cache per token per layer: {KV_BYTES_PER_TOKEN} bytes "
       f"(MLA: kv_lora_rank={KV_LORA_RANK} + qk_rope_dim={QK_ROPE_HEAD_DIM}, FP16)")
 print(f"PCIe effective BW: {PCIE_BW_GBS * BW_EFFICIENCY:.1f} GB/s | "
       f"HBM effective BW: {HBM_BW_GBS * BW_EFFICIENCY:.1f} GB/s")
 
-# ── Plot: grouped bar chart ──────────────────────────────────────────
+# ── Plot: side-by-side grouped bar charts for each TP value ──────────
 plt.rcParams.update({
     "figure.dpi": 150,
     "savefig.dpi": 150,
     "font.size": 11,
-    "axes.titlesize": 14,
+    "axes.titlesize": 13,
     "axes.labelsize": 12,
-    "legend.fontsize": 11,
+    "legend.fontsize": 10,
     "figure.facecolor": "white",
 })
 
 C_KV = "#3498db"       # Blue for KV cache load
 C_COMPUTE = "#2ecc71"  # Green for compute
 C_COMM = "#e67e22"     # Orange for communication
-
-fig, ax = plt.subplots(figsize=(14, 7))
 
 seq_labels = []
 for s in SEQ_LENS:
@@ -220,62 +250,63 @@ for s in SEQ_LENS:
     else:
         seq_labels.append(f"{s // (1024 * 1024)}M")
 
+fig, axes = plt.subplots(1, len(TP_VALUES), figsize=(14 * len(TP_VALUES) // 2, 7),
+                         sharey=True)
+if len(TP_VALUES) == 1:
+    axes = [axes]
+
 x = np.arange(len(SEQ_LENS))
 bar_width = 0.25
 
-kv_times = [r["kv_load_ms"] for r in results]
-compute_times = [r["compute_ms"] for r in results]
-comm_times = [r["comm_ms"] for r in results]
+for idx, tp in enumerate(TP_VALUES):
+    ax = axes[idx]
+    results = results_by_tp[tp]
 
-bars_kv = ax.bar(x - bar_width, kv_times, bar_width,
-                 label="KV Cache Load (PCIe)", color=C_KV,
-                 edgecolor="black", linewidth=0.5, alpha=0.85)
-bars_compute = ax.bar(x, compute_times, bar_width,
-                      label="Compute (Attn + MoE)", color=C_COMPUTE,
-                      edgecolor="black", linewidth=0.5, alpha=0.85)
-bars_comm = ax.bar(x + bar_width, comm_times, bar_width,
-                   label="Communication (TP + EP)", color=C_COMM,
-                   edgecolor="black", linewidth=0.5, alpha=0.85)
+    kv_times = [r["kv_load_ms"] for r in results]
+    compute_times = [r["compute_ms"] for r in results]
+    comm_times = [r["comm_ms"] for r in results]
 
-ax.set_yscale("log")
-ax.set_xlabel("Sequence Length (tokens)")
-ax.set_ylabel("Time per Decode Step (ms, log scale)")
-ax.set_title(
-    "DeepSeek-V3 MLA: Sequence Length Sweep\n"
-    "Single Decode Step Timing Breakdown (BS=1, A100 PCIe Gen4, TP=8, EP=8)",
-    fontweight="bold",
-)
-ax.set_xticks(x)
-ax.set_xticklabels(seq_labels, fontsize=11)
-ax.legend(loc="upper left", fontsize=11)
-ax.grid(axis="y", alpha=0.3, which="both")
+    bars_kv = ax.bar(x - bar_width, kv_times, bar_width,
+                     label="KV Cache Load (PCIe)", color=C_KV,
+                     edgecolor="black", linewidth=0.5, alpha=0.85)
+    bars_compute = ax.bar(x, compute_times, bar_width,
+                          label="Compute (Attn + MoE)", color=C_COMPUTE,
+                          edgecolor="black", linewidth=0.5, alpha=0.85)
+    bars_comm = ax.bar(x + bar_width, comm_times, bar_width,
+                       label="Communication (TP + EP)", color=C_COMM,
+                       edgecolor="black", linewidth=0.5, alpha=0.85)
 
-# Add value labels on top of each bar
-for bars in [bars_kv, bars_compute, bars_comm]:
-    for bar in bars:
-        height = bar.get_height()
-        if height >= 1000:
-            label = f"{height / 1000:.1f}s"
-        elif height >= 1:
-            label = f"{height:.0f}"
-        else:
-            label = f"{height:.1f}"
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            height * 1.15,
-            label,
-            ha="center", va="bottom", fontsize=7, rotation=45,
-        )
+    ax.set_yscale("log")
+    ax.set_xlabel("Sequence Length (tokens)")
+    if idx == 0:
+        ax.set_ylabel("Time per Decode Step (ms, log scale)")
+    ax.set_title(f"TP={tp}, EP={tp}", fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(seq_labels, fontsize=10)
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(axis="y", alpha=0.3, which="both")
 
-# Add annotation about KV load dominance
-ax.annotate(
-    "KV cache load over PCIe\ndominates at all sequence lengths\n"
-    f"(MLA compressed KV: {KV_BYTES_PER_TOKEN} B/token/layer)",
-    xy=(4, kv_times[4]),
-    xytext=(5.5, kv_times[2] * 0.3),
-    fontsize=9, ha="center", color="#2c3e50",
-    bbox=dict(boxstyle="round,pad=0.4", facecolor="#eaf2f8", edgecolor="#3498db"),
-    arrowprops=dict(arrowstyle="->", color="#3498db", lw=1.5),
+    # Add value labels on top of each bar
+    for bars in [bars_kv, bars_compute, bars_comm]:
+        for bar in bars:
+            height = bar.get_height()
+            if height >= 1000:
+                label = f"{height / 1000:.1f}s"
+            elif height >= 1:
+                label = f"{height:.0f}"
+            else:
+                label = f"{height:.1f}"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                height * 1.15,
+                label,
+                ha="center", va="bottom", fontsize=7, rotation=45,
+            )
+
+fig.suptitle(
+    "DeepSeek-V3 MLA: Sequence Length Sweep — TP Comparison\n"
+    "Single Decode Step Timing Breakdown (BS=1, A100 PCIe Gen4)",
+    fontweight="bold", fontsize=14, y=1.02,
 )
 
 plt.tight_layout()
