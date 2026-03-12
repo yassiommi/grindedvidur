@@ -15,7 +15,7 @@ DSA architecture (from DeepSeek-V3.2):
 Hardware assumptions:
   - A100 GPU, PCIe Gen4 (31.5 GB/s), HBM2e (2039 GB/s)
   - DGX A100 (NVLink 600 GB/s intra-node)
-  - TP=8, EP=8, bandwidth efficiency factor: 0.8
+  - TP=4, EP=4, bandwidth efficiency factor: 0.8
 """
 
 import json
@@ -52,8 +52,8 @@ NUM_ROUTED_EXPERTS = 256
 NUM_EXPERTS_PER_TOK = 8
 
 # Parallelism
-TP = 8
-EP = 8
+TP = 4
+EP = 4
 
 # MLA KV cache: compressed latent per token per layer (FP16)
 MLA_KV_BYTES_PER_TOKEN = (KV_LORA_RANK + QK_ROPE_HEAD_DIM) * BYTES_PER_PARAM  # 1152 bytes
@@ -73,11 +73,11 @@ DSA_SLIDING_WINDOW = 512
 # Total tokens that get full MLA attention in DSA
 DSA_ATTENDED_TOKENS = DSA_SELECTED_TOKENS + DSA_SLIDING_WINDOW  # 2560
 
-# ── Profiling-calibrated constants (from TP=8 runs) ─────────────────
-ATTN_PROJ_CONSTANT_MS = 0.20   # per layer
-MOE_COMPUTE_CONSTANT_MS = 0.49  # per layer
-TP_COMM_PER_LAYER_MS = 0.31
-EP_COMM_PER_LAYER_MS = 0.05
+# ── Profiling-calibrated constants (from TP=4 runs) ─────────────────
+ATTN_PROJ_CONSTANT_MS = 0.38   # per layer (2x heads per GPU → ~2x proj)
+MOE_COMPUTE_CONSTANT_MS = 0.95  # per layer (2x experts per GPU → ~2x compute)
+TP_COMM_PER_LAYER_MS = 0.22    # fewer participants → less comm overhead
+EP_COMM_PER_LAYER_MS = 0.08    # EP=4: more tokens routed per link
 
 # DSA indexer compute overhead per layer (ms):
 # The lightning indexer does a cheap FP8 matmul (query × indexer_K^T) plus
@@ -253,7 +253,7 @@ print(f"DSA selected: {DSA_SELECTED_TOKENS} tokens | sliding window: {DSA_SLIDIN
 
 print()
 print("=" * 110)
-print("DeepSeek-V3: DSA vs MLA — Decode Step Timing Comparison (BS=1, TP=8, EP=8)")
+print(f"DeepSeek-V3: DSA vs MLA — Decode Step Timing Comparison (BS=1, TP={TP}, EP={EP})")
 print("=" * 110)
 print(f"{'Seq Len':>10s}  {'MLA Total':>12s}  {'DSA Total':>12s}  "
       f"{'Speedup':>8s}  {'MLA KV Load':>12s}  {'DSA KV Load':>12s}  "
