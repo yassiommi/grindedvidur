@@ -9,7 +9,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-OUT_DIR = "report_figures"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(_ROOT, "report_figures")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ---------- style ----------

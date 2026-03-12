@@ -18,7 +18,8 @@ import csv
 import yaml
 from typing import Dict, List, Tuple
 
-RESULTS_DIR = "example_outputs/pdd_tests"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(_ROOT, "example_outputs", "pdd_tests")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
@@ -116,23 +117,24 @@ def run_simulation(config_path: str, label: str) -> Tuple[bool, str]:
     print(f"{'='*70}")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=_ROOT)
 
         # Find output directory
         for line in result.stderr.split("\n") + result.stdout.split("\n"):
             if "simulator_output/" in line:
                 for part in line.split():
                     if "simulator_output/" in part:
-                        output_dir = os.path.dirname(part)
+                        output_dir = os.path.join(_ROOT, os.path.dirname(part))
                         if os.path.exists(output_dir):
                             print(f"  ✓ Simulation completed: {output_dir}")
                             return True, output_dir
 
         # Fallback: find most recent output directory
-        if os.path.exists("simulator_output"):
-            dirs = sorted([d for d in os.listdir("simulator_output") if d.startswith("20")])
+        sim_out = os.path.join(_ROOT, "simulator_output")
+        if os.path.exists(sim_out):
+            dirs = sorted([d for d in os.listdir(sim_out) if d.startswith("20")])
             if dirs:
-                output_dir = os.path.join("simulator_output", dirs[-1])
+                output_dir = os.path.join(sim_out, dirs[-1])
                 print(f"  ✓ Simulation completed: {output_dir}")
                 return True, output_dir
 

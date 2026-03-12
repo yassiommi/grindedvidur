@@ -100,7 +100,7 @@ The 64.7x bandwidth gap between HBM and PCIe means that a single CPU-offloaded l
 
 The CPU weight load is **29.6x longer than compute** and **64.7x longer than HBM loading**. Since MoE layer time is `max(compute, load) + overhead`, a CPU-offloaded layer is completely dominated by the PCIe transfer.
 
-![Per-Layer Timing](example_outputs/experiments/ncpumoe_sweep/layer_timing_vs_ncpumoe.png)
+![Per-Layer Timing](../example_outputs/experiments/ncpumoe_sweep/layer_timing_vs_ncpumoe.png)
 *Figure 1: Per-layer timing breakdown. CPU weight load (red) dwarfs both GPU weight load (blue) and compute time (green). The PCIe transfer is the sole bottleneck for offloaded layers.*
 
 ---
@@ -125,7 +125,7 @@ The CPU weight load is **29.6x longer than compute** and **64.7x longer than HBM
 | 55 | 3,544,279 | 4,260,602 | +5,615% | 5,729 |
 | **61** | **3,925,540** | **4,724,708** | **+6,230%** | **6,354** |
 
-![E2E Latency](example_outputs/experiments/ncpumoe_sweep/e2e_vs_ncpumoe.png)
+![E2E Latency](../example_outputs/experiments/ncpumoe_sweep/e2e_vs_ncpumoe.png)
 *Figure 2: Mean E2E latency grows linearly with n_cpu_moe. Even N=5 causes a 492% increase (62s → 367s). The relationship is strictly linear because each CPU layer adds a fixed 104.17 ms per forward pass.*
 
 ### Linearity Analysis
@@ -141,7 +141,7 @@ This linearity confirms that CPU weight loading is purely additive — there is 
 
 ### Forward Pass Breakdown
 
-![Stacked Breakdown](example_outputs/experiments/ncpumoe_sweep/stacked_breakdown_vs_ncpumoe.png)
+![Stacked Breakdown](../example_outputs/experiments/ncpumoe_sweep/stacked_breakdown_vs_ncpumoe.png)
 *Figure 3: Stacked forward pass time breakdown. At N=0, the forward pass is ~310 ms (compute + HBM loading). At N=61, CPU weight loading adds 6,354 ms, making the forward pass 21x longer.*
 
 | n_cpu_moe | Compute (ms) | GPU Load (ms) | CPU Load (ms) | Total/Pass (ms) |
@@ -152,7 +152,7 @@ This linearity confirms that CPU weight loading is purely additive — there is 
 
 ### Weight Loading Overhead Scaling
 
-![Overhead Scaling](example_outputs/experiments/ncpumoe_sweep/overhead_vs_ncpumoe.png)
+![Overhead Scaling](../example_outputs/experiments/ncpumoe_sweep/overhead_vs_ncpumoe.png)
 *Figure 4: CPU weight loading overhead (red) grows linearly while GPU weight loading (blue) shrinks proportionally. The crossover happens when all layers are on CPU.*
 
 ---
@@ -173,7 +173,7 @@ Each CPU-offloaded layer frees **2.59 GB** of GPU HBM per GPU:
 | 30 | 77.8 | +3,053% |
 | 61 | 158.1 | +6,230% |
 
-![Memory-Latency Tradeoff](example_outputs/experiments/ncpumoe_sweep/memory_latency_tradeoff.png)
+![Memory-Latency Tradeoff](../example_outputs/experiments/ncpumoe_sweep/memory_latency_tradeoff.png)
 *Figure 5: (Left) GPU memory freed grows linearly with N. (Right) The memory-latency tradeoff: every GB of GPU memory saved costs approximately 40% latency increase.*
 
 ### Cost per GB Saved
@@ -253,7 +253,7 @@ For models where VRAM is tight but not critically short, dynamic transfer may am
 ```bash
 # Full sweep (runs 13 simulations)
 cd /home/user/grindedvidur
-python run_ncpumoe_experiment.py
+python experiments/run_ncpumoe_experiment.py
 
 # Single run with N=10 CPU-offloaded layers
 python -m vidur.main \

@@ -270,7 +270,7 @@ python -m vidur.main \
 
 ## Example Outputs
 
-The `example_outputs/` directory contains actual simulation results from running the examples above.
+The `../example_outputs/` directory contains actual simulation results from running the examples above.
 
 ### Llama-2-7b (Dense, A100, TP=1, Prefetch=ON)
 
@@ -304,13 +304,13 @@ python -m vidur.main \
 | `prefetch_overlap_savings` | 0.31 | DMA overlap with compute |
 | **total_time** | **1.59** | Per-layer decode step |
 
-**Gantt Charts** (`example_outputs/llama_2_7b/`):
+**Gantt Charts** (`../example_outputs/llama_2_7b/`):
 
 The timeline Gantt shows each layer as a row with overlapping stream bars:
 - `layer_gantt_batch_0_prefill.png`: Prefill batch — all 32 layers show only compute (dark green = attention, light green = MLP). With TP=1, no communication bars. Time progresses left-to-right, ~1.14 ms per layer.
 - `layer_gantt_batch_4_decode.png`: Decode batch — now I/O (blue, KV DMA over PCIe) is visible overlapping with compute. The blue bars extend past the green compute, showing the system is **I/O-bound**. The DMA prefetch for layer N+1 runs concurrently with layer N's compute. Layer 31 has no I/O bar (last layer, nothing to prefetch).
 
-**Summary Plot** (`example_outputs/llama_2_7b/layer_timing_summary.png`):
+**Summary Plot** (`../example_outputs/llama_2_7b/layer_timing_summary.png`):
 
 The stacked bar summary (averaged across all batches including decode) shows that Llama-2-7b on a single A100 is I/O-bound during decode: KV cache loading from host via PCIe (blue, ~1.58 ms) dominates over compute (green, ~0.33 ms). The red dashed prefetch savings line shows ~0.31 ms saved per layer by overlapping KV DMA with compute. Layer 0 has higher effective I/O since it gets no prefetch benefit (no preceding layer to overlap with).
 
@@ -349,13 +349,13 @@ python -m vidur.main \
 | `prefetch_overlap_savings` | 0.18 | DMA overlap with compute |
 | **total_time** | **0.46** | Per-layer decode step |
 
-**Gantt Charts** (`example_outputs/deepseek_v3/`):
+**Gantt Charts** (`../example_outputs/deepseek_v3/`):
 
 The timeline Gantt shows all three hardware streams per layer:
 - `layer_gantt_batch_0_prefill.png`: Prefill, TP=8 — green compute blocks followed by orange all-reduce communication. The compute-then-comm pattern is clearly visible, with the staircase showing how communication serializes after compute.
 - `layer_gantt_batch_4_decode.png`: Decode, TP=8, prefetch=ON — all three streams visible: green compute, blue I/O (DMA, nearly invisible since MLA compresses KV), and orange comm. The I/O is almost fully hidden behind compute, showing that MLA's small KV cache makes DMA prefetch very effective (savings=5.23ms).
 
-**Summary Plot** (`example_outputs/deepseek_v3/layer_timing_summary.png`):
+**Summary Plot** (`../example_outputs/deepseek_v3/layer_timing_summary.png`):
 
 The stacked bar summary shows a balanced profile across compute (green, ~0.22 ms), I/O (blue, ~0.10 ms effective after prefetch), and communication (orange, ~0.13 ms). DeepSeek-V3's MLA attention significantly reduces KV cache size (kv_lora_rank=512 vs full multi-head), leading to much smaller I/O costs compared to Llama-2-7b. The prefetch savings line (red dashed, ~0.18 ms) nearly eliminates the I/O bottleneck.
 
@@ -373,7 +373,7 @@ Each simulation run produces in `simulator_output/<timestamp>/`:
 | `plots/layer_timing_summary.png` | Averaged stacked bar summary |
 | `chrome_trace.json` | Chrome trace viewer format (open in `chrome://tracing`) |
 
-The `example_outputs/` directory contains sample outputs from both runs above, including request metrics CSV, config JSON, layer timing CSV sample (first 200 rows), and Gantt/summary plots.
+The `../example_outputs/` directory contains sample outputs from both runs above, including request metrics CSV, config JSON, layer timing CSV sample (first 200 rows), and Gantt/summary plots.
 
 ---
 

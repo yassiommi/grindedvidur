@@ -30,7 +30,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ── Output directory ──────────────────────────────────────────────────
-RESULTS_DIR = "example_outputs/experiments/deepseek_mla_seqlen_sweep"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(_ROOT, "example_outputs", "experiments", "deepseek_mla_seqlen_sweep")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ── Hardware specs (A100, PCIe Gen4) ─────────────────────────────────

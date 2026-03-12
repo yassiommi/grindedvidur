@@ -10,7 +10,8 @@ import subprocess
 import sys
 import pandas as pd
 
-RESULTS_DIR = "example_outputs/experiments/deepseek_batch_sweep"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(_ROOT, "example_outputs", "experiments", "deepseek_batch_sweep")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
@@ -29,10 +30,11 @@ def run_sim(extra_args: list, label: str) -> str:
     ] + extra_args
 
     print(f"\n  RUNNING: {label}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    dirs = sorted([d for d in os.listdir('simulator_output') if d.startswith('20')])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=_ROOT)
+    sim_out = os.path.join(_ROOT, 'simulator_output')
+    dirs = sorted([d for d in os.listdir(sim_out) if d.startswith('20')])
     if dirs:
-        return os.path.join('simulator_output', dirs[-1])
+        return os.path.join(sim_out, dirs[-1])
     raise RuntimeError(f"Sim failed: {result.stderr[-300:]}")
 
 

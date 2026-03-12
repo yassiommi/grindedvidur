@@ -50,7 +50,8 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 # ── Output directory ──────────────────────────────────────────
-OUT_DIR = "example_outputs/experiments/pdd_analysis"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(_ROOT, "example_outputs", "experiments", "pdd_analysis")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
