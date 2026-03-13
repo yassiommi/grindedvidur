@@ -4,19 +4,21 @@ Uses empirically measured profiling data from the sparse profiler
 (vidur.profiling.sparse) to predict MoE and MLA execution times,
 replacing the analytical FLOPs-based estimates in MoEExecutionTimePredictor.
 
-When sparse profiling CSVs are available (sparse_mlp.csv, mla_attention.csv,
-io_bandwidth.csv), this predictor trains sklearn models on the measured data.
+When profiling CSVs are available (mlp.csv, attention.csv, io.csv),
+this predictor builds interpolation tables from the measured data.
 When profiling data is missing, it falls back to analytical calculation.
 
 Profiling data is expected at:
-    {sparse_profiling_dir}/sparse_mlp.csv
-    {sparse_profiling_dir}/mla_attention.csv
-    {sparse_profiling_dir}/io_bandwidth.csv
+    {sparse_profiling_dir}/mlp.csv        -- MoE MLP operation timings
+    {sparse_profiling_dir}/attention.csv  -- MLA projection timings
+    {sparse_profiling_dir}/io.csv         -- IO bandwidth measurements
+
+The default path resolves to data/profiling/compute/{DEVICE}/{MODEL_DIR}/
+where {MODEL_DIR} uses underscore-separated org_model format
+(e.g. deepseek_DeepSeek-V3).
 
 Generate profiling data with:
     python -m vidur.profiling.sparse.main --model deepseek-ai/DeepSeek-V3
-Or use the synthetic generator:
-    python scripts/generate_sparse_profiling_data.py
 """
 
 import os
@@ -41,12 +43,30 @@ from vidur.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _model_name_to_dir(model_name: str) -> str:
+    """Convert model name like 'deepseek-ai/DeepSeek-V3' to dir name 'deepseek_DeepSeek-V3'.
+
+    Matches the convention used by the sparse profiler output and the
+    existing data/profiling/compute/ directory layout for MoE models.
+    The standard dense models use org/model (slash-separated) paths,
+    but MoE profiling data uses underscore-separated directories.
+    """
+    # Try underscore-separated first (deepseek-ai/DeepSeek-V3 -> deepseek_DeepSeek-V3)
+    parts = model_name.split("/")
+    if len(parts) == 2:
+        org, name = parts
+        # Strip common suffixes from org for shorter dir names
+        org_short = org.replace("-ai", "").replace("ai/", "")
+        return f"{org_short}_{name}"
+    return model_name.replace("/", "_")
+
+
 class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
     """Execution time predictor that uses sparse profiling data.
 
     Overrides MoE and MLA timing methods with empirically-measured values
-    from the sparse profiler CSVs, while keeping the sklearn-based dense
-    model predictions for standard attention and MLP operations.
+    from profiling CSVs, while keeping the sklearn-based dense model
+    predictions for standard attention and MLP operations.
     """
 
     def __init__(
@@ -64,20 +84,14 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
             metrics_config=metrics_config,
         )
 
-        # Resolve sparse profiling directory
-        sparse_dir = predictor_config.sparse_profiling_dir
-        if sparse_dir:
-            sparse_dir = (
-                sparse_dir
-                .replace("{DEVICE}", replica_config.device)
-                .replace("{MODEL}", self._model_config.get_name())
-            )
-
-        self._sparse_dir = sparse_dir
         self._sparse_mlp_predictions = None
         self._sparse_mla_predictions = None
         self._profiled_hbm_bw_gbs = None
         self._profiled_pcie_bw_gbs = None
+
+        # Resolve sparse profiling directory
+        sparse_dir = self._resolve_sparse_dir(predictor_config, replica_config)
+        self._sparse_dir = sparse_dir
 
         if sparse_dir and os.path.isdir(sparse_dir):
             self._load_sparse_profiling_data(sparse_dir)
@@ -87,34 +101,70 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
                 f"using analytical MoE/MLA timing"
             )
 
-    def _load_sparse_profiling_data(self, sparse_dir: str):
-        """Load and train models from sparse profiling CSVs."""
-        mlp_path = os.path.join(sparse_dir, "sparse_mlp.csv")
-        mla_path = os.path.join(sparse_dir, "mla_attention.csv")
-        io_path = os.path.join(sparse_dir, "io_bandwidth.csv")
+    def _resolve_sparse_dir(
+        self,
+        predictor_config: SparseProfiledExecutionTimePredictorConfig,
+        replica_config: ReplicaConfig,
+    ) -> Optional[str]:
+        """Resolve the sparse profiling directory path."""
+        sparse_dir = predictor_config.sparse_profiling_dir
+        if not sparse_dir:
+            return None
 
-        if os.path.exists(mlp_path):
+        model_name = self._model_config.get_name()
+        model_dir = _model_name_to_dir(model_name)
+
+        sparse_dir = (
+            sparse_dir
+            .replace("{DEVICE}", replica_config.device)
+            .replace("{MODEL}", model_name)
+            .replace("{MODEL_DIR}", model_dir)
+        )
+
+        # If the resolved path doesn't exist, also try the slash-separated path
+        if not os.path.isdir(sparse_dir):
+            alt_dir = sparse_dir.replace(model_dir, model_name)
+            if os.path.isdir(alt_dir):
+                return alt_dir
+
+        return sparse_dir
+
+    def _load_sparse_profiling_data(self, sparse_dir: str):
+        """Load profiling data from CSVs in the sparse profiling directory."""
+        # Try both naming conventions: new (mlp.csv) and legacy (sparse_mlp.csv)
+        mlp_path = self._find_csv(sparse_dir, ["mlp.csv", "sparse_mlp.csv"])
+        mla_path = self._find_csv(sparse_dir, ["attention.csv", "mla_attention.csv"])
+        io_path = self._find_csv(sparse_dir, ["io.csv", "io_bandwidth.csv"])
+
+        if mlp_path:
             self._load_sparse_mlp(mlp_path)
         else:
-            logger.info(f"sparse_mlp.csv not found, using analytical MoE timing")
+            logger.info(f"No MoE MLP profiling CSV found in {sparse_dir}, using analytical")
 
-        if os.path.exists(mla_path):
+        if mla_path:
             self._load_mla_attention(mla_path)
         else:
-            logger.info(f"mla_attention.csv not found, using analytical MLA timing")
+            logger.info(f"No MLA attention profiling CSV found in {sparse_dir}, using analytical")
 
-        if os.path.exists(io_path):
+        if io_path:
             self._load_io_bandwidth(io_path)
         else:
-            logger.info(f"io_bandwidth.csv not found, using analytical IO bandwidth")
+            logger.info(f"No IO bandwidth profiling CSV found in {sparse_dir}, using analytical")
+
+    @staticmethod
+    def _find_csv(directory: str, candidates: List[str]) -> Optional[str]:
+        """Find the first existing CSV from a list of candidate filenames."""
+        for name in candidates:
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                return path
+        return None
 
     def _load_sparse_mlp(self, path: str):
         """Load sparse MLP profiling data and build prediction lookup."""
         df = pd.read_csv(path)
         logger.info(f"Loaded sparse MLP profiling: {len(df)} rows from {path}")
 
-        # Build per-num_tokens lookup for MoE operation timings (in ms)
-        # Sum the relevant operations into routing and expert compute
         predictions = {}
 
         for _, row in df.iterrows():
@@ -144,7 +194,7 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
         self._sparse_mlp_max_tokens = max(predictions.keys()) if predictions else 0
 
         logger.info(
-            f"  MoE profiled predictions: {len(predictions)} token counts, "
+            f"  MoE profiled: {len(predictions)} token counts, "
             f"max={self._sparse_mlp_max_tokens}"
         )
 
@@ -182,7 +232,7 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
         self._sparse_mla_max_tokens = max(predictions.keys()) if predictions else 0
 
         logger.info(
-            f"  MLA profiled predictions: {len(predictions)} token counts, "
+            f"  MLA profiled: {len(predictions)} token counts, "
             f"max={self._sparse_mla_max_tokens}"
         )
 
@@ -215,7 +265,6 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
         if self._profiled_hbm_bw_gbs is not None:
             self._mem_bw_bytes_per_s = self._profiled_hbm_bw_gbs * (1024 ** 3)
             if self._is_moe:
-                # Recompute weight load times with profiled bandwidth
                 total_expert_bytes = self._expert_params_bytes * self._local_experts
                 self._weight_load_hbm_ms = (
                     total_expert_bytes / self._mem_bw_bytes_per_s
@@ -240,16 +289,13 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
         if num_tokens in predictions:
             return predictions[num_tokens][key]
 
-        # Find surrounding token counts
         token_counts = sorted(predictions.keys())
 
         if num_tokens <= token_counts[0]:
-            # Extrapolate below: scale linearly from smallest
             ratio = num_tokens / token_counts[0]
             return predictions[token_counts[0]][key] * ratio
 
         if num_tokens >= token_counts[-1]:
-            # Extrapolate above: scale linearly from largest
             ratio = num_tokens / token_counts[-1]
             return predictions[token_counts[-1]][key] * ratio
 

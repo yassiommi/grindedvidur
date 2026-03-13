@@ -254,7 +254,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output_dir",
-        default="data/profiling/sparse/deepseek-ai/DeepSeek-V3",
+        default="data/profiling/compute/h100/deepseek_DeepSeek-V3",
         help="Output directory for profiling CSVs",
     )
     args = parser.parse_args()
@@ -280,16 +280,16 @@ def main():
     print(f"Token counts: {len(num_tokens_list)} values from {num_tokens_list[0]} to {num_tokens_list[-1]}")
 
     mlp_df = generate_sparse_mlp(num_tokens_list)
-    mlp_df.to_csv(os.path.join(output_dir, "sparse_mlp.csv"), index=False)
-    print(f"  sparse_mlp.csv: {len(mlp_df)} rows")
+    mlp_df.to_csv(os.path.join(output_dir, "mlp.csv"), index=False)
+    print(f"  mlp.csv: {len(mlp_df)} rows")
 
     mla_df = generate_mla_attention(num_tokens_list)
-    mla_df.to_csv(os.path.join(output_dir, "mla_attention.csv"), index=False)
-    print(f"  mla_attention.csv: {len(mla_df)} rows")
+    mla_df.to_csv(os.path.join(output_dir, "attention.csv"), index=False)
+    print(f"  attention.csv: {len(mla_df)} rows")
 
     io_df = generate_io_bandwidth()
-    io_df.to_csv(os.path.join(output_dir, "io_bandwidth.csv"), index=False)
-    print(f"  io_bandwidth.csv: {len(io_df)} rows")
+    io_df.to_csv(os.path.join(output_dir, "io.csv"), index=False)
+    print(f"  io.csv: {len(io_df)} rows")
 
     print("Done.")
 

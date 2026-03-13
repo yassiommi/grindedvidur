@@ -671,16 +671,16 @@ class RandomForrestExecutionTimePredictorConfig(BaseExecutionTimePredictorConfig
 class SparseProfiledExecutionTimePredictorConfig(BaseExecutionTimePredictorConfig):
     """Config for sparse-profiled predictor using empirical MoE/MLA data.
 
-    Uses profiling CSVs from vidur.profiling.sparse (sparse_mlp.csv,
-    mla_attention.csv, io_bandwidth.csv) to replace analytical estimates.
+    Uses profiling CSVs (mlp.csv, attention.csv, io.csv) from the
+    sparse profiler to replace analytical estimates.
     Falls back to analytical when profiling data is unavailable.
     """
     sparse_profiling_dir: str = field(
-        default="./data/profiling/sparse/{MODEL}",
+        default="./data/profiling/compute/{DEVICE}/{MODEL_DIR}",
         metadata={
             "help": "Directory containing sparse profiling CSVs "
-                    "(sparse_mlp.csv, mla_attention.csv, io_bandwidth.csv). "
-                    "Supports {MODEL} and {DEVICE} placeholders."
+                    "(mlp.csv, attention.csv, io.csv). "
+                    "Supports {DEVICE}, {MODEL}, and {MODEL_DIR} placeholders."
         },
     )
     num_estimators: List[int] = field(
