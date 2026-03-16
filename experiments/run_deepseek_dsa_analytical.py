@@ -62,6 +62,20 @@ INDEXER_K_BYTES_PER_TOKEN = KV_LORA_RANK * 1  # 512 bytes (FP8)
 
 BYTES_PER_PARAM = 2  # FP16 weights
 
+# MoE config
+NUM_ROUTED_EXPERTS = 256
+NUM_EXPERTS_PER_TOK = 8
+NUM_SHARED_EXPERTS = 1
+EXPERT_INTERMEDIATE_SIZE = 2048
+# 3 weight matrices per expert: gate_proj, up_proj, down_proj
+EXPERT_WEIGHT_BYTES = 3 * HIDDEN_SIZE * EXPERT_INTERMEDIATE_SIZE * BYTES_PER_PARAM  # 84 MB
+SHARED_EXPERT_WEIGHT_BYTES = EXPERT_WEIGHT_BYTES  # same architecture
+
+# Parallelism
+EP = 8   # expert parallelism: each GPU holds 256/8 = 32 experts
+TP = 1   # tensor parallelism (for this single-GPU analytical model)
+NVLINK_BW_GBS = 900.0  # H100 NVLink per-link effective bandwidth
+
 # ── H100 specs (from profiling) ────────────────────────────────────
 # HBM: ~1350 GB/s at large sizes, but flat ~0.015 ms floor below 16 MB
 # PCIe: ~51 GB/s
@@ -201,21 +215,55 @@ def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
 
     # ═══════════════════════════════════════════════════════════════
     # MoE BLOCK (sequential after attention)
+    #
+    # Expert weights are PREFETCHED on each GPU. With EP=8, each GPU
+    # holds 256/8 = 32 experts resident in HBM. No weight loading I/O.
+    #
+    # At BS=1, expert GEMMs are memory-bound (reading weights from HBM).
+    # A proper grouped GEMM kernel batches all active experts on this
+    # GPU into one kernel launch.
+    #
+    # Pipeline:
+    #   1. Router: gate GEMM + softmax + top-k (on each GPU)
+    #   2. EP dispatch: send token to GPUs holding selected experts
+    #   3. Expert GEMM: each GPU runs its local experts (1 per token avg)
+    #   4. EP combine: send results back
+    #   5. Shared expert: runs on every GPU (dense GEMM, always active)
     # ═══════════════════════════════════════════════════════════════
+
+    # Router: profiled (runs on each GPU, small GEMM)
     moe_norm_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_block_norm.median")
     moe_router_ms = (
         get_profiled_time(mlp_df, 1, "time_stats.moe_router_gate.median")
         + get_profiled_time(mlp_df, 1, "time_stats.moe_router_softmax.median")
         + get_profiled_time(mlp_df, 1, "time_stats.moe_router_topk.median")
     )
-    moe_dispatch_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_expert_dispatch.median")
-    moe_gemm_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_expert_gemm.median")
-    moe_combine_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_expert_combine.median")
-    moe_shared_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_shared_expert.median")
+
+    # EP dispatch + combine: send 1 token hidden_state to/from expert GPUs
+    # Each token goes to num_experts_per_tok=8 GPUs, each receives hidden_size FP16
+    # Dispatch: 8 × 7168 × 2B = 112 KB outbound (scattered across 8 GPUs)
+    # Combine: 8 × 7168 × 2B = 112 KB inbound (gather from 8 GPUs)
+    # NVLink latency-bound at these small sizes (~5-10 μs per message)
+    ep_msg_bytes = HIDDEN_SIZE * BYTES_PER_PARAM  # 14 KB per expert target
+    ep_dispatch_ms = NUM_EXPERTS_PER_TOK * 0.005  # ~5 μs per NVLink send
+    ep_combine_ms = NUM_EXPERTS_PER_TOK * 0.005   # ~5 μs per NVLink recv
+
+    # Expert GEMM: with EP=8, each GPU runs ~1 expert per token (8 experts / 8 GPUs)
+    # Each expert = 3 GEMMs (gate+up+down), BS=1, memory-bound on weight read
+    # Weight size per expert: 3 × 7168 × 2048 × 2B = 84 MB
+    # Time = weight_bytes / HBM_bandwidth (weights prefetched, resident in HBM)
+    experts_per_gpu = NUM_EXPERTS_PER_TOK / EP  # 1.0 on average
+    expert_weight_mb = EXPERT_WEIGHT_BYTES / (1024**2)
+    moe_gemm_ms = hbm_read_time_ms(io_df, int(experts_per_gpu * EXPERT_WEIGHT_BYTES))
+
+    # Shared expert: dense GEMM on all tokens, same shape as routed expert
+    # Weight size: 84 MB, BS=1, memory-bound
+    moe_shared_ms = hbm_read_time_ms(io_df, SHARED_EXPERT_WEIGHT_BYTES)
+
     moe_residual_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_block_residual.median")
 
-    moe_total_ms = (moe_norm_ms + moe_router_ms + moe_dispatch_ms +
-                    moe_gemm_ms + moe_combine_ms + moe_shared_ms + moe_residual_ms)
+    moe_total_ms = (moe_norm_ms + moe_router_ms + ep_dispatch_ms +
+                    moe_gemm_ms + ep_combine_ms + moe_shared_ms + moe_residual_ms)
 
     # ═══════════════════════════════════════════════════════════════
     # TOTAL per layer
@@ -253,9 +301,11 @@ def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
         # MoE
         "moe_norm_ms": moe_norm_ms,
         "moe_router_ms": moe_router_ms,
-        "moe_dispatch_ms": moe_dispatch_ms,
+        "ep_dispatch_ms": ep_dispatch_ms,
         "moe_gemm_ms": moe_gemm_ms,
-        "moe_combine_ms": moe_combine_ms,
+        "expert_weight_mb": expert_weight_mb,
+        "experts_per_gpu": experts_per_gpu,
+        "ep_combine_ms": ep_combine_ms,
         "moe_shared_ms": moe_shared_ms,
         "moe_residual_ms": moe_residual_ms,
         "moe_total_ms": moe_total_ms,
@@ -300,14 +350,14 @@ def print_breakdown(r):
     print(f"  │ Residual add                                        {r['residual_ms']:.4f} ms")
     print(f"  └─── Block C total: {r['block_c_ms']:.4f} ms")
 
-    print(f"\n  MoE BLOCK (sequential after attention)")
+    print(f"\n  MoE BLOCK (EP={EP}, weights prefetched on GPU)")
     print(f"  ┌─────────────────────────────────────────────────────────────")
     print(f"  │ Norm          {r['moe_norm_ms']:.4f} ms")
     print(f"  │ Router        gate+softmax+topk                     {r['moe_router_ms']:.4f} ms")
-    print(f"  │ Dispatch                                            {r['moe_dispatch_ms']:.4f} ms")
-    print(f"  │ Expert GEMM   8 experts × 3 GEMMs (grouped)         {r['moe_gemm_ms']:.4f} ms")
-    print(f"  │ Combine                                             {r['moe_combine_ms']:.4f} ms")
-    print(f"  │ Shared expert 1 dense expert                        {r['moe_shared_ms']:.4f} ms")
+    print(f"  │ EP dispatch   token→expert GPUs (NVLink)             {r['ep_dispatch_ms']:.4f} ms")
+    print(f"  │ Expert GEMM   {r['experts_per_gpu']:.0f}/GPU × {r['expert_weight_mb']:.0f}MB weights (HBM)    {r['moe_gemm_ms']:.4f} ms")
+    print(f"  │ EP combine    results→home GPU (NVLink)              {r['ep_combine_ms']:.4f} ms")
+    print(f"  │ Shared expert 1 dense × {r['expert_weight_mb']:.0f}MB weights (HBM)        {r['moe_shared_ms']:.4f} ms")
     print(f"  │ Residual                                            {r['moe_residual_ms']:.4f} ms")
     print(f"  └─── MoE total: {r['moe_total_ms']:.4f} ms")
 
@@ -331,7 +381,7 @@ def main():
     print("DeepSeek-V3 DSA Decode: Analytical Per-Layer Breakdown")
     print(f"Model: 61 layers, hidden=7168, 128 heads, MLA (kv_lora=512, q_lora=1536)")
     print(f"DSA: top-{DSA_SELECTED_TOKENS} selected + {DSA_SLIDING_WINDOW} sliding window = {DSA_ATTENDED} attended")
-    print(f"Hardware: H100 (profiled), single GPU, BS=1")
+    print(f"Hardware: H100 (profiled), EP={EP} (experts prefetched, {NUM_ROUTED_EXPERTS//EP}/GPU), BS=1")
 
     seq_lens = [4096, 32768, 128 * 1024, 512 * 1024, 1024 * 1024]
     results = []
