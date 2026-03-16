@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DeepSeek-V3 DSA Decode: Analytical per-layer timing breakdown.
+"""DeepSeek-V3 DSA Decode: Purely analytical per-layer timing breakdown.
 
 Computes execution time for one decode step through 61 layers using
 the correct DSA pipeline structure:
@@ -24,15 +24,8 @@ Block C: Attention compute (runs after both A and B complete)
   - Attention: Q × K^T → softmax → × V (on 2560 tokens only)
   - o_proj: attention output → hidden
 
-Uses real H100 profiling data for GEMM times and IO bandwidth.
+All times are purely analytical — no profiling data used.
 """
-
-import os
-import pandas as pd
-import numpy as np
-
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROFILING_DIR = os.path.join(_ROOT, "data/profiling/compute/h100/deepseek_DeepSeek-V3")
 
 # ── DeepSeek-V3 config ──────────────────────────────────────────────
 NUM_LAYERS = 61
@@ -68,94 +61,91 @@ NUM_EXPERTS_PER_TOK = 8
 NUM_SHARED_EXPERTS = 1
 EXPERT_INTERMEDIATE_SIZE = 2048
 # 3 weight matrices per expert: gate_proj, up_proj, down_proj
-EXPERT_WEIGHT_BYTES = 3 * HIDDEN_SIZE * EXPERT_INTERMEDIATE_SIZE * BYTES_PER_PARAM  # 84 MB
+EXPERT_WEIGHT_BYTES = 3 * HIDDEN_SIZE * EXPERT_INTERMEDIATE_SIZE * BYTES_PER_PARAM  # ~84 MB
 SHARED_EXPERT_WEIGHT_BYTES = EXPERT_WEIGHT_BYTES  # same architecture
 
 # Parallelism
 EP = 8   # expert parallelism: each GPU holds 256/8 = 32 experts
 TP = 1   # tensor parallelism (for this single-GPU analytical model)
-NVLINK_BW_GBS = 900.0  # H100 NVLink per-link effective bandwidth
 
-# ── H100 specs (from profiling) ────────────────────────────────────
-# HBM: ~1350 GB/s at large sizes, but flat ~0.015 ms floor below 16 MB
-# PCIe: ~51 GB/s
-# FP16 TFLOPS: 989.5 (H100 SXM spec)
-H100_FP16_TFLOPS = 989.5
-H100_FP8_TFLOPS = 1979.0
+# ── H100 SXM specs ───────────────────────────────────────────────────
+H100_HBM_BW_GBS = 3350.0       # H100 SXM HBM3 peak bandwidth (GB/s)
+H100_HBM_BW_EFF_GBS = 2680.0   # ~80% efficiency at large transfers
+H100_FP16_TFLOPS = 989.5       # FP16 Tensor Core peak
+H100_FP8_TFLOPS = 1979.0       # FP8 Tensor Core peak
+H100_KERNEL_LAUNCH_US = 5.0    # Typical CUDA kernel launch overhead (μs)
+NVLINK_LATENCY_US = 5.0        # NVLink per-message latency (μs)
 
 
 def gemm_flops(m, k, n):
+    """FLOPs for a GEMM: 2*M*K*N."""
     return 2.0 * m * k * n
 
 
 def gemm_weight_bytes(k, n):
+    """Weight matrix size in bytes (FP16)."""
     return k * n * BYTES_PER_PARAM
 
 
-def load_profiling_data():
-    attn = pd.read_csv(os.path.join(PROFILING_DIR, "attention.csv"))
-    mlp = pd.read_csv(os.path.join(PROFILING_DIR, "mlp.csv"))
-    io = pd.read_csv(os.path.join(PROFILING_DIR, "io.csv"))
-    return attn, mlp, io
+def hbm_read_time_ms(size_bytes):
+    """Analytical HBM read time in ms.
+
+    At BS=1, GEMM is memory-bound: time = max(weight_read, kernel_launch).
+    H100 SXM HBM3: 3.35 TB/s peak, ~80% utilization at large sizes.
+    Small transfers are dominated by kernel launch overhead (~5 μs).
+    """
+    bandwidth_time_ms = (size_bytes / (H100_HBM_BW_EFF_GBS * 1024**3)) * 1e3
+    kernel_launch_ms = H100_KERNEL_LAUNCH_US / 1000.0
+    return max(bandwidth_time_ms, kernel_launch_ms)
 
 
-def get_profiled_time(df, num_tokens, col):
-    """Get profiled median time for exact or nearest token count."""
-    row = df[df["num_tokens"] == num_tokens]
-    if len(row) > 0:
-        return row.iloc[0][col]
-    # Interpolate
-    below = df[df["num_tokens"] <= num_tokens].sort_values("num_tokens")
-    above = df[df["num_tokens"] >= num_tokens].sort_values("num_tokens")
-    if len(below) == 0:
-        return above.iloc[0][col]
-    if len(above) == 0:
-        return below.iloc[-1][col]
-    lo = below.iloc[-1]
-    hi = above.iloc[0]
-    frac = (num_tokens - lo["num_tokens"]) / (hi["num_tokens"] - lo["num_tokens"])
-    return lo[col] * (1 - frac) + hi[col] * frac
+def gemm_time_ms(m, k, n, dtype_bytes=BYTES_PER_PARAM, peak_tflops=H100_FP16_TFLOPS, mfu=0.5):
+    """Analytical GEMM time: max(compute_bound, memory_bound).
+
+    At BS=1 (m=1), GEMMs are memory-bound (reading weight matrix).
+    At larger batch sizes, compute starts to dominate.
+    """
+    # Compute bound: FLOPs / throughput
+    flops = gemm_flops(m, k, n)
+    compute_ms = (flops / 1e9) / (peak_tflops * 1024 * mfu) * 1e3
+
+    # Memory bound: read weights + activations from HBM
+    weight_bytes = k * n * dtype_bytes
+    activation_bytes = (m * k + m * n) * dtype_bytes  # input + output
+    total_bytes = weight_bytes + activation_bytes
+    memory_ms = hbm_read_time_ms(total_bytes)
+
+    return max(compute_ms, memory_ms)
 
 
-def hbm_read_time_ms(io_df, size_bytes):
-    """Interpolate HBM read time from profiled data, respecting latency floor."""
-    hbm = io_df[io_df["transfer_type"] == "hbm_read"].sort_values("size_bytes")
-    size_mb = size_bytes / (1024 ** 2)
+def elementwise_time_ms(num_elements, bytes_per_element=2):
+    """Time for element-wise ops (RoPE, residual add, etc.).
 
-    # Exact or interpolate from profiled data
-    below = hbm[hbm["size_bytes"] <= size_bytes]
-    above = hbm[hbm["size_bytes"] >= size_bytes]
-
-    if len(below) == 0:
-        return above.iloc[0]["latency_ms"]
-    if len(above) == 0:
-        # Extrapolate using largest measured bandwidth
-        bw = hbm.iloc[-1]["bandwidth_gb_per_s"]
-        return (size_bytes / (bw * 1024**3)) * 1e3
-
-    lo = below.iloc[-1]
-    hi = above.iloc[0]
-
-    if lo["size_bytes"] == hi["size_bytes"]:
-        return lo["latency_ms"]
-
-    frac = (size_bytes - lo["size_bytes"]) / (hi["size_bytes"] - lo["size_bytes"])
-    return lo["latency_ms"] * (1 - frac) + hi["latency_ms"] * frac
+    Memory-bound: read + write the tensor.
+    """
+    total_bytes = num_elements * bytes_per_element * 2  # read + write
+    return hbm_read_time_ms(total_bytes)
 
 
-def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
+def analyze_dsa_decode(seq_len):
     """Analytical DSA decode timing for one layer at BS=1."""
 
     # ═══════════════════════════════════════════════════════════════
     # BLOCK A: Q Projection (1 decode token)
     # ═══════════════════════════════════════════════════════════════
-    # These are weight-matrix multiplies at BS=1 → memory-bound (loading weights)
-    q_down_ms = get_profiled_time(attn_df, 1, "time_stats.mla_q_down_proj.median")
-    q_up_ms = get_profiled_time(attn_df, 1, "time_stats.mla_q_up_proj.median")
-    rope_ms = get_profiled_time(attn_df, 1, "time_stats.mla_rope.median")
+    # At BS=1, all GEMMs are memory-bound (reading weights from HBM)
 
+    # q_down_proj: [1, 7168] × [7168, 1536] → [1, 1536]
+    q_down_ms = gemm_time_ms(1, HIDDEN_SIZE, Q_LORA_RANK)
     q_down_weight_mb = gemm_weight_bytes(HIDDEN_SIZE, Q_LORA_RANK) / (1024**2)
+
+    # q_up_proj: [1, 1536] × [1536, 24576] → [1, 24576]
+    q_up_ms = gemm_time_ms(1, Q_LORA_RANK, Q_TOTAL_DIM)
     q_up_weight_mb = gemm_weight_bytes(Q_LORA_RANK, Q_TOTAL_DIM) / (1024**2)
+
+    # RoPE: element-wise on rope portion of Q
+    rope_elements = NUM_HEADS * QK_ROPE_HEAD_DIM  # 128 * 64 = 8192
+    rope_ms = elementwise_time_ms(rope_elements)
 
     block_a_ms = q_down_ms + q_up_ms + rope_ms
 
@@ -166,24 +156,22 @@ def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
     # B1: Read indexer K cache from HBM (FP8, all tokens)
     indexer_k_bytes = INDEXER_K_BYTES_PER_TOKEN * seq_len
     indexer_k_mb = indexer_k_bytes / (1024**2)
-    indexer_read_ms = hbm_read_time_ms(io_df, indexer_k_bytes)
+    indexer_read_ms = hbm_read_time_ms(indexer_k_bytes)
 
     # B2: Indexer matmul (FP8): [1, 512] × [512, seq_len] → [1, seq_len]
     #     At BS=1 this is entirely memory-bound — time is dominated by
     #     reading the indexer K cache, which we already counted above.
     indexer_flops = gemm_flops(1, KV_LORA_RANK, seq_len)
-    indexer_compute_ms = (indexer_flops / 1e9) / (H100_FP8_TFLOPS * 1024)  # negligible
+    indexer_compute_ms = (indexer_flops / 1e9) / (H100_FP8_TFLOPS * 1024) * 1e3  # negligible
 
     # B3: Top-k selection (2048 from seq_len)
-    #     GPU parallel partial sort. Not profiled; estimate from GPU sort benchmarks.
-    #     H100 can sort ~1B elements/s for top-k. At 128K: ~0.13 ms, at 1M: ~1 ms
-    topk_ms = seq_len / 1e6 * 1.0  # rough: ~1 ms per 1M elements
+    #     GPU parallel partial sort. ~1 ms per 1M elements on H100.
+    topk_ms = seq_len / 1e6 * 1.0
 
     # B4: Fetch full MLA KV for attended tokens (scattered gather from KV cache)
     fetch_kv_bytes = MLA_KV_BYTES_PER_TOKEN * DSA_ATTENDED
     fetch_kv_mb = fetch_kv_bytes / (1024**2)
-    # Scattered gather — use profiled HBM time (dominated by latency floor at 2.8 MB)
-    fetch_kv_ms = hbm_read_time_ms(io_df, fetch_kv_bytes)
+    fetch_kv_ms = hbm_read_time_ms(fetch_kv_bytes)
 
     block_b_ms = indexer_read_ms + indexer_compute_ms + topk_ms + fetch_kv_ms
 
@@ -192,8 +180,8 @@ def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
     # ═══════════════════════════════════════════════════════════════
 
     # C1: KV decompression (kv_up_proj on 2560 fetched tokens)
-    #     [2560, 512] × [512, 32768] — compute-bound at this size
-    kv_up_ms = get_profiled_time(attn_df, DSA_ATTENDED, "time_stats.mla_kv_up_proj.median")
+    #     [2560, 512] × [512, 32768] — this is a large GEMM, compute-bound
+    kv_up_ms = gemm_time_ms(DSA_ATTENDED, KV_LORA_RANK, KV_UP_OUT_DIM)
     kv_up_flops = gemm_flops(DSA_ATTENDED, KV_LORA_RANK, KV_UP_OUT_DIM)
 
     # C2: Attention core (1 query vs 2560 KV entries, 128 heads)
@@ -201,15 +189,15 @@ def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
     #     Decompressed KV size: 2560 * 32768 * 2 = 160 MB
     decompressed_kv_bytes = DSA_ATTENDED * KV_UP_OUT_DIM * BYTES_PER_PARAM
     decompressed_kv_mb = decompressed_kv_bytes / (1024**2)
-    attn_core_ms = hbm_read_time_ms(io_df, decompressed_kv_bytes)
+    attn_core_ms = hbm_read_time_ms(decompressed_kv_bytes)
 
     # C3: Output projection (on 1 decode token)
     #     [1, 16384] × [16384, 7168] — memory-bound at BS=1
-    o_proj_ms = get_profiled_time(attn_df, 1, "time_stats.mla_o_proj.median")
+    o_proj_ms = gemm_time_ms(1, O_PROJ_IN_DIM, HIDDEN_SIZE)
     o_proj_weight_mb = gemm_weight_bytes(O_PROJ_IN_DIM, HIDDEN_SIZE) / (1024**2)
 
-    # C4: Residual
-    residual_ms = get_profiled_time(attn_df, 1, "time_stats.mla_block_residual.median")
+    # C4: Residual add
+    residual_ms = elementwise_time_ms(HIDDEN_SIZE)
 
     block_c_ms = kv_up_ms + attn_core_ms + o_proj_ms + residual_ms
 
@@ -231,36 +219,33 @@ def analyze_dsa_decode(seq_len, attn_df, mlp_df, io_df):
     #   5. Shared expert: runs on every GPU (dense GEMM, always active)
     # ═══════════════════════════════════════════════════════════════
 
-    # Router: profiled (runs on each GPU, small GEMM)
-    moe_norm_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_block_norm.median")
-    moe_router_ms = (
-        get_profiled_time(mlp_df, 1, "time_stats.moe_router_gate.median")
-        + get_profiled_time(mlp_df, 1, "time_stats.moe_router_softmax.median")
-        + get_profiled_time(mlp_df, 1, "time_stats.moe_router_topk.median")
-    )
+    # Norm: LayerNorm on hidden_size
+    moe_norm_ms = elementwise_time_ms(HIDDEN_SIZE)
+
+    # Router: gate GEMM [1, 7168] × [7168, 256] + softmax + topk
+    router_gate_ms = gemm_time_ms(1, HIDDEN_SIZE, NUM_ROUTED_EXPERTS)
+    router_softmax_ms = H100_KERNEL_LAUNCH_US / 1000.0  # tiny op, kernel launch dominated
+    router_topk_ms = H100_KERNEL_LAUNCH_US / 1000.0     # tiny op, kernel launch dominated
+    moe_router_ms = router_gate_ms + router_softmax_ms + router_topk_ms
 
     # EP dispatch + combine: send 1 token hidden_state to/from expert GPUs
-    # Each token goes to num_experts_per_tok=8 GPUs, each receives hidden_size FP16
-    # Dispatch: 8 × 7168 × 2B = 112 KB outbound (scattered across 8 GPUs)
-    # Combine: 8 × 7168 × 2B = 112 KB inbound (gather from 8 GPUs)
-    # NVLink latency-bound at these small sizes (~5-10 μs per message)
-    ep_msg_bytes = HIDDEN_SIZE * BYTES_PER_PARAM  # 14 KB per expert target
-    ep_dispatch_ms = NUM_EXPERTS_PER_TOK * 0.005  # ~5 μs per NVLink send
-    ep_combine_ms = NUM_EXPERTS_PER_TOK * 0.005   # ~5 μs per NVLink recv
+    # NVLink latency-bound at these small sizes (~5 μs per message)
+    ep_dispatch_ms = NUM_EXPERTS_PER_TOK * NVLINK_LATENCY_US / 1000.0
+    ep_combine_ms = NUM_EXPERTS_PER_TOK * NVLINK_LATENCY_US / 1000.0
 
     # Expert GEMM: with EP=8, each GPU runs ~1 expert per token (8 experts / 8 GPUs)
     # Each expert = 3 GEMMs (gate+up+down), BS=1, memory-bound on weight read
-    # Weight size per expert: 3 × 7168 × 2048 × 2B = 84 MB
-    # Time = weight_bytes / HBM_bandwidth (weights prefetched, resident in HBM)
+    # Weight size per expert: 3 × 7168 × 2048 × 2B = ~84 MB
     experts_per_gpu = NUM_EXPERTS_PER_TOK / EP  # 1.0 on average
     expert_weight_mb = EXPERT_WEIGHT_BYTES / (1024**2)
-    moe_gemm_ms = hbm_read_time_ms(io_df, int(experts_per_gpu * EXPERT_WEIGHT_BYTES))
+    moe_gemm_ms = hbm_read_time_ms(int(experts_per_gpu * EXPERT_WEIGHT_BYTES))
 
-    # Shared expert: dense GEMM on all tokens, same shape as routed expert
-    # Weight size: 84 MB, BS=1, memory-bound
-    moe_shared_ms = hbm_read_time_ms(io_df, SHARED_EXPERT_WEIGHT_BYTES)
+    # Shared expert: dense GEMM on 1 token, same shape as routed expert
+    # Weight size: ~84 MB, BS=1, memory-bound
+    moe_shared_ms = hbm_read_time_ms(SHARED_EXPERT_WEIGHT_BYTES)
 
-    moe_residual_ms = get_profiled_time(mlp_df, 1, "time_stats.moe_block_residual.median")
+    # Residual add
+    moe_residual_ms = elementwise_time_ms(HIDDEN_SIZE)
 
     moe_total_ms = (moe_norm_ms + moe_router_ms + ep_dispatch_ms +
                     moe_gemm_ms + ep_combine_ms + moe_shared_ms + moe_residual_ms)
@@ -376,24 +361,23 @@ def print_breakdown(r):
 
 
 def main():
-    attn_df, mlp_df, io_df = load_profiling_data()
-
-    print("DeepSeek-V3 DSA Decode: Analytical Per-Layer Breakdown")
-    print(f"Model: 61 layers, hidden=7168, 128 heads, MLA (kv_lora=512, q_lora=1536)")
+    print("DeepSeek-V3 DSA Decode: Purely Analytical Per-Layer Breakdown")
+    print(f"Model: {NUM_LAYERS} layers, hidden={HIDDEN_SIZE}, {NUM_HEADS} heads, MLA (kv_lora={KV_LORA_RANK}, q_lora={Q_LORA_RANK})")
     print(f"DSA: top-{DSA_SELECTED_TOKENS} selected + {DSA_SLIDING_WINDOW} sliding window = {DSA_ATTENDED} attended")
-    print(f"Hardware: H100 (profiled), EP={EP} (experts prefetched, {NUM_ROUTED_EXPERTS//EP}/GPU), BS=1")
+    print(f"Hardware: H100 SXM (analytical), HBM={H100_HBM_BW_EFF_GBS:.0f} GB/s eff, FP16={H100_FP16_TFLOPS} TFLOPS")
+    print(f"EP={EP} (experts prefetched, {NUM_ROUTED_EXPERTS // EP}/GPU), BS=1")
 
     seq_lens = [4096, 32768, 128 * 1024, 512 * 1024, 1024 * 1024]
     results = []
 
     for sl in seq_lens:
-        r = analyze_dsa_decode(sl, attn_df, mlp_df, io_df)
+        r = analyze_dsa_decode(sl)
         results.append(r)
         print_breakdown(r)
 
     # Summary table
     print(f"\n\n{'=' * 90}")
-    print(f" SUMMARY: DSA Decode Timing (BS=1, single H100, {NUM_LAYERS} layers)")
+    print(f" SUMMARY: DSA Decode Timing (BS=1, H100 SXM analytical, {NUM_LAYERS} layers)")
     print(f"{'=' * 90}")
     print(f"{'Seq Len':>10s}  {'Block A':>10s}  {'Block B':>10s}  {'max(A,B)':>10s}  "
           f"{'Block C':>10s}  {'MoE':>10s}  {'Layer':>10s}  {'61 Layers':>12s}")
