@@ -1,4 +1,4 @@
-"""Sparse model profiler: MoE MLP + MLA attention + IO bandwidth.
+"""Sparse model profiler: MoE MLP + MLA attention + DSA sparse attention + IO bandwidth.
 
 Profiles sparse model components (DeepSeek-V3, Mixtral, etc.) to collect
 empirical timing data that replaces analytical FLOPs-based estimation.
@@ -12,7 +12,9 @@ Usage:
 Components profiled:
     1. MoE MLP: routing, grouped expert GEMM, shared experts, dispatch/combine
     2. MLA attention: Q/KV compression/decompression projections (DeepSeek models)
-    3. IO bandwidth: HBM read, PCIe H2D/D2H for expert weights and KV cache
+    3. DSA sparse attention: indexer loading, top-k selection, KV fetch, Q projections,
+       attention calculation — the full DeepSeek Sparse Attention decode pipeline
+    4. IO bandwidth: HBM read, PCIe H2D/D2H for expert weights and KV cache
 """
 
 import argparse
@@ -29,6 +31,7 @@ from tqdm import tqdm
 from vidur.config.model_config import BaseModelConfig
 from vidur.profiling.sparse.sparse_mlp_wrapper import SparseMlpWrapper
 from vidur.profiling.sparse.mla_attention_wrapper import MLAAttentionWrapper
+from vidur.profiling.sparse.dsa_attention_wrapper import DSAAttentionWrapper
 from vidur.profiling.sparse.io_profiler import IOProfiler
 from vidur.profiling.utils import ProfileMethod, get_num_tokens_to_profile
 
@@ -51,6 +54,10 @@ SPARSE_MODEL_CONFIGS = {
         "qk_rope_head_dim": 64,
         "v_head_dim": 128,
         "has_mla": True,
+        # DSA (Dynamic Sparse Attention) parameters
+        "has_dsa": True,
+        "dsa_selected_tokens": 2048,
+        "dsa_sliding_window": 512,
     },
     "mistralai/Mixtral-8x7B-v0.1": {
         "hidden_size": 4096,
@@ -137,6 +144,30 @@ def parse_args():
         "--skip_io",
         action="store_true",
         help="Skip IO bandwidth profiling",
+    )
+    parser.add_argument(
+        "--skip_dsa",
+        action="store_true",
+        help="Skip DSA (sparse attention) profiling",
+    )
+    parser.add_argument(
+        "--dsa_seq_lens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Sequence lengths for DSA profiling (default: logarithmic sweep up to max_tokens)",
+    )
+    parser.add_argument(
+        "--dsa_selected_tokens",
+        type=int,
+        default=None,
+        help="Override DSA top-k selected tokens (default: from model config)",
+    )
+    parser.add_argument(
+        "--dsa_sliding_window",
+        type=int,
+        default=None,
+        help="Override DSA sliding window size (default: from model config)",
     )
     parser.add_argument(
         "--io_sizes_mb",
@@ -323,6 +354,117 @@ def profile_mla_attention(
     return df
 
 
+def get_dsa_seq_lens(max_seq_len: int) -> List[int]:
+    """Generate a logarithmic sweep of sequence lengths for DSA profiling.
+
+    DSA cost scales with seq_len (indexer K cache size, top-k cost), so we
+    sweep across a representative range from small to large contexts.
+    """
+    import math
+    seq_lens = []
+    # Powers of 2 from 1024 to max_seq_len
+    power = 10  # 1024
+    while 2**power <= max_seq_len:
+        seq_lens.append(2**power)
+        power += 1
+    # Also add intermediate points for finer resolution
+    intermediates = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
+    for s in intermediates:
+        if s <= max_seq_len and s not in seq_lens:
+            seq_lens.append(s)
+    seq_lens.sort()
+    return seq_lens
+
+
+def profile_dsa_attention(
+    args: argparse.Namespace,
+    model_name: str,
+    config: dict,
+    num_tokens_list: List[int],
+    seq_lens: List[int],
+    pbar: Any,
+) -> pd.DataFrame:
+    """Profile DSA sparse attention across (num_tokens, seq_len) pairs.
+
+    For DSA decode, we typically profile with num_tokens=1 (single decode
+    token) across varying seq_lens, since seq_len controls the indexer
+    cache size and top-k cost — the dominant variable.  We also sweep
+    num_tokens for batch decode scenarios.
+    """
+    all_results = []
+
+    dsa_selected = args.dsa_selected_tokens or config.get("dsa_selected_tokens", 2048)
+    dsa_window = args.dsa_sliding_window or config.get("dsa_sliding_window", 512)
+
+    if args.disable_ray:
+        wrapper = DSAAttentionWrapper(
+            hidden_size=config["hidden_size"],
+            num_heads=config["num_heads"],
+            kv_lora_rank=config["kv_lora_rank"],
+            q_lora_rank=config["q_lora_rank"],
+            qk_nope_head_dim=config["qk_nope_head_dim"],
+            qk_rope_head_dim=config["qk_rope_head_dim"],
+            v_head_dim=config["v_head_dim"],
+            dsa_selected_tokens=dsa_selected,
+            dsa_sliding_window=dsa_window,
+            max_seq_len=max(seq_lens),
+            profile_method=args.profile_method,
+            output_dir=args.output_dir,
+        )
+        for seq_len in seq_lens:
+            for num_tokens in num_tokens_list:
+                result = wrapper.profile(num_tokens, seq_len)
+                all_results.append(result)
+                pbar.update(1)
+    else:
+        wrapper_actor = ray.remote(num_cpus=1, num_gpus=1)(DSAAttentionWrapper)
+        wrappers = [
+            wrapper_actor.remote(
+                hidden_size=config["hidden_size"],
+                num_heads=config["num_heads"],
+                kv_lora_rank=config["kv_lora_rank"],
+                q_lora_rank=config["q_lora_rank"],
+                qk_nope_head_dim=config["qk_nope_head_dim"],
+                qk_rope_head_dim=config["qk_rope_head_dim"],
+                v_head_dim=config["v_head_dim"],
+                dsa_selected_tokens=dsa_selected,
+                dsa_sliding_window=dsa_window,
+                max_seq_len=max(seq_lens),
+                profile_method=args.profile_method,
+                output_dir=args.output_dir,
+            )
+            for _ in range(args.num_gpus)
+        ]
+
+        promises = []
+        idx = 0
+        for seq_len in seq_lens:
+            for num_tokens in num_tokens_list:
+                worker_id = idx % args.num_gpus
+                promise = wrappers[worker_id].profile.remote(num_tokens, seq_len)
+                promises.append(promise)
+                idx += 1
+
+                if len(promises) >= args.num_gpus:
+                    results = ray.get(promises)
+                    all_results.extend(results)
+                    promises = []
+                    pbar.update(len(results))
+
+        if promises:
+            results = ray.get(promises)
+            all_results.extend(results)
+            pbar.update(len(results))
+
+    df = pd.DataFrame(all_results)
+    df = (
+        pd.json_normalize(df["time_stats"])
+        .add_prefix("time_stats.")
+        .join(df.drop(columns=["time_stats"]))
+    )
+    return df
+
+
 def profile_io_bandwidth(
     args: argparse.Namespace,
     model_name: str,
@@ -426,7 +568,7 @@ def main():
 
         # 1. MoE MLP profiling
         if not args.skip_moe_mlp:
-            print(f"\n[1/3] Profiling MoE MLP ({len(num_tokens_to_profile)} token counts)...")
+            print(f"\n[1/4] Profiling MoE MLP ({len(num_tokens_to_profile)} token counts)...")
             if not args.disable_ray:
                 ray.init(ignore_reinit_error=True)
 
@@ -438,7 +580,7 @@ def main():
 
         # 2. MLA attention profiling (only for models with MLA)
         if not args.skip_mla and config.get("has_mla"):
-            print(f"\n[2/3] Profiling MLA attention ({len(num_tokens_to_profile)} token counts)...")
+            print(f"\n[2/4] Profiling MLA attention ({len(num_tokens_to_profile)} token counts)...")
             if not args.disable_ray:
                 ray.init(ignore_reinit_error=True)
 
@@ -448,11 +590,34 @@ def main():
             mla_df.to_csv(f"{model_dir}/mla_attention.csv", index=False)
             print(f"  Saved: {model_dir}/mla_attention.csv ({len(mla_df)} rows)")
         elif not args.skip_mla:
-            print(f"\n[2/3] Skipping MLA (model uses standard GQA attention)")
+            print(f"\n[2/4] Skipping MLA (model uses standard GQA attention)")
 
-        # 3. IO bandwidth profiling
+        # 3. DSA sparse attention profiling (only for models with DSA)
+        if not args.skip_dsa and config.get("has_dsa"):
+            dsa_seq_lens = args.dsa_seq_lens or get_dsa_seq_lens(args.max_tokens)
+            # For DSA decode, profile with small batch sizes (1, 4, 16)
+            dsa_num_tokens = [1, 4, 16]
+            total_dsa_combos = len(dsa_seq_lens) * len(dsa_num_tokens)
+            print(f"\n[3/4] Profiling DSA sparse attention "
+                  f"({len(dsa_seq_lens)} seq_lens × {len(dsa_num_tokens)} batch sizes "
+                  f"= {total_dsa_combos} combos)...")
+            if not args.disable_ray:
+                ray.init(ignore_reinit_error=True)
+
+            pbar = tqdm(total=total_dsa_combos, desc="DSA Attention")
+            dsa_df = profile_dsa_attention(
+                args, model_name, config,
+                dsa_num_tokens, dsa_seq_lens, pbar,
+            )
+            pbar.close()
+            dsa_df.to_csv(f"{model_dir}/dsa_attention.csv", index=False)
+            print(f"  Saved: {model_dir}/dsa_attention.csv ({len(dsa_df)} rows)")
+        elif not args.skip_dsa:
+            print(f"\n[3/4] Skipping DSA (model does not use sparse attention)")
+
+        # 4. IO bandwidth profiling
         if not args.skip_io:
-            print(f"\n[3/3] Profiling IO bandwidth...")
+            print(f"\n[4/4] Profiling IO bandwidth...")
             io_df = profile_io_bandwidth(args, model_name, config)
             io_df.to_csv(f"{model_dir}/io_bandwidth.csv", index=False)
             print(f"  Saved: {model_dir}/io_bandwidth.csv ({len(io_df)} rows)")
