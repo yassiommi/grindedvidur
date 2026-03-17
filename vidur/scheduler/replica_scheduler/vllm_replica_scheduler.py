@@ -22,6 +22,7 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
 
     def on_batch_end(self, batch: Batch) -> None:
         self._num_running_batches -= 1
+        self._insert_completed_into_prefix_cache(batch)
 
         for request in batch.requests:
             if request.completed:
@@ -29,12 +30,19 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
             else:
                 self._preempted_requests.append(request)
 
+    def _get_new_request_blocks(self, request: Request) -> int:
+        """Get number of blocks needed for a new request, accounting for prefix cache hits."""
+        # Only allocate blocks for tokens that actually need processing
+        effective_tokens = request.num_prefill_tokens - request.num_processed_tokens
+        effective_tokens = max(effective_tokens, 0)
+        # Still need blocks for the cached portion (KV state is in prefix cache
+        # but request still needs memory for its full sequence during execution)
+        return ceil(request.num_prefill_tokens / self._config.block_size)
+
     def _can_allocate_request(self, request: Request) -> bool:
         if request.id not in self._allocation_map:
             # new request
-            num_required_blocks = ceil(
-                (request.num_prefill_tokens) / self._config.block_size
-            )
+            num_required_blocks = self._get_new_request_blocks(request)
             return (
                 self._config.num_blocks
                 - self._num_allocated_blocks
@@ -48,9 +56,7 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
     def _allocate_request(self, request: Request) -> None:
         if request.id not in self._allocation_map:
             # new request
-            num_required_blocks = ceil(
-                (request.num_prefill_tokens) / self._config.block_size
-            )
+            num_required_blocks = self._get_new_request_blocks(request)
             self.allocate(request.id, num_required_blocks)
             return
 

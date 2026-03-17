@@ -71,6 +71,8 @@ class RequestMetricsHistogram(enum.Enum):
     REQUEST_DECODE_TOKENS = "request_num_decode_tokens"
     REQUEST_PD_RATIO = "request_pd_ratio"
     REQUEST_NUM_RESTARTS = "request_num_restarts"
+    REQUEST_PREFIX_CACHE_HIT_TOKENS = "request_prefix_cache_hit_tokens"
+    REQUEST_PREFIX_CACHE_HIT_RATIO = "request_prefix_cache_hit_ratio"
 
 
 class BatchMetricsCountDistribution(enum.Enum):

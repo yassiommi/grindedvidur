@@ -5,6 +5,7 @@ from typing import List
 
 from vidur.config import SimulationConfig
 from vidur.entities import Cluster
+from vidur.entities.prefix_token_generator import PrefixTokenGenerator
 from vidur.events import BaseEvent, RequestArrivalEvent
 from vidur.logger import init_logger
 from vidur.metrics import MetricsStore
@@ -82,6 +83,9 @@ class Simulator:
     def _write_output(self) -> None:
         logger.info("Writing output")
 
+        # Log prefix cache summary if enabled
+        self._write_prefix_cache_summary()
+
         self._metric_store.plot()
         logger.info("Metrics written")
 
@@ -103,6 +107,19 @@ class Simulator:
     def _init_event_queue(self) -> None:
         requests = self._request_generator.generate()
 
+        # Assign synthetic token IDs if prefix caching is enabled
+        prefix_cache_config = (
+            self._config.cluster_config.replica_scheduler_config.prefix_cache_config
+        )
+        if prefix_cache_config.enabled:
+            token_generator = PrefixTokenGenerator(prefix_cache_config)
+            token_generator.assign_token_ids(requests)
+            logger.info(
+                f"Assigned synthetic token IDs to {len(requests)} requests "
+                f"({prefix_cache_config.num_shared_prefixes} prefix groups, "
+                f"{prefix_cache_config.shared_prefix_length_fraction:.0%} shared)"
+            )
+
         for request in requests:
             self._add_event(RequestArrivalEvent(request.arrived_at, request))
 
@@ -113,6 +130,32 @@ class Simulator:
                 f"Time limit reached: {self._time_limit}s terminating the simulation."
             )
             self._terminate = True
+
+    def _write_prefix_cache_summary(self) -> None:
+        """Write prefix cache statistics summary if enabled."""
+        for replica_scheduler in self._scheduler.replica_schedulers:
+            cache = replica_scheduler.prefix_cache
+            if cache is None:
+                continue
+            summary = cache.get_state_summary()
+            stats = summary["stats"]
+            logger.info(
+                f"Prefix cache stats (replica {replica_scheduler.replica_id}): "
+                f"hit_rate={stats['hit_rate']:.2%}, "
+                f"token_hit_rate={stats['token_hit_rate']:.2%}, "
+                f"lookups={stats['total_lookups']}, "
+                f"hits={stats['total_hits']}, "
+                f"evictions={stats['total_evictions']}, "
+                f"utilization={summary['utilization']:.2%}"
+            )
+            # Write to file
+            output_path = (
+                f"{self._config.metrics_config.output_dir}"
+                f"/prefix_cache_stats_replica_{replica_scheduler.replica_id}.json"
+            )
+            import json as json_mod
+            with open(output_path, "w") as f:
+                json_mod.dump(summary, f, indent=2)
 
     def _write_event_trace(self) -> None:
         trace_file = f"{self._config.metrics_config.output_dir}/event_trace.json"

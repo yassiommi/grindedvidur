@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import List
+from math import ceil
+from typing import List, Optional
 
 from vidur.config import (
     BaseReplicaSchedulerConfig,
@@ -7,6 +8,7 @@ from vidur.config import (
     ReplicaConfig,
 )
 from vidur.entities import Batch, Replica, Request
+from vidur.entities.prefix_cache_manager import PrefixCacheManager
 from vidur.execution_time_predictor import BaseExecutionTimePredictor
 from vidur.logger import init_logger
 from vidur.scheduler.replica_stage_scheduler import ReplicaStageScheduler
@@ -54,6 +56,23 @@ class BaseReplicaScheduler(ABC):
         self._num_allocated_blocks = 0
         self._allocation_map = {}
 
+        # Initialize prefix cache if enabled
+        self._prefix_cache: Optional[PrefixCacheManager] = None
+        prefix_cache_config = self._config.prefix_cache_config
+        if prefix_cache_config.enabled:
+            prefix_cache_blocks = int(
+                self._config.num_blocks * prefix_cache_config.max_blocks_fraction
+            )
+            self._prefix_cache = PrefixCacheManager(
+                max_blocks=prefix_cache_blocks,
+                block_size=self._config.block_size,
+            )
+            logger.info(
+                f"Prefix cache enabled for replica {self._replica_id}: "
+                f"{prefix_cache_blocks} blocks "
+                f"({prefix_cache_config.max_blocks_fraction:.0%} of {self._config.num_blocks})"
+            )
+
         self._replica_stage_schedulers = {
             stage_id: ReplicaStageScheduler(
                 replica.id,
@@ -96,9 +115,25 @@ class BaseReplicaScheduler(ABC):
         if request.is_prefill_complete:
             return 1
 
-        return request.num_prefill_tokens
+        # Account for prefix cache hits: only prefill uncached tokens
+        remaining_prefill = request.num_prefill_tokens - request.num_processed_tokens
+        return max(1, remaining_prefill)
+
+    @property
+    def prefix_cache(self) -> Optional[PrefixCacheManager]:
+        return self._prefix_cache
 
     def add_request(self, request: Request) -> None:
+        # Perform prefix cache lookup if enabled and request has token IDs
+        if self._prefix_cache is not None and request.token_ids is not None:
+            cached_tokens = self._prefix_cache.match_prefix(request.token_ids)
+            if cached_tokens > 0:
+                request.apply_prefix_cache_hit(cached_tokens)
+                logger.debug(
+                    f"Request {request.id}: prefix cache hit for {cached_tokens} tokens "
+                    f"(prefill reduced from {request.original_prefill_tokens} to "
+                    f"{request.num_prefill_tokens - request.num_processed_tokens})"
+                )
         self._request_queue.append(request)
 
     def get_replica_stage_scheduler(self, stage_id: int):
@@ -125,6 +160,14 @@ class BaseReplicaScheduler(ABC):
 
     def free_batch(self, batch: Batch) -> None:
         self.free(*batch.request_ids)
+
+    def _insert_completed_into_prefix_cache(self, batch: Batch) -> None:
+        """Insert completed requests' token sequences into the prefix cache."""
+        if self._prefix_cache is None:
+            return
+        for request in batch.requests:
+            if request.completed and request.token_ids is not None:
+                self._prefix_cache.on_request_complete(request.token_ids)
 
     @abstractmethod
     def on_batch_end(self, batch: Batch) -> None:

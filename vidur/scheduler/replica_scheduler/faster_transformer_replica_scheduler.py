@@ -14,6 +14,7 @@ class FasterTransformerReplicaScheduler(BaseReplicaScheduler):
 
     def on_batch_end(self, batch: Batch) -> None:
         self._num_running_batches -= 1
+        self._insert_completed_into_prefix_cache(batch)
 
         if batch.all_requests_completed:
             # free memory for all requests at once

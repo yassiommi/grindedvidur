@@ -574,6 +574,7 @@ class MetricsStore:
             ].put(request.id, request.arrived_at - self._last_request_arrived_at)
         self._last_request_arrived_at = request.arrived_at
 
+
     @if_write_metrics
     def _on_request_end(self, time: float, request: Request) -> None:
         if not self._config.store_request_metrics:
@@ -641,6 +642,15 @@ class MetricsStore:
         self._request_metrics_histogram[
             RequestMetricsHistogram.REQUEST_NUM_RESTARTS
         ].put(request.id, request.num_restarts)
+
+        # Record prefix cache metrics if applicable
+        if request.prefix_cache_hit_tokens > 0:
+            self._request_metrics_histogram[
+                RequestMetricsHistogram.REQUEST_PREFIX_CACHE_HIT_TOKENS
+            ].put(request.id, request.prefix_cache_hit_tokens)
+            self._request_metrics_histogram[
+                RequestMetricsHistogram.REQUEST_PREFIX_CACHE_HIT_RATIO
+            ].put(request.id, request.prefix_cache_hit_ratio)
 
     def _update_per_token_execution_times(
         self, time: float, request: Request, batch: Batch
