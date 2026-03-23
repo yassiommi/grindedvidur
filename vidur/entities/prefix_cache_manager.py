@@ -342,27 +342,40 @@ class PrefixCacheManager:
             self._num_cached_blocks + blocks_needed > self._max_blocks
             and self._lru_order
         ):
-            # Pop the oldest (least recently used) entry
-            node_id, node = self._lru_order.popitem(last=False)
+            # Scan for the oldest leaf node, skipping non-leaf (shared prefix) nodes.
+            # Non-leaf nodes are put back; if we exhaust the entire LRU without
+            # finding a leaf, the cache is full of shared prefixes and we must stop.
+            skipped = []
+            evict_node = None
+            evict_id = None
 
-            # Only evict leaf nodes; if not a leaf, skip and re-add at end
-            # (this ensures we only evict nodes that aren't shared prefixes
-            # of active sequences)
-            if not node.is_leaf:
-                self._lru_order[node_id] = node
-                # If we can't evict anything, break to avoid infinite loop
-                # This means the cache is full of shared prefixes
+            while self._lru_order:
+                node_id, node = self._lru_order.popitem(last=False)
+                if node.is_leaf:
+                    evict_node = node
+                    evict_id = node_id
+                    break
+                else:
+                    skipped.append((node_id, node))
+
+            # Put back all skipped non-leaf nodes (preserving their order)
+            for nid, n in skipped:
+                self._lru_order[nid] = n
+                self._lru_order.move_to_end(nid, last=False)
+
+            if evict_node is None:
+                # No evictable leaf found — cache is full of shared prefixes
                 break
 
-            self._num_cached_blocks -= node.num_blocks
+            self._num_cached_blocks -= evict_node.num_blocks
             self._stats.total_evictions += 1
-            self._stats.total_blocks_evicted += node.num_blocks
+            self._stats.total_blocks_evicted += evict_node.num_blocks
 
             # Remove from parent
-            if node.parent is not None:
-                parent = node.parent
+            if evict_node.parent is not None:
+                parent = evict_node.parent
                 keys_to_remove = [
-                    k for k, v in parent.children.items() if v is node
+                    k for k, v in parent.children.items() if v is evict_node
                 ]
                 for k in keys_to_remove:
                     del parent.children[k]
@@ -372,7 +385,7 @@ class PrefixCacheManager:
                     self._merge_with_child(parent)
 
             logger.debug(
-                f"Evicted {node.num_blocks} blocks from prefix cache "
+                f"Evicted {evict_node.num_blocks} blocks from prefix cache "
                 f"(cached: {self._num_cached_blocks}/{self._max_blocks})"
             )
 
