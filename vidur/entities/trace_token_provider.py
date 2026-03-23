@@ -325,14 +325,96 @@ class ShareGPTTokenIdProvider:
         if dataset_path and os.path.exists(dataset_path):
             self._load_pretokenized(dataset_path)
         else:
-            self._conversations = generate_sharegpt_conversations(
-                num_conversations=num_conversations, seed=seed
-            )
+            # Try to load real ShareGPT data; fall back to offline generation
+            loaded = self._try_load_real_sharegpt()
+            if not loaded:
+                logger.info(
+                    "Real ShareGPT unavailable (no network or missing deps). "
+                    "Using offline conversation generator."
+                )
+                self._conversations = generate_sharegpt_conversations(
+                    num_conversations=num_conversations, seed=seed
+                )
 
         logger.info(
             f"ShareGPTTokenIdProvider: {len(self._conversations)} conversations, "
             f"multi_turn={multi_turn}, interleave={interleave_conversations}"
         )
+
+    def _try_load_real_sharegpt(self) -> bool:
+        """Try to download and tokenize real ShareGPT conversations.
+
+        Downloads the ShareGPT_Vicuna_unfiltered dataset from HuggingFace,
+        tokenizes with tiktoken (cl100k_base), and caches the result locally.
+        Returns True if successful, False if network or dependencies unavailable.
+        """
+        cache_dir = _CACHE_DIR
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_file = cache_dir / "sharegpt_tokenized.json"
+
+        # Use cached tokenized version if available
+        if cached_file.exists():
+            logger.info(f"Loading cached real ShareGPT data: {cached_file}")
+            self._load_pretokenized(str(cached_file))
+            return bool(self._conversations)
+
+        # Try to download and tokenize
+        try:
+            import tiktoken
+            from datasets import load_dataset
+        except ImportError:
+            logger.debug("tiktoken or datasets not installed")
+            return False
+
+        try:
+            logger.info("Downloading ShareGPT dataset from HuggingFace...")
+            ds = load_dataset(
+                "anon8231489123/ShareGPT_Vicuna_unfiltered",
+                data_files="ShareGPT_V3_unfiltered_cleaned_split.json",
+                split="train",
+            )
+        except Exception as e:
+            logger.debug(f"Failed to download ShareGPT: {e}")
+            return False
+
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logger.debug(f"Failed to load tiktoken encoding: {e}")
+            return False
+
+        logger.info(f"Tokenizing {len(ds)} ShareGPT conversations...")
+        all_convs = []
+        for row in ds:
+            turns_raw = row.get("conversations", [])
+            if not turns_raw or len(turns_raw) < 2:
+                continue
+
+            cumulative_tokens: List[int] = []
+            turns: List[List[int]] = []
+            for turn in turns_raw:
+                text = turn.get("value", "")
+                if not text:
+                    continue
+                turn_tokens = enc.encode(text)
+                cumulative_tokens.extend(turn_tokens)
+                turns.append(list(cumulative_tokens))
+
+            if turns:
+                all_convs.append(turns)
+
+        # Cache to disk
+        with open(cached_file, "w") as f:
+            json.dump(all_convs, f)
+        logger.info(
+            f"Tokenized and cached {len(all_convs)} conversations to {cached_file}"
+        )
+
+        # Load into self
+        for conv in all_convs:
+            self._conversations.append([tuple(t) for t in conv])
+        self._rng.shuffle(self._conversations)
+        return True
 
     def _load_pretokenized(self, path: str) -> None:
         """Load pre-tokenized conversations from JSON.
