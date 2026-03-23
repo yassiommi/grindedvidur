@@ -8,11 +8,13 @@ This is a pure simulation — no GPU profiling or execution time prediction.
 """
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from typing import List, Dict, Any
 
-sys.path.insert(0, ".")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
 from vidur.config.config import PrefixCacheConfig
 from vidur.entities.prefix_cache_manager import PrefixCacheManager
@@ -291,9 +293,11 @@ def main():
             "cache_utilization": r.cache_utilization,
         })
 
-    with open("experiment_kv_cache_results.json", "w") as f:
+    results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "experiment_kv_cache_results.json")
+    with open(results_path, "w") as f:
         json.dump(output, f, indent=2)
-    print(f"\n  Raw results saved to experiment_kv_cache_results.json")
+    print(f"\n  Raw results saved to {results_path}")
 
 
 if __name__ == "__main__":

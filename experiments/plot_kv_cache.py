@@ -9,11 +9,15 @@ then produces plots showing:
 """
 
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-sys.path.insert(0, ".")
+# Allow running from experiments/ or repo root
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+PLOT_DIR = os.path.join(REPO_ROOT, "report_figures", "kv_cache")
 
 import matplotlib
 matplotlib.use("Agg")
@@ -155,7 +159,7 @@ def plot_all(all_traces: dict):
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig("plot_hit_rate_over_time.png", dpi=150)
+    fig.savefig(os.path.join(PLOT_DIR, "plot_hit_rate_over_time.png"), dpi=150)
     plt.close(fig)
     print("  Saved plot_hit_rate_over_time.png")
 
@@ -197,7 +201,7 @@ def plot_all(all_traces: dict):
 
     axes[-1].set_xlabel("Request Index")
     fig.tight_layout()
-    fig.savefig("plot_io_pattern.png", dpi=150)
+    fig.savefig(os.path.join(PLOT_DIR, "plot_io_pattern.png"), dpi=150)
     plt.close(fig)
     print("  Saved plot_io_pattern.png")
 
@@ -220,7 +224,7 @@ def plot_all(all_traces: dict):
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig("plot_cache_utilization.png", dpi=150)
+    fig.savefig(os.path.join(PLOT_DIR, "plot_cache_utilization.png"), dpi=150)
     plt.close(fig)
     print("  Saved plot_cache_utilization.png")
 
@@ -256,7 +260,7 @@ def plot_all(all_traces: dict):
 
     axes[-1].set_xlabel("Request Index")
     fig.tight_layout()
-    fig.savefig("plot_rw_volume.png", dpi=150)
+    fig.savefig(os.path.join(PLOT_DIR, "plot_rw_volume.png"), dpi=150)
     plt.close(fig)
     print("  Saved plot_rw_volume.png")
 
@@ -299,7 +303,7 @@ def plot_all(all_traces: dict):
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig("plot_windowed_hit_rate.png", dpi=150)
+    fig.savefig(os.path.join(PLOT_DIR, "plot_windowed_hit_rate.png"), dpi=150)
     plt.close(fig)
     print("  Saved plot_windowed_hit_rate.png")
 
@@ -389,6 +393,7 @@ def print_io_characterization(all_traces: dict):
 
 
 def main():
+    os.makedirs(PLOT_DIR, exist_ok=True)
     print("=" * 70)
     print("  KV CACHE HIT RATE & I/O PATTERN ANALYSIS")
     print("=" * 70)
