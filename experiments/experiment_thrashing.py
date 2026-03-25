@@ -57,7 +57,13 @@ STEP_TOOL_RESULT_TOKENS = 110   # tool output (can be large: API responses, code
 TOKENS_PER_STEP = STEP_THOUGHT_TOKENS + STEP_TOOL_CALL_TOKENS + STEP_TOOL_RESULT_TOKENS
 
 STEPS_PER_SESSION = 12           # typical agentic loop: 8-15 steps
-NUM_SESSIONS = 40                # total agent sessions to simulate
+NUM_SESSIONS = 60                # total agent sessions to simulate
+
+# Lifecycle phases: how many sessions to use for each phase
+# Ramp-up:  sessions arrive one at a time until pool is full
+# Sustained: completed sessions are replaced (pool stays full)
+# Drain:    no replacements, pool empties as sessions complete
+SUSTAINED_REPLACEMENTS = 30      # how many replacement sessions during sustained phase
 
 # Cache sizes to sweep (in blocks)
 # A single session at max length ≈ (200 + 100 + 12*200) / 16 ≈ 169 blocks
@@ -110,22 +116,28 @@ def generate_agentic_requests(
     num_sessions: int,
     steps_per_session: int,
     concurrent_sessions: int,
+    sustained_replacements: int = SUSTAINED_REPLACEMENTS,
     seed: int = SEED,
-    stagger: bool = True,
 ) -> List[Tuple[Request, Tuple[int, ...]]]:
-    """Generate requests modeling interleaved agentic inference.
+    """Generate requests modeling a three-phase agentic inference lifecycle.
 
     Returns a list of (Request, token_ids) pairs in arrival order.
 
-    If stagger=True (default), initial sessions start at different steps
-    to model a system that has been running for a while. This avoids the
-    unrealistic synchronized-generation artifact where all N sessions
-    start and end together, creating repeating sawtooth patterns instead
-    of sustained thrashing.
+    The three phases model a realistic production traffic pattern:
 
-    When a session completes, a new one immediately takes its slot at
-    step 0, so the pool stays full and sessions are always at mixed
-    stages of their lifecycle.
+    1. RAMP-UP: Sessions arrive one every few ticks until the pool reaches
+       N concurrent. The cache warms up gradually — hit rate rises as each
+       new session benefits from the shared system prompt already cached
+       by earlier sessions.
+
+    2. SUSTAINED LOAD: The pool stays full at N concurrent sessions.
+       Completed sessions are immediately replaced. If the working set
+       exceeds cache capacity, this phase is sustained thrashing — the
+       system never recovers because new sessions keep entering.
+
+    3. DRAIN: No more replacement sessions. Active sessions complete one
+       by one. Cache pressure drops, evictions slow, hit rate recovers.
+       The cache "cools down" as the working set shrinks below capacity.
     """
     rng = random.Random(seed)
     system_tokens = _make_system_prompt_tokens()
@@ -144,10 +156,10 @@ def generate_agentic_requests(
 
         session_contexts[sid] = steps
 
-    # Interleave sessions: maintain a pool of active sessions
     requests: List[Tuple[Request, Tuple[int, ...]]] = []
     active: List[Tuple[int, int]] = []  # (session_id, current_step)
     next_session_id = 0
+    replacements_remaining = sustained_replacements
     time_tick = 0.0
 
     def _take_session() -> Optional[int]:
@@ -158,29 +170,53 @@ def generate_agentic_requests(
             return sid
         return None
 
-    # Initial fill: stagger starting steps so sessions are at different
-    # points in their lifecycle (models a system already under load)
-    for slot in range(concurrent_sessions):
-        sid = _take_session()
-        if sid is None:
-            break
-        if stagger:
-            # Spread initial sessions evenly across their lifecycle
-            initial_step = (slot * steps_per_session) // concurrent_sessions
-        else:
-            initial_step = 0
-        active.append((sid, initial_step))
+    # ── Phase 1: RAMP-UP ─────────────────────────────────────────────────
+    # Add one session every 2 ticks until pool is full.
+    # Each session starts at step 0 (cold start).
+    ramp_tick_interval = 2  # ticks between new session arrivals
+    ticks_since_last_arrival = ramp_tick_interval  # trigger first arrival immediately
 
-    while active:
-        # Each tick: advance one step in each active session
+    while len(active) < concurrent_sessions:
+        # Check if it's time to add a new session
+        if ticks_since_last_arrival >= ramp_tick_interval:
+            sid = _take_session()
+            if sid is None:
+                break
+            active.append((sid, 0))
+            ticks_since_last_arrival = 0
+
+        # Advance all active sessions one step
         next_active = []
         for sid, step in active:
             token_ids = session_contexts[sid][step]
-            num_prefill = len(token_ids)
-
             req = Request(
                 arrived_at=time_tick,
-                num_prefill_tokens=num_prefill,
+                num_prefill_tokens=len(token_ids),
+                num_decode_tokens=DECODE_TOKENS,
+            )
+            requests.append((req, token_ids))
+            time_tick += 0.05
+
+            next_step = step + 1
+            if next_step <= steps_per_session:
+                next_active.append((sid, next_step))
+            # During ramp-up, completed sessions are not replaced
+            # (pool is still growing from new arrivals)
+
+        active = next_active
+        time_tick += 0.5
+        ticks_since_last_arrival += 1
+
+    # ── Phase 2: SUSTAINED LOAD ──────────────────────────────────────────
+    # Pool is full. Completed sessions are immediately replaced.
+    # This continues until we exhaust the replacement budget.
+    while active and replacements_remaining >= 0:
+        next_active = []
+        for sid, step in active:
+            token_ids = session_contexts[sid][step]
+            req = Request(
+                arrived_at=time_tick,
+                num_prefill_tokens=len(token_ids),
                 num_decode_tokens=DECODE_TOKENS,
             )
             requests.append((req, token_ids))
@@ -190,10 +226,37 @@ def generate_agentic_requests(
             if next_step <= steps_per_session:
                 next_active.append((sid, next_step))
             else:
-                # Session done — immediately replace with a new one at step 0
-                new_sid = _take_session()
-                if new_sid is not None:
-                    next_active.append((new_sid, 0))
+                # Replace completed session
+                if replacements_remaining > 0:
+                    new_sid = _take_session()
+                    if new_sid is not None:
+                        next_active.append((new_sid, 0))
+                        replacements_remaining -= 1
+                    else:
+                        replacements_remaining = -1  # no more sessions available
+                else:
+                    replacements_remaining = -1  # budget exhausted
+
+        active = next_active
+        time_tick += 0.5
+
+    # ── Phase 3: DRAIN ───────────────────────────────────────────────────
+    # No replacements. Sessions complete and leave. Pool shrinks to zero.
+    while active:
+        next_active = []
+        for sid, step in active:
+            token_ids = session_contexts[sid][step]
+            req = Request(
+                arrived_at=time_tick,
+                num_prefill_tokens=len(token_ids),
+                num_decode_tokens=DECODE_TOKENS,
+            )
+            requests.append((req, token_ids))
+            time_tick += 0.05
+
+            next_step = step + 1
+            if next_step <= steps_per_session:
+                next_active.append((sid, next_step))
 
         active = next_active
         time_tick += 0.5
@@ -233,23 +296,24 @@ def simulate_thrashing(
     cache_max_blocks: int,
     num_sessions: int = NUM_SESSIONS,
     steps_per_session: int = STEPS_PER_SESSION,
-    stagger: bool = True,
+    sustained_replacements: int = SUSTAINED_REPLACEMENTS,
 ) -> List[StepTrace]:
     """Run a single thrashing simulation."""
     requests = generate_agentic_requests(
         num_sessions=num_sessions,
         steps_per_session=steps_per_session,
         concurrent_sessions=concurrent_sessions,
+        sustained_replacements=sustained_replacements,
         seed=SEED,
-        stagger=stagger,
     )
 
     cache = PrefixCacheManager(max_blocks=cache_max_blocks, block_size=BLOCK_SIZE)
     traces = []
 
-    # Re-derive session assignments by replaying the interleaving logic
+    # Re-derive session assignments by replaying the three-phase logic
     active2: List[Tuple[int, int]] = []
     next2 = 0
+    repl_remaining = sustained_replacements
 
     def _take2() -> Optional[int]:
         nonlocal next2
@@ -259,27 +323,52 @@ def simulate_thrashing(
             return sid
         return None
 
-    for slot in range(concurrent_sessions):
-        sid = _take2()
-        if sid is None:
-            break
-        if stagger:
-            initial_step = (slot * steps_per_session) // concurrent_sessions
-        else:
-            initial_step = 0
-        active2.append((sid, initial_step))
+    assignment_list: List[Tuple[int, int]] = []
 
-    assignment_list = []
-    while active2:
+    # Phase 1: ramp-up
+    ramp_tick = 2
+    ticks_since = ramp_tick
+    while len(active2) < concurrent_sessions:
+        if ticks_since >= ramp_tick:
+            sid = _take2()
+            if sid is None:
+                break
+            active2.append((sid, 0))
+            ticks_since = 0
+        next_active2 = []
+        for sid, step in active2:
+            assignment_list.append((sid, step))
+            if step + 1 <= steps_per_session:
+                next_active2.append((sid, step + 1))
+        active2 = next_active2
+        ticks_since += 1
+
+    # Phase 2: sustained
+    while active2 and repl_remaining >= 0:
         next_active2 = []
         for sid, step in active2:
             assignment_list.append((sid, step))
             if step + 1 <= steps_per_session:
                 next_active2.append((sid, step + 1))
             else:
-                new_sid = _take2()
-                if new_sid is not None:
-                    next_active2.append((new_sid, 0))
+                if repl_remaining > 0:
+                    new_sid = _take2()
+                    if new_sid is not None:
+                        next_active2.append((new_sid, 0))
+                        repl_remaining -= 1
+                    else:
+                        repl_remaining = -1
+                else:
+                    repl_remaining = -1
+        active2 = next_active2
+
+    # Phase 3: drain
+    while active2:
+        next_active2 = []
+        for sid, step in active2:
+            assignment_list.append((sid, step))
+            if step + 1 <= steps_per_session:
+                next_active2.append((sid, step + 1))
         active2 = next_active2
 
     for i, ((req, token_ids), (sid, step)) in enumerate(zip(requests, assignment_list)):

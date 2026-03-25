@@ -35,60 +35,66 @@ The key insight is that **cache utilization stays high (~85-98%) while hit rate 
 | Tokens per step | ~200 (thought: 60, tool call: 30, tool result: ~110) | Models typical tool-use output |
 | Steps per session | 12 | Realistic agentic loop |
 | Max context at completion | 2700 tokens = 169 blocks | Upper bound per session |
-| Total sessions | 40 | Enough to observe sustained thrashing |
+| Total sessions | 60 | Enough to observe all three phases |
 | Block size | 16 tokens | |
 
-### Staggered Arrival Model
+### Three-Phase Lifecycle Model
 
-Sessions are **staggered**: the initial N concurrent sessions start at different points in their lifecycle (evenly spread across steps 0..12), modeling a system that has been running under load. When a session completes, a new one immediately takes its slot at step 0. This keeps the pool permanently full with sessions at mixed stages — no synchronized generations, no artificial recovery gaps.
+The simulation models a realistic production traffic pattern with three distinct phases:
 
-This is more realistic than batch-synchronized arrivals, which produce a repeating sawtooth pattern as entire generations start and finish together. In production, sessions arrive and depart continuously.
+**Phase 1 — Ramp-Up:** Sessions arrive one at a time (one every 2 ticks) until the pool reaches N concurrent sessions. Each session starts at step 0 (cold start). The cache warms up gradually — hit rate rises as each new session benefits from the shared system prompt already cached by earlier sessions. Cache pressure builds steadily.
+
+**Phase 2 — Sustained Load:** The pool stays full at N concurrent sessions. When a session completes, it is immediately replaced by a new session at step 0. This is controlled by a `sustained_replacements` budget (default: 30). If the working set exceeds cache capacity, this phase is sustained thrashing — the system never recovers because new sessions keep entering and maintaining pressure. Sessions at different lifecycle stages create a mixed working set that persists for the entire phase.
+
+**Phase 3 — Drain:** No more replacement sessions arrive. Active sessions complete one by one. Cache pressure drops as the working set shrinks. Evictions slow, and hit rate may recover as the remaining sessions fit within cache capacity. The cache "cools down" as the pool empties.
+
+This three-phase model is more realistic than either batch-synchronized arrivals (which produce repeating sawtooth patterns) or purely staggered arrivals (which skip warmup). In production, services ramp up, run under sustained load, and eventually drain during scale-down or deployment.
 
 ### Sweep Parameters
 
 - **Concurrent sessions:** 2, 4, 6, 8, 12
 - **Cache sizes:** 200, 400, 600, 800, 1200 blocks
 
-The critical ratio is **working set / cache capacity**. A single session at max length requires 169 blocks, so 8 concurrent sessions need ~1352 blocks. When the cache holds fewer blocks than the working set demands, thrashing begins — and with staggered arrivals, it persists for the entire simulation.
+The critical ratio is **working set / cache capacity**. A single session at max length requires 169 blocks, so 8 concurrent sessions need ~1352 blocks. When the cache holds fewer blocks than the working set demands, thrashing begins — and with sustained replacement of completed sessions, it persists for the entire sustained-load phase.
 
 ---
 
 ## 3. Results
 
-### 3.1 Sustained Thrashing
+### 3.1 Sustained Thrashing (Phase 2)
 
-With staggered arrivals, overcommitted configurations enter thrashing immediately and **never recover**. The 12-concurrent / 400-block case (5.1× overcommit) thrashes for all 454 requests:
+During the sustained-load phase, overcommitted configurations thrash continuously with no recovery. The 12-concurrent / 400-block case (5.1x overcommit) shows the pattern clearly:
 
 ![Severe Thrashing](../report_figures/kv_cache/thrashing_severe.png)
 
-| Config | Phase | Requests | Token Hit Rate | Cache Util | Evictions/req |
-|--------|-------|:---:|:---:|:---:|:---:|
-| 12 conc, 400 blk | **Thrashing** | 0–453 | **18.4%** | **83%** | 83.5 |
-| 8 conc, 400 blk | **Thrashing** | 0–479 | **19.0%** | **85%** | 81.7 |
-| 6 conc, 400 blk | **Thrashing** | 0–489 | **25.5%** | **87%** | 74.6 |
-| 12 conc, 800 blk | **Thrashing** | 0–453 | **24.0%** | **93%** | 75.8 |
+| Config | Phase | Token Hit Rate | Cache Util | Evictions/req |
+|--------|-------|:---:|:---:|:---:|
+| 12 conc, 400 blk | Sustained thrashing | **~18%** | **~83%** | ~84 |
+| 8 conc, 400 blk | Sustained thrashing | **~19%** | **~85%** | ~82 |
+| 6 conc, 400 blk | Sustained thrashing | **~26%** | **~87%** | ~75 |
+| 12 conc, 800 blk | Sustained thrashing | **~24%** | **~93%** | ~76 |
 
-In every case: high utilization, high eviction rate, low hit rate — the full simulation is one sustained thrashing phase with no recovery.
+In every case: high utilization, high eviction rate, low hit rate. The warmup phase is visible at the start (hit rate initially higher as sessions are still loading), followed by sustained thrashing that persists until the drain phase.
 
 ### 3.2 No Thrashing (Working Set Fits)
 
-When the working set fits in the cache, the pattern is completely different:
+When the working set fits in the cache, the three-phase pattern shows healthy behavior throughout:
 
 ![No Thrashing](../report_figures/kv_cache/thrashing_none.png)
 
 | Config | Token Hit Rate | Cache Util | Evictions/req |
 |--------|:---:|:---:|:---:|
-| 2 conc, 400 blk | 80.4% | 96% | 11.3 |
-| 2 conc, 800 blk | 80.4% | 94% | 10.6 |
-| 4 conc, 800 blk | 80.3% | 95% | 10.8 |
+| 2 conc, 400 blk | ~80% | ~96% | ~11 |
+| 2 conc, 800 blk | ~80% | ~94% | ~11 |
+| 4 conc, 800 blk | ~80% | ~95% | ~11 |
 
-Hit rate is stable at ~80%, evictions are low and steady (just LRU turnover of completed sessions), and there are no phase transitions.
+Hit rate is stable at ~80% across all three phases, evictions are low and steady (just LRU turnover of completed sessions), and there are no phase transitions in cache behavior.
 
 ### 3.3 Thrashing Boundary Heatmap
 
 ![Thrashing Heatmap](../report_figures/kv_cache/thrashing_heatmap.png)
 
-The heatmap maps mid-phase token hit rate across all (concurrent sessions × cache size) configurations. The boundary is sharp and binary: configurations where the working set fits achieve ~80% hit rate, those that don't drop to 17-25%.
+The heatmap maps mid-phase token hit rate across all (concurrent sessions x cache size) configurations. The boundary is sharp and binary: configurations where the working set fits achieve ~80% hit rate, those that don't drop to 17-25%.
 
 | Concurrent Sessions | Working Set (blocks) | Min Cache to Avoid Thrashing |
 |:---:|:---:|:---:|
@@ -104,18 +110,20 @@ The heatmap maps mid-phase token hit rate across all (concurrent sessions × cac
 
 At a fixed 600-block cache:
 - **2-4 concurrent:** Stable 80%+ hit rate — working set fits comfortably
-- **8 concurrent:** Sustained thrashing at ~20-30%, with brief spikes when a session that just completed frees space before a new one fills it
-- **12 concurrent:** Pinned at ~15-20% for the entire run — sustained, unrecoverable thrashing
+- **8 concurrent:** Sustained thrashing at ~20-30%, with brief spikes when sessions complete during the drain phase
+- **12 concurrent:** Pinned at ~15-20% for the entire sustained-load phase — unrecoverable thrashing until drain
 
 The bottom panel shows **near-100% cache utilization across all configurations** — confirming that utilization is completely uninformative about whether the cache is actually helping.
 
 ### 3.5 The Detailed View
 
-The 6-concurrent / 600-block case (1.7× overcommit) shows the borderline behavior:
+The 6-concurrent / 600-block case (1.7x overcommit) shows the borderline behavior with all three phases visible:
 
 ![Thrashing Detail](../report_figures/kv_cache/thrashing_detail.png)
 
-After a brief warmup (staggered sessions loading their initial contexts), the system reaches steady state. With staggered arrivals, the working set varies continuously as sessions at different stages cycle through, creating persistent mild pressure rather than periodic crises.
+- **Warmup (early requests):** Sessions arrive one by one. Cache fills gradually. Hit rate starts high as early sessions benefit from the shared system prompt.
+- **Sustained load (middle):** Pool is full with sessions at different lifecycle stages. Working set exceeds capacity. Hit rate drops and stays low as sessions continuously evict each other's blocks.
+- **Drain (late requests):** No replacements. As sessions complete and leave, the working set shrinks below capacity. Evictions slow and hit rate may recover for the final sessions.
 
 ---
 
@@ -123,15 +131,20 @@ After a brief warmup (staggered sessions loading their initial contexts), the sy
 
 ### Finding 1: Cache utilization masks thrashing
 
-During severe thrashing (12 concurrent, 400 blocks), cache utilization is **83%** while token hit rate is **18%**. A monitoring system that only tracks utilization would report the cache as healthy. The diagnostic triad is: **high utilization + high eviction rate + low hit rate = thrashing**.
+During severe thrashing (12 concurrent, 400 blocks), cache utilization is **~83%** while token hit rate is **~18%**. A monitoring system that only tracks utilization would report the cache as healthy. The diagnostic triad is: **high utilization + high eviction rate + low hit rate = thrashing**.
 
 ### Finding 2: The thrashing boundary is a cliff, not a slope
 
 There is no graceful degradation. Hit rate is either ~80% (working set fits) or ~20% (it doesn't). The transition is nearly binary — a 30% increase in concurrent sessions can cause a 60-point drop in hit rate. This is because LRU eviction under round-robin access is adversarial: the least-recently-used entry is always the one that will be needed next.
 
-### Finding 3: Staggered arrivals make thrashing worse, not better
+### Finding 3: The three-phase lifecycle makes thrashing visible
 
-With synchronized generations, thrashing is periodic — sessions start together, thrash during the middle steps, then all complete and the cache recovers before the next batch. With realistic staggered arrivals, there is **no recovery window**. The pool is always full of sessions at different stages, so the working set never drops below the thrashing threshold. The system enters thrashing and stays there permanently.
+The warmup-sustained-drain lifecycle creates a clear narrative:
+- **Warmup** establishes the baseline — high hit rates as sessions load and the cache fills.
+- **Sustained load** reveals the steady-state behavior — if the working set exceeds capacity, thrashing persists indefinitely because completed sessions are immediately replaced.
+- **Drain** shows recovery potential — as sessions leave without replacement, the working set shrinks and hit rate can recover.
+
+This is more realistic than purely staggered arrivals (which skip warmup) or synchronized batches (which produce artificial sawtooth recovery patterns).
 
 ### Finding 4: Agentic workloads are uniquely vulnerable
 
@@ -156,7 +169,7 @@ This combination creates the worst case for LRU caching: every entry is needed e
 | **Context compression** | Reduce per-step token growth | Lossy; may degrade agent accuracy |
 | **Priority scheduling** | Complete one session before starting the next | Eliminates inter-session thrashing but serializes execution |
 
-The most actionable finding: for agentic workloads, **cache capacity should be provisioned as `N × max_context_length / block_size`** where N is the target concurrent session count. Under-provisioning by even 30% triggers sharp, sustained performance degradation with no self-recovery.
+The most actionable finding: for agentic workloads, **cache capacity should be provisioned as `N x max_context_length / block_size`** where N is the target concurrent session count. Under-provisioning by even 30% triggers sharp, sustained performance degradation with no self-recovery.
 
 ---
 
