@@ -111,14 +111,21 @@ def generate_agentic_requests(
     steps_per_session: int,
     concurrent_sessions: int,
     seed: int = SEED,
+    stagger: bool = True,
 ) -> List[Tuple[Request, Tuple[int, ...]]]:
     """Generate requests modeling interleaved agentic inference.
 
     Returns a list of (Request, token_ids) pairs in arrival order.
-    Concurrent sessions are interleaved round-robin: each "tick" advances
-    one step in each active session, modeling parallel agent execution.
 
-    When a session completes, a new one starts in its slot (if any remain).
+    If stagger=True (default), initial sessions start at different steps
+    to model a system that has been running for a while. This avoids the
+    unrealistic synchronized-generation artifact where all N sessions
+    start and end together, creating repeating sawtooth patterns instead
+    of sustained thrashing.
+
+    When a session completes, a new one immediately takes its slot at
+    step 0, so the pool stays full and sessions are always at mixed
+    stages of their lifecycle.
     """
     rng = random.Random(seed)
     system_tokens = _make_system_prompt_tokens()
@@ -143,16 +150,29 @@ def generate_agentic_requests(
     next_session_id = 0
     time_tick = 0.0
 
-    def _fill_active():
+    def _take_session() -> Optional[int]:
         nonlocal next_session_id
-        while len(active) < concurrent_sessions and next_session_id < num_sessions:
-            active.append((next_session_id, 0))
+        if next_session_id < num_sessions:
+            sid = next_session_id
             next_session_id += 1
+            return sid
+        return None
 
-    _fill_active()
+    # Initial fill: stagger starting steps so sessions are at different
+    # points in their lifecycle (models a system already under load)
+    for slot in range(concurrent_sessions):
+        sid = _take_session()
+        if sid is None:
+            break
+        if stagger:
+            # Spread initial sessions evenly across their lifecycle
+            initial_step = (slot * steps_per_session) // concurrent_sessions
+        else:
+            initial_step = 0
+        active.append((sid, initial_step))
 
     while active:
-        # Each tick: advance one step in each active session (round-robin)
+        # Each tick: advance one step in each active session
         next_active = []
         for sid, step in active:
             token_ids = session_contexts[sid][step]
@@ -164,16 +184,19 @@ def generate_agentic_requests(
                 num_decode_tokens=DECODE_TOKENS,
             )
             requests.append((req, token_ids))
-            time_tick += 0.05  # small time gap between requests in same tick
+            time_tick += 0.05
 
             next_step = step + 1
             if next_step <= steps_per_session:
                 next_active.append((sid, next_step))
-            # else: session is done, slot opens up
+            else:
+                # Session done — immediately replace with a new one at step 0
+                new_sid = _take_session()
+                if new_sid is not None:
+                    next_active.append((new_sid, 0))
 
         active = next_active
-        _fill_active()
-        time_tick += 0.5  # gap between ticks (models tool execution time)
+        time_tick += 0.5
 
     return requests
 
@@ -210,6 +233,7 @@ def simulate_thrashing(
     cache_max_blocks: int,
     num_sessions: int = NUM_SESSIONS,
     steps_per_session: int = STEPS_PER_SESSION,
+    stagger: bool = True,
 ) -> List[StepTrace]:
     """Run a single thrashing simulation."""
     requests = generate_agentic_requests(
@@ -217,33 +241,34 @@ def simulate_thrashing(
         steps_per_session=steps_per_session,
         concurrent_sessions=concurrent_sessions,
         seed=SEED,
+        stagger=stagger,
     )
 
     cache = PrefixCacheManager(max_blocks=cache_max_blocks, block_size=BLOCK_SIZE)
     traces = []
 
-    # Track which session each request belongs to
-    session_step_counter: Dict[int, int] = {}
-    session_assignment: List[Tuple[int, int]] = []  # (session_id, step_within)
-
-    # Reconstruct session/step from arrival order
-    active_slots: List[Optional[int]] = [None] * concurrent_sessions
-    next_sid = 0
-    slot_steps: Dict[int, int] = {}  # slot -> current step
-    req_idx = 0
-
     # Re-derive session assignments by replaying the interleaving logic
-    rng = random.Random(SEED)
     active2: List[Tuple[int, int]] = []
     next2 = 0
 
-    def _fill2():
+    def _take2() -> Optional[int]:
         nonlocal next2
-        while len(active2) < concurrent_sessions and next2 < num_sessions:
-            active2.append((next2, 0))
+        if next2 < num_sessions:
+            sid = next2
             next2 += 1
+            return sid
+        return None
 
-    _fill2()
+    for slot in range(concurrent_sessions):
+        sid = _take2()
+        if sid is None:
+            break
+        if stagger:
+            initial_step = (slot * steps_per_session) // concurrent_sessions
+        else:
+            initial_step = 0
+        active2.append((sid, initial_step))
+
     assignment_list = []
     while active2:
         next_active2 = []
@@ -251,8 +276,11 @@ def simulate_thrashing(
             assignment_list.append((sid, step))
             if step + 1 <= steps_per_session:
                 next_active2.append((sid, step + 1))
+            else:
+                new_sid = _take2()
+                if new_sid is not None:
+                    next_active2.append((new_sid, 0))
         active2 = next_active2
-        _fill2()
 
     for i, ((req, token_ids), (sid, step)) in enumerate(zip(requests, assignment_list)):
         evictions_before = cache.stats.total_evictions
@@ -271,9 +299,15 @@ def simulate_thrashing(
         stats = cache.stats
         hit_frac = cached_tokens / len(token_ids) if token_ids else 0.0
 
-        # Estimate working set: concurrent_sessions * avg context size at this point
-        avg_context = SYSTEM_PROMPT_TOKENS + TASK_PROMPT_TOKENS + step * TOKENS_PER_STEP
-        ws_blocks = concurrent_sessions * math.ceil(avg_context / BLOCK_SIZE)
+        # Estimate working set from actual active sessions at this point
+        # Look at nearby requests (same tick) to get all active session states
+        tick_start = max(0, i - (i % concurrent_sessions))
+        tick_end = min(len(assignment_list), tick_start + concurrent_sessions)
+        ws_blocks = 0
+        for j in range(tick_start, tick_end):
+            _, s = assignment_list[j]
+            ctx = SYSTEM_PROMPT_TOKENS + TASK_PROMPT_TOKENS + s * TOKENS_PER_STEP
+            ws_blocks += math.ceil(ctx / BLOCK_SIZE)
 
         traces.append(StepTrace(
             request_idx=i,
@@ -554,12 +588,12 @@ def main():
 
     # ── 1. Detailed single-config analysis ───────────────────────────────
     print(f"\n{'─'*70}")
-    print("  DETAILED ANALYSIS: 6 concurrent, 600-block cache")
+    print("  DETAILED ANALYSIS: 6 concurrent, 600-block cache (staggered)")
     print(f"{'─'*70}")
 
     traces_detail = simulate_thrashing(concurrent_sessions=6, cache_max_blocks=600)
     plot_thrashing_phases(traces_detail,
-                         label="6 concurrent sessions, 600-block cache",
+                         label="6 concurrent, 600 blocks (staggered arrivals)",
                          filename="thrashing_detail.png")
     print_thrashing_analysis(traces_detail, "6 concurrent, 600 blocks")
 
@@ -584,12 +618,12 @@ def main():
     # Detailed plots for extreme cases
     plot_thrashing_phases(
         all_results[(12, 400)],
-        label="12 concurrent, 400-block cache (severe thrashing)",
+        label="12 concurrent, 400 blocks (severe thrashing)",
         filename="thrashing_severe.png")
 
     plot_thrashing_phases(
         all_results[(2, 1200)],
-        label="2 concurrent, 1200-block cache (no thrashing)",
+        label="2 concurrent, 1200 blocks (no thrashing)",
         filename="thrashing_none.png")
 
     # ── 4. Full characterization ─────────────────────────────────────────
