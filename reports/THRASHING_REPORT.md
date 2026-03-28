@@ -173,10 +173,176 @@ The most actionable finding: for agentic workloads, **cache capacity should be p
 
 ---
 
-## 6. Reproducing
+## 6. Heterogeneous Agent Types
+
+Real deployments don't run identical agents. A production inference server might simultaneously host quick lookup agents (3-4 tool calls), standard reasoning agents (10-12 steps), and deep-research agents (20+ steps with large tool outputs). When these agent types share the same KV cache, their working sets differ in size, growth rate, and lifetime — changing the thrashing dynamics in ways that homogeneous experiments cannot capture.
+
+### 6.1 Agent Archetypes
+
+We define four canonical agent types that model the spectrum of production agentic workloads:
+
+| Archetype | Steps | Tokens/step (mean) | CV | Max context | Max blocks |
+|-----------|:-----:|:---:|:---:|:---:|:---:|
+| **short** — quick lookup (API call, RAG retrieval) | 4 | 80 | 0.2 | 620 | 39 |
+| **medium** — standard reasoning (code gen, analysis) | 12 | 200 | 0.3 | 2700 | 169 |
+| **long** — deep research (multi-tool chains, iterative code) | 24 | 300 | 0.35 | 7500 | 469 |
+| **high_var** — unpredictable outputs (web search, code exec) | 10 | 200 | 0.9 | 2300 | 144 |
+
+The coefficient of variation (CV) controls per-step token variance — a `high_var` agent's tool result might return 50 tokens (short API response) or 500 tokens (full web page), modelling the bursty insertion patterns of real tool use.
+
+Each agent type has its own system prompt (different agent roles), so there is **intra-type prefix sharing but no cross-type sharing**. This is realistic: a coding agent and a search agent have different base contexts.
+
+### 6.2 Simulation Model
+
+The heterogeneous simulation uses a **cold-start pool** model: all `concurrent_sessions` agents begin simultaneously at step 0. As sessions complete, they are replaced from a pool of 120 total sessions (50 replacements during the sustained phase). Agent types are assigned to sessions according to configurable mix fractions.
+
+Six mix configurations are swept across five cache sizes (200, 400, 600, 800, 1200 blocks) with 8 concurrent sessions:
+
+| Mix name | Composition |
+|----------|-------------|
+| `all_short` | 100% short |
+| `all_medium` | 100% medium |
+| `all_long` | 100% long |
+| `short+long` | 50% short + 50% long |
+| `high_var` | 100% high-variance |
+| `mixed_3way` | ⅓ short + ⅓ medium + ⅓ long |
+
+### 6.3 Results: Agent Mix × Cache Size Heatmap
+
+![Hetero Mix Heatmap](../report_figures/kv_cache/hetero_mix_heatmap.png)
+
+The heatmap reveals how dramatically agent composition affects thrashing:
+
+| Mix | 200 blks | 400 blks | 800 blks | 1200 blks |
+|-----|:---:|:---:|:---:|:---:|
+| all_short | 75% | 75% | 75% | 75% |
+| all_medium | 21% | 33% | 56% | 74% |
+| all_long | 10% | 14% | 24% | 28% |
+| short+long | 9% | 13% | 21% | 26% |
+| high_var | 24% | 37% | 62% | 72% |
+| mixed_3way | 10% | 15% | 34% | 40% |
+
+**Short agents are cache-friendly.** Their small working set (39 blocks each, 312 total for 8 concurrent) fits comfortably in even 400 blocks. Hit rate is flat at ~75% regardless of cache size.
+
+**Long agents dominate cache pressure.** A single long agent at full context requires 469 blocks — more than the entire 400-block cache. Eight concurrent long agents need ~3752 blocks, creating 4.7x overcommit at 800 blocks and severe thrashing (~24% hit rate).
+
+**Mixing short and long is worse than either alone.** The `short+long` mix achieves only 21% hit rate at 800 blocks — worse than `all_medium` (56%) despite having half the pool as small-footprint agents. Long agents' massive insertions evict short agents' cached prefixes, and short agents' fast turnover provides no stability benefit.
+
+### 6.4 Cross-Type Eviction: The Fairness Problem
+
+![Short+Long Detail](../report_figures/kv_cache/hetero_detail_short_long.png)
+
+The 50% short / 50% long mix at 800 blocks (detailed 5-panel view above) exposes the cross-type eviction problem:
+
+| Agent Type | Hit Rate (standalone) | Hit Rate (in mix) | Δ |
+|------------|:---:|:---:|:---:|
+| short | 75.2% | 40.4% | **−34.8 pp** |
+| long | 23.6% | 16.6% | −7.0 pp |
+
+Short agents suffer a **35 percentage-point hit rate drop** when sharing the cache with long agents. Long agents barely notice. The mechanism:
+
+1. Long agents insert ~216 blocks per request (at later steps), evicting most of the cache each step
+2. Short agents' cached prefixes (only 39 blocks) are collateral damage
+3. Short agents' small insertions don't meaningfully evict long agents' entries
+
+This is an **asymmetric fairness failure**: the resource-heavy agent type degrades the resource-light type disproportionately.
+
+### 6.5 Three-Way Mix: Everyone Suffers
+
+![3-Way Detail](../report_figures/kv_cache/hetero_detail_3way.png)
+
+![3-Way Breakdown](../report_figures/kv_cache/hetero_3way_breakdown.png)
+
+The mixed_3way configuration (⅓ short / ⅓ medium / ⅓ long) at 800 blocks:
+
+| Agent Type | Standalone Hit Rate | In 3-Way Mix | Blocks Inserted/req |
+|------------|:---:|:---:|:---:|
+| short (4 steps) | 75.2% | 48.9% | 13.2 |
+| medium (12 steps) | 55.6% | 32.6% | 65.2 |
+| long (24 steps) | 23.6% | 31.0% | 179.5 |
+
+The per-type breakdown (right panel: stacked bar of cache pressure) shows long agents dominating cache insertions throughout the simulation. The box plot (left panel) shows the hit-rate distribution: short agents have the widest spread (some requests hit well, others miss entirely due to eviction), while long agents cluster at low hit rates.
+
+Notably, long agents actually *improve* slightly in the mix (31.0% vs 23.6% standalone) because short agents' fast turnover means less sustained competition for cache space.
+
+### 6.6 High-Variance Token Sizes
+
+![High Variance Detail](../report_figures/kv_cache/hetero_high_var.png)
+
+Agents with unpredictable tool result sizes (CV=0.9) show distinctive behaviour at 800 blocks:
+
+- **Overall hit rate: 61.8%** — moderate, comparable to `all_medium`
+- **Bursty insertion pattern**: some requests insert 10 blocks (small tool result), others insert 100+ (large result), visible as spikes in the blocks-inserted panel
+- **Eviction spikes**: large insertions trigger cascading evictions that temporarily hurt subsequent requests
+- **Recovery between bursts**: after a large insertion, if the next few steps are small, the cache stabilises and hit rate recovers
+
+The high variance doesn't cause sustained thrashing (the *mean* working set still fits), but it creates **intermittent thrashing episodes** — brief periods where a burst of large tool results temporarily overcommits the cache.
+
+### 6.7 Step Count and Duration Sweep
+
+![Step Count Sweep](../report_figures/kv_cache/hetero_step_count_sweep.png)
+
+The overlay of all six mixes at 800 blocks (windowed hit rate + utilisation) shows:
+
+- **all_short** maintains 75% hit rate throughout with low utilisation (~74%) — the cache is undercommitted
+- **all_medium** and **high_var** track together at 55-62%, approaching full utilisation
+- **all_long**, **short+long**, and **mixed_3way** cluster at 14-34%, with full cache utilisation — confirming that long agents' working set (469 blocks × 8 concurrent ≈ 3752 blocks) overwhelms any reasonable cache size
+- Utilisation converges to ~80-99% for all mixes — again showing that **utilisation alone cannot distinguish healthy caching from thrashing**
+
+---
+
+## 7. Combined Findings
+
+### Finding 5: Agent heterogeneity creates asymmetric cache interference
+
+When short and long agents share a cache, long agents' massive per-step insertions evict short agents' prefixes, causing a 35 percentage-point hit rate degradation for short agents. Long agents are barely affected. This suggests that **cache partitioning or per-type admission control** could significantly improve fairness.
+
+### Finding 6: Mixed pools can be worse than the worst individual type
+
+The `short+long` mix (21% hit at 800 blocks) performs worse than `all_medium` (56%) despite having half the pool as lightweight agents. The fast turnover of short agents doesn't offset the cache pollution from long agents — it makes it worse by increasing churn without reducing pressure.
+
+### Finding 7: Working-set diversity demands per-type capacity planning
+
+The homogeneous rule of thumb (`cache ≥ N × max_blocks_per_session`) is insufficient for heterogeneous pools. A mixed pool's effective cache requirement is dominated by its largest agent type:
+
+| Mix | Naive capacity (avg) | Actual required (for >50% hit) |
+|-----|:---:|:---:|
+| all_short | 312 blocks | ~200 blocks |
+| all_medium | 1352 blocks | ~800 blocks |
+| all_long | 3752 blocks | ~3000+ blocks |
+| short+long | 2032 blocks | ~3000+ blocks (dominated by long) |
+| mixed_3way | 2256 blocks | ~2500+ blocks |
+
+### Finding 8: High-variance step sizes cause intermittent, not sustained, thrashing
+
+Unlike the steady-state thrashing from working-set overcommit, high CV agents create **bursty eviction episodes** — brief periods of cache churn when large tool results arrive, followed by recovery. This is a different failure mode that might benefit from **burst-aware eviction damping** rather than simple capacity increases.
+
+---
+
+## 8. Extended Implications for System Design
+
+The heterogeneous findings extend the system design recommendations from Section 5:
+
+| Strategy | Effect | When to use |
+|----------|--------|-------------|
+| **Cache partitioning by agent type** | Prevents cross-type eviction; protects short agents from long agents' cache pressure | Multi-type deployments with known agent profiles |
+| **Weighted admission control** | Limit cache blocks per agent type proportional to their working-set contribution | Prevent a single long agent from monopolising cache |
+| **Type-aware scheduling** | Batch similar agent types together to reduce working-set heterogeneity | When agent types are known at dispatch time |
+| **Dynamic pool sizing** | Adjust concurrent session limits per agent type based on measured hit rates | Production systems with real-time monitoring |
+| **Separate cache tiers** | Small fast cache for short agents, large slower cache for long agents | When latency requirements differ by agent type |
+| **Burst-absorbing buffers** | Temporary over-provisioning to absorb high-variance insertion spikes without evicting stable entries | High-CV agent workloads |
+
+The most critical finding for capacity planning: **provision cache for the largest agent type's full working set × its concurrent count**, not the average across types. A pool with even 25% long agents behaves as if it were 100% long agents from a cache-pressure perspective.
+
+---
+
+## 9. Reproducing
 
 ```bash
 python experiments/experiment_thrashing.py
 ```
 
-Output: console characterization + 5 plots in `report_figures/kv_cache/thrashing_*.png`.
+Output:
+- Console characterisation for both homogeneous and heterogeneous experiments
+- 5 homogeneous plots in `report_figures/kv_cache/thrashing_*.png`
+- 7 heterogeneous plots in `report_figures/kv_cache/hetero_*.png`
