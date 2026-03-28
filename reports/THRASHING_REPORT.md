@@ -1,7 +1,7 @@
 # KV Cache Thrashing in Agentic Inference — Experiment Report
 
-**Date:** 2026-03-25
-**Experiment:** `experiments/experiment_thrashing.py`
+**Date:** 2026-03-25 (updated 2026-03-28)
+**Experiments:** `experiments/experiment_thrashing.py`, `experiments/experiment_unlimited_cache.py`
 **Component:** `vidur.entities.prefix_cache_manager`
 
 ---
@@ -339,10 +339,211 @@ The most critical finding for capacity planning: **provision cache for the large
 ## 9. Reproducing
 
 ```bash
-python experiments/experiment_thrashing.py
+python experiments/experiment_thrashing.py   # Parts 1 & 2
+python experiments/experiment_unlimited_cache.py  # Part 3
 ```
 
 Output:
-- Console characterisation for both homogeneous and heterogeneous experiments
+- Console characterisation for homogeneous, heterogeneous, and unlimited experiments
 - 5 homogeneous plots in `report_figures/kv_cache/thrashing_*.png`
 - 7 heterogeneous plots in `report_figures/kv_cache/hetero_*.png`
+- 5 unlimited-cache plots in `report_figures/kv_cache/unlimited_*.png`
+
+---
+
+## 10. Unlimited Cache Experiment — Quantifying the Cost of Thrashing
+
+The previous sections characterise *where* thrashing occurs and *how bad* the hit
+rate gets. This section answers the operational question: **how much does thrashing
+actually cost in terms of GPU compute?**
+
+We run every configuration twice on the identical request stream — once with the
+limited LRU cache and once with an **unlimited oracle cache** (500 000 blocks,
+never evicts). The gap between the two measures the exact compute penalty of
+operating under capacity constraints.
+
+### 10.1 Measurement Model
+
+Every token not served from cache must be re-computed during prefill. We model
+two performance dimensions directly:
+
+```
+effective_prefill_i  =  total_prefill_i  −  cached_tokens_i
+
+TTFT multiplier_i    =  eff_prefill_limited_i  /  eff_prefill_unlimited_i
+
+compute_overhead     =  Σ eff_limited  /  Σ eff_unlimited   (aggregate ratio)
+
+throughput_ratio     =  1 / compute_overhead               (fraction of unlimited tput)
+```
+
+A `compute_overhead` of 5× means the server computes five times as many prefill
+tokens as it would with an unlimited cache. A `throughput_ratio` of 19% means
+only one-fifth of the requests-per-second capacity of the unlimited case is
+delivered.
+
+### 10.2 Homogeneous Results: The Binary Cliff
+
+![Overhead Heatmap](../report_figures/kv_cache/unlimited_overhead_heatmap.png)
+
+The heatmap reveals the same binary transition seen in the hit-rate analysis, now
+expressed as concrete compute cost:
+
+| Config | WS/Cache | Compute overhead | Throughput | TTFT p95 | Compute wasted |
+|--------|:--------:|:----------------:|:----------:|:--------:|:--------------:|
+| 2 conc, 400 blks | 0.8× | **1.00×** | 100% | 1.0× | 0% |
+| 4 conc, 400 blks | 1.7× | **1.48×** | 68% | 4.9× | 32% |
+| 6 conc, 400 blks | 2.5× | **5.19×** | 19% | 11.5× | 81% |
+| 8 conc, 400 blks | 3.4× | **5.38×** | 19% | 11.6× | 81% |
+| 12 conc, 400 blks | 5.1× | **5.38×** | 19% | 11.6× | 81% |
+| 8 conc, 600 blks | 2.3× | **1.00×** | 100% | 1.0× | 0% |
+
+There is no gradual degradation. As soon as the working set exceeds cache capacity
+the system enters a regime where **81-84% of prefill compute is wasted** — tokens
+that could have been served from cache but were evicted and must be fully
+recomputed. Adding more concurrent sessions beyond the thrashing threshold changes
+nothing: the penalty is already maxed out at ~5.4× overhead.
+
+### 10.3 Per-Request View: TTFT Inflation
+
+![Detail Comparison](../report_figures/kv_cache/unlimited_detail_comparison.png)
+
+The 4-panel view (8 concurrent, 400 blocks) shows the per-request picture:
+
+- **Top**: hit fraction collapses from the unlimited baseline (~86%) to ~25% during
+  sustained thrashing.
+- **Second**: effective prefill tokens are 4-5× higher in the limited case — the
+  server re-computes almost the full context for every step.
+- **Third**: individual request TTFT multipliers. During thrashing, the median
+  request takes **5× longer** on prefill than it would with unlimited cache. Tail
+  requests (p95) take **11.6×** longer.
+- **Bottom**: cumulative compute overhead converges to ~5.4× and stays there for
+  the duration of sustained load.
+
+### 10.4 TTFT Distribution
+
+![TTFT CDF](../report_figures/kv_cache/unlimited_ttft_cdf.png)
+
+The CDF of per-request TTFT multipliers across five representative configurations:
+
+| Config | TTFT p50 | TTFT p95 | Interpretation |
+|--------|:--------:|:--------:|----------------|
+| 2 conc, 1200 blks | 1.0× | 1.0× | No overhead at all — cache always has everything |
+| 4 conc, 800 blks | 1.0× | 1.0× | No overhead — working set fits |
+| 8 conc, 600 blks | 1.0× | 1.0× | No overhead — working set fits |
+| 8 conc, 400 blks | 4.9× | 11.6× | Severe thrashing — most requests 5× slower |
+| 12 conc, 400 blks | 4.9× | 11.6× | Same pattern — adding sessions doesn't change it |
+
+The CDF for thrashing configurations is heavy-tailed: a large fraction of requests
+cluster at 5-6× overhead, with a tail reaching 12×. These are the later steps of
+agentic sessions, where the context is longest and the cache benefit should be
+greatest — but the blocks have already been evicted.
+
+### 10.5 The Thrashing Cliff
+
+![Cost of Thrashing](../report_figures/kv_cache/unlimited_cost_of_thrashing.png)
+
+Plotting compute overhead against the working-set/cache ratio makes the threshold
+structure explicit. The transition is sharp: below ws/cache ≈ 1, overhead is 1×
+(no penalty). Above it, overhead jumps immediately to 5-6× for medium agents and
+stays there regardless of how much more the working set grows. This is the
+**thrashing cliff** — a phase boundary in the system's behaviour.
+
+### 10.6 Heterogeneous Agent Results
+
+![Agent Mix Cost](../report_figures/kv_cache/unlimited_agent_mix_cost.png)
+
+The unlimited-cache comparison makes the heterogeneous cost structure stark:
+
+| Mix | Cache | Overhead | Tput | TTFT p95 | Wasted compute |
+|-----|:-----:|:--------:|:----:|:--------:|:--------------:|
+| all_short | any | **1.00×** | 100% | 1.0× | 0% |
+| all_medium | 400 blks | 5.48× | 18% | 14.1× | 82% |
+| all_medium | 800 blks | 3.79× | 26% | 13.8× | 74% |
+| all_long | 400 blks | **11.55×** | 9% | 30.2× | 91% |
+| all_long | 800 blks | **10.85×** | 9% | 29.9× | 91% |
+| all_long | 1200 blks | **10.13×** | 10% | 29.9× | 90% |
+| short+long | 800 blks | **10.63×** | 9% | 28.3× | 91% |
+| high_var | 800 blks | 2.76× | 36% | 16.5× | 64% |
+| mixed_3way | 800 blks | 7.64× | 13% | 23.8× | 87% |
+
+**Long agents never recover.** Even at 1200 blocks, `all_long` wastes 90% of
+prefill compute. Their maximum context (469 blocks per session × 8 concurrent =
+3752 blocks needed) exceeds all tested cache sizes. Every step re-triggers massive
+evictions, and the unlimited-cache baseline — where each step only needs to compute
+~300 new tokens rather than 7500 accumulated tokens — is completely unachievable
+with any practical cache size short of full working set.
+
+**Short agents pay nothing.** Their maximum context (39 blocks per session × 8 =
+312 blocks) fits comfortably within 400 blocks. Compute overhead is exactly 1.00×
+at all tested cache sizes, TTFT multiplier is 1.0× throughout. Short agents are
+the ideal cache-friendly workload.
+
+**High-variance agents pay a moderate price.** At 800 blocks: 2.76× overhead, 36%
+throughput. Their mean context is similar to medium agents, but the bursty
+insertions mean some steps blow past the cache capacity, triggering cascade
+evictions. At 1200 blocks they nearly recover (1.02× overhead), confirming that
+the cost is capacity-driven, not inherent to variance.
+
+**The short+long mix is dominated by long agents.** The mix achieves 10.63×
+overhead at 800 blocks — nearly identical to all_long — because long agents'
+3752-block working set completely governs cache pressure. The short agents'
+small footprint provides no relief; their cached tokens are collateral eviction
+damage from long agents' insertions.
+
+### 10.7 Findings Summary
+
+**Finding 9: Thrashing wastes 81–84% of prefill compute in the homogeneous case**
+
+When the working set exceeds cache capacity for medium agents (12 steps, 2700 token
+max context), 81–84% of all prefill computation is redundant — tokens that should
+have been served from cache but were evicted and must be recomputed. The GPU
+delivers only 16–19% of the throughput it could achieve with an unlimited cache.
+
+**Finding 10: The overhead is capped at ~5–6× for medium agents; long agents reach ~11×**
+
+For medium-length agents, the maximum overhead is ~5.4× because even with zero
+cache hits, the full context length is bounded. Long agents (24 steps, up to
+7500 tokens) reach 10–12× overhead because the unlimited-cache baseline is
+extremely efficient (only ~300 new tokens per step vs 7500 recomputed), while the
+limited cache provides almost no benefit at any tested size.
+
+**Finding 11: The thrashing cliff is a hard phase boundary, not a gradient**
+
+Overhead is either 1.0× (working set fits) or 5× (it doesn't). There is no
+intermediate regime. This means that **incremental cache increases only help if
+they push the system below the thrashing threshold** — partial increases within the
+thrashing regime provide zero benefit.
+
+**Finding 12: The cost of thrashing dwarfs the cost of the cache miss itself**
+
+In the thrashing regime, the problem isn't that individual requests miss the cache —
+it's that the *sequence* of misses and evictions means every step of every session
+re-computes its full context. For a 12-step session, this means steps 10, 11, 12
+compute ~2700, ~2900, ~3100 tokens respectively instead of ~200 tokens each. The
+waste is concentrated at the later, longer steps.
+
+---
+
+## 11. Capacity Planning: Break-Even Cache Sizes
+
+Combining Findings 2 (binary threshold) and 11 (phase boundary), the optimal
+capacity rule is strict:
+
+```
+Required cache blocks  ≥  N_concurrent  ×  max_blocks_per_session_type
+```
+
+| Agent type | Max blocks/session | 8 concurrent requires | Safe cache size |
+|------------|:-----------------:|:---------------------:|:---------------:|
+| short | 39 | 312 blocks | **400 blocks** |
+| medium | 169 | 1352 blocks | **1400 blocks** |
+| long | 469 | 3752 blocks | **4000 blocks** |
+| high_var | ~200 (mean) | ~1600 blocks | **2000 blocks** |
+
+For mixed pools, dimension against the **largest agent type** present, not the
+average. A pool with 25% long agents requires the same cache as 100% long agents
+(Finding 7, Finding 12).
+
+Under-sizing by even one session worth of blocks pushes the system over the cliff
+into the 81–91% compute-waste regime with no intermediate penalty level.
