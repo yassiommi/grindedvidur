@@ -31,7 +31,7 @@ Models analyzed:
 
 **Question:** How does interconnect bandwidth affect KV cache transfer latency?
 
-![KV Transfer vs PCIe](example_outputs/experiments/pdd_analysis/exp1_pcie_bandwidth.png)
+![KV Transfer vs PCIe](../example_outputs/experiments/pdd_analysis/exp1_pcie_bandwidth.png)
 
 ### Results
 
@@ -54,7 +54,7 @@ DeepSeek-V3's MLA compression reduces KV cache by 8.4x vs Llama-7B per-token, ma
 
 **Question:** What is the latency trade-off between disaggregated and colocated execution?
 
-![PDD vs Colocated](example_outputs/experiments/pdd_analysis/exp2_pdd_vs_colocated.png)
+![PDD vs Colocated](../example_outputs/experiments/pdd_analysis/exp2_pdd_vs_colocated.png)
 
 ### Results (Llama-7B, A100, seq=512)
 
@@ -83,7 +83,7 @@ The constant 64.7x ratio reveals that for MHA architectures, **PDD is I/O-bound 
 
 **Question:** How do different KV attention mechanisms affect transfer cost?
 
-![KV Cache Scaling](example_outputs/experiments/pdd_analysis/exp3_kv_cache_scaling.png)
+![KV Cache Scaling](../example_outputs/experiments/pdd_analysis/exp3_kv_cache_scaling.png)
 
 ### Results
 
@@ -114,7 +114,7 @@ This means MLA-based models can support **8x higher request throughput** through
 
 **Question:** Can decode-side GPU compute hide the KV transfer latency?
 
-![Prefetch Overlap](example_outputs/experiments/pdd_analysis/exp4_prefetch_overlap.png)
+![Prefetch Overlap](../example_outputs/experiments/pdd_analysis/exp4_prefetch_overlap.png)
 
 ### Results (batch=32, seq=1024, A100)
 
@@ -144,7 +144,7 @@ To fully hide the transfer, one would need:
 
 **Question:** How does batch size affect PDD transfer overhead amortization?
 
-![Batch Sensitivity](example_outputs/experiments/pdd_analysis/exp5_batch_sensitivity.png)
+![Batch Sensitivity](../example_outputs/experiments/pdd_analysis/exp5_batch_sensitivity.png)
 
 ### Results (Llama-7B, A100)
 
@@ -178,7 +178,7 @@ DeepSeek-V3's MLA makes the per-token overhead negligible even on PCIe Gen4.
 
 **Question:** Does H100's faster PCIe help PDD?
 
-![Hardware Comparison](example_outputs/experiments/pdd_analysis/exp6_hardware_comparison.png)
+![Hardware Comparison](../example_outputs/experiments/pdd_analysis/exp6_hardware_comparison.png)
 
 ### Results (batch=32, seq=1024)
 

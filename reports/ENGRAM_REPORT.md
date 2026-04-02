@@ -124,10 +124,10 @@ How does reallocating 17 routed experts (72 -> 55) to a 5.7B Engram table affect
 | 64 | 47.819 | 36.389 | 1.31x | I/O dominance saturates |
 | 128 | 47.819 | 36.408 | 1.31x | Compute starts to matter |
 
-![Per-Layer Comparison](example_outputs/experiments/engram_analysis/exp1_per_layer_comparison.png)
+![Per-Layer Comparison](../example_outputs/experiments/engram_analysis/exp1_per_layer_comparison.png)
 *Figure 1: Per-layer timing breakdown for MoE-27B (top) vs Engram-27B (bottom). Engram layers 2 and 15 show minimal overhead from the memory module. The dominant effect is reduced expert weight I/O across all layers.*
 
-![Forward Pass Comparison](example_outputs/experiments/engram_analysis/exp1_forward_pass_comparison.png)
+![Forward Pass Comparison](../example_outputs/experiments/engram_analysis/exp1_forward_pass_comparison.png)
 *Figure 2: Left: Forward pass latency vs batch size. Right: Time breakdown at batch=32 showing the Engram overhead is tiny compared to the I/O savings from fewer experts.*
 
 ### Analysis
@@ -155,7 +155,7 @@ The paper's central finding is that validation loss follows a **U-shaped curve**
 - **rho << 1 (mostly Engram)**: Higher loss because too few experts limit reasoning capacity
 - **rho ~ 0.74 (optimal)**: Best trade-off -- Engram handles static recall, freeing depth for reasoning
 
-![Sparsity Allocation](example_outputs/experiments/engram_analysis/exp2_sparsity_allocation.png)
+![Sparsity Allocation](../example_outputs/experiments/engram_analysis/exp2_sparsity_allocation.png)
 *Figure 3: Three-panel analysis. Left: Validation loss U-curve with optimum at rho~0.74. Center: Inference latency monotonically decreases with lower rho (fewer experts = less I/O). Right: Pareto plot showing Engram achieves both better quality and lower latency.*
 
 ### The Pareto Improvement
@@ -187,7 +187,7 @@ Because Engram uses deterministic hash-based addressing, the per-token access pa
 
 *Note: All overhead values are relative to MoE-27B (negative = faster).*
 
-![Host Memory Offloading](example_outputs/experiments/engram_analysis/exp3_host_memory_offload.png)
+![Host Memory Offloading](../example_outputs/experiments/engram_analysis/exp3_host_memory_offload.png)
 *Figure 4: Left: Overhead is flat across table sizes (O(1) access). Center: HBM memory freed by offloading to host DRAM. Right: Prefetch vs no-prefetch comparison.*
 
 ### Infrastructure Implications
@@ -239,7 +239,7 @@ If `budget >= lookup_time`, the DMA finishes before layer E needs the data, and 
 For layer 2: 2 preceding layers provide 9x the required DMA time.
 For layer 15: 15 preceding layers provide 64x the required DMA time.
 
-![Prefetch Overlap Budget](example_outputs/experiments/engram_analysis/exp4_prefetch_overlap.png)
+![Prefetch Overlap Budget](../example_outputs/experiments/engram_analysis/exp4_prefetch_overlap.png)
 *Figure 5: Top-left/right: Compute budget vs DMA lookup time for layers 2 and 15 (the green region is the hidden I/O). Bottom-left: Budget/lookup ratio on log scale -- always well above the stall threshold. Bottom-right: Two-stream timeline showing DMA finishing well before SM needs the data.*
 
 ### Why This Matters
@@ -285,7 +285,7 @@ What would Engram look like applied to DeepSeek-V3 (61 layers, 256 experts, EP=8
 | 64 | 95.1 | 81.8 | **-14.0%** | ~186 GB |
 | 128 | 164.7 | 162.8 | -1.1% | ~186 GB |
 
-![V3-Scale Projection](example_outputs/experiments/engram_analysis/exp5_v3_scale_projection.png)
+![V3-Scale Projection](../example_outputs/experiments/engram_analysis/exp5_v3_scale_projection.png)
 *Figure 6: Left: Latency comparison. Right: Overhead by batch size. At typical serving batch sizes (8-64), Engram-V3 is 14-22% faster while freeing ~186 GB of HBM.*
 
 ### Analysis
@@ -308,7 +308,7 @@ How does PCIe generation (Gen4 vs Gen5) affect Engram performance?
 | A100 | 31.5 GB/s (Gen4) | 45.1 | 35.7 | -20.9% |
 | H100 | 64.0 GB/s (Gen5) | 27.5 | 21.7 | -20.9% |
 
-![Hardware Comparison](example_outputs/experiments/engram_analysis/exp6_hardware_comparison.png)
+![Hardware Comparison](../example_outputs/experiments/engram_analysis/exp6_hardware_comparison.png)
 *Figure 7: Left: Absolute latency on both GPUs. Right: Relative overhead, which is similar because the Engram lookup I/O is tiny compared to expert weight loading.*
 
 ### Analysis
@@ -406,7 +406,7 @@ Even with 4 N-gram sizes, the compute budget at Layer 2 is still **4.3x** the DM
 
 To stall Layer 2's DMA, you would need roughly 17 N-gram sizes with the current architecture -- far beyond any practical configuration.
 
-![N-gram Comparison](example_outputs/experiments/engram_analysis/exp7_ngram_comparison.png)
+![N-gram Comparison](../example_outputs/experiments/engram_analysis/exp7_ngram_comparison.png)
 *Figure 8: Six-panel analysis of N-gram configurations. Top-left: Per-token I/O scales linearly with |N-gram sizes|. Top-center: Hash collision rates are near-100% for all configs (by design). Top-right: Forward pass latency is identical across configs at typical batch sizes. Bottom-left: Overhead vs MoE-27B (all negative = all faster). Bottom-center: Prefetch overlap headroom -- all ratios well above stall threshold. Bottom-right: Time breakdown showing Engram I/O is a tiny fraction of total time.*
 
 ### Key Insights

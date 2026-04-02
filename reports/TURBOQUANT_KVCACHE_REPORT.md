@@ -63,7 +63,7 @@ We use the InferSim analytical FLOPs-based timing approach:
 
 ### 3.1 Experiment 1: KV Cache Size at 1M+ Context
 
-![KV Cache Size Bar Chart](exp1_kv_cache_size_1M.png)
+![KV Cache Size Bar Chart](../example_outputs/experiments/turboquant_kvcache/exp1_kv_cache_size_1M.png)
 
 **Objective**: Quantify the KV cache memory footprint at 1M token context for each configuration.
 
@@ -82,7 +82,7 @@ We use the InferSim analytical FLOPs-based timing approach:
 
 ### 3.2 Experiment 2: Compute/Copy Stream Overlap (Gantt Chart)
 
-![Stream Overlap Gantt Chart](exp2_stream_overlap_gantt.png)
+![Stream Overlap Gantt Chart](../example_outputs/experiments/turboquant_kvcache/exp2_stream_overlap_gantt.png)
 
 **Objective**: Visualize how the KV cache load (Copy Stream) overlaps with attention/MLP compute (Compute Stream) using prefetch pipelining, and quantify how much I/O latency is hidden.
 
@@ -94,7 +94,7 @@ We use the InferSim analytical FLOPs-based timing approach:
 |---------------|-----------------|----------------|----------------|---------|
 | GQA (FP16) | 3.271 | 1.965 | 39.9% | 1.66x |
 | MLA (FP16) | 9.747 | 8.228 | 15.6% | 1.18x |
-| GQA + TQ (3-bit) | 2.142 | 1.897 | 11.4% | 1.13x |
+| GQA + TQ (3-bit) | 2.092 | 1.847 | 11.7% | 1.13x |
 | MLA + TQ (3-bit) | 9.429 | 7.890 | 16.3% | 1.20x |
 
 **Analysis**:
@@ -102,14 +102,14 @@ We use the InferSim analytical FLOPs-based timing approach:
 - **GQA (FP16)** benefits most from prefetch overlap (39.9% I/O hidden) because its I/O time is comparable to compute time, allowing the copy stream to be largely masked by the compute stream.
 - **MLA configurations** (both FP16 and TQ) are compute-dominated due to the MoE expert computation. The KV I/O is already small relative to compute, so the overlap percentage appears lower, but the absolute I/O time is minimal.
 - **TurboQuant** reduces the copy stream duration (fewer bytes to load), which means:
-  - For GQA: the I/O was already partially hidden; with TQ, I/O becomes so small that overlap provides diminishing returns (11.4%) because the copy finishes before compute does.
+  - For GQA: the I/O was already partially hidden; with TQ, I/O becomes so small that overlap provides diminishing returns (11.7%) because the copy finishes before compute does.
   - For MLA: TQ slightly improves overlap effectiveness (16.3% vs 15.6%) since less data needs to be read.
 
 **The key insight**: TurboQuant's primary benefit is not overlap improvement but **absolute I/O reduction** -- the copy stream segments shrink by 5.3x, directly reducing the wall-clock time even when overlap is limited.
 
 ### 3.3 Experiment 3: I/O Access Pattern Heatmap
 
-![I/O Access Heatmap](exp3_io_access_heatmap.png)
+![I/O Access Heatmap](../example_outputs/experiments/turboquant_kvcache/exp3_io_access_heatmap.png)
 
 **Objective**: Visualize the fundamental difference in memory access patterns between full sequential reads (MHA), compressed contiguous reads (MLA), and TurboQuant's discrete sparse reads (DSA).
 
@@ -128,7 +128,7 @@ We use the InferSim analytical FLOPs-based timing approach:
 
 ### 3.4 Experiment 4: TTFT, TPOT, and Throughput
 
-![Inference Latency](exp4_inference_latency.png)
+![Inference Latency](../example_outputs/experiments/turboquant_kvcache/exp4_inference_latency.png)
 
 **Objective**: Compare Time to First Token (TTFT), Time per Output Token (TPOT), and request throughput across all configurations.
 

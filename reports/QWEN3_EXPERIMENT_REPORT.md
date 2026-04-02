@@ -129,7 +129,7 @@ Per deficit layer:
 
 **User validation**: N=37 gives 28.6 TPS (user reported ~30 TPS) — within 5% of real-world measurement.
 
-![CPU-Resident TPS](example_outputs/experiments/qwen3_cpumoe/cpu_resident_tps.png)
+![CPU-Resident TPS](../example_outputs/experiments/qwen3_cpumoe/cpu_resident_tps.png)
 *Figure 1: CPU-Resident TPS degrades linearly with n_cpu_moe. Each CPU layer adds 0.356 ms (0.811 - 0.455) compared to GPU.*
 
 ### Strategy B: Dynamic Transfer Sweep
@@ -145,7 +145,7 @@ Per deficit layer:
 
 **User validation**: Deficit=37 (VRAM≈30GB) gives 20.8 TPS (user reported ~20 TPS) — within 4%.
 
-![Dynamic Transfer TPS](example_outputs/experiments/qwen3_cpumoe/dynamic_transfer_tps.png)
+![Dynamic Transfer TPS](../example_outputs/experiments/qwen3_cpumoe/dynamic_transfer_tps.png)
 *Figure 2: Dynamic Transfer TPS improves as VRAM increases (fewer deficit layers). At VRAM=80GB, only 4 layers are deficit.*
 
 ### User Scenario: Head-to-Head
@@ -157,7 +157,7 @@ Per deficit layer:
 | Dynamic Transfer | VRAM=80GB | 24.67 | **40.5** | — |
 | All GPU (theoretical) | deficit=0 | 21.84 | **45.8** | — |
 
-![Strategy Comparison](example_outputs/experiments/qwen3_cpumoe/strategy_comparison.png)
+![Strategy Comparison](../example_outputs/experiments/qwen3_cpumoe/strategy_comparison.png)
 *Figure 3: (Left) Matched deficit comparison — CPU-Resident consistently beats Dynamic Transfer. (Right) VRAM crossover: Dynamic Transfer beats CPU-Resident (N=37) at VRAM >= 58 GB.*
 
 ---
@@ -199,10 +199,10 @@ Each additional deficit layer costs the dynamic strategy 0.352 ms more than the 
 
 **Important caveat**: CPU-Resident (N=0) always gives 45.8 TPS because it assumes *all* layers fit in GPU VRAM. In practice, N is not a free parameter — it's determined by how much VRAM is available. The user *must* offload layers because VRAM < model weights.
 
-![Per-Layer Breakdown](example_outputs/experiments/qwen3_cpumoe/per_layer_breakdown.png)
+![Per-Layer Breakdown](../example_outputs/experiments/qwen3_cpumoe/per_layer_breakdown.png)
 *Figure 4: (Left) Per-layer time for each execution mode. CPU-Resident avoids PCIe. (Right) PCIe data per layer spans 4 orders of magnitude: 2 KB for CPU-Resident vs 30 MB for Dynamic Transfer vs 1.5 GB for full layer swap.*
 
-![Strategy Heatmap](example_outputs/experiments/qwen3_cpumoe/strategy_heatmap.png)
+![Strategy Heatmap](../example_outputs/experiments/qwen3_cpumoe/strategy_heatmap.png)
 *Figure 5: Strategy heatmap showing TPS advantage across (n_cpu_moe, VRAM) space. Green = CPU-Resident wins; red = Dynamic Transfer wins. Black contour marks the crossover boundary. User's config (N=37, VRAM=80GB) is marked.*
 
 ---
