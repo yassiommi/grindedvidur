@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(REPO_ROOT, "report_figures")
+OUT_DIR = os.path.join(REPO_ROOT, "example_outputs", "experiments", "layer_timing_infersim")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ---------- style ----------

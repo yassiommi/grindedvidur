@@ -48,7 +48,7 @@ from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
-PLOT_DIR = os.path.join(REPO_ROOT, "report_figures", "kv_cache")
+PLOT_DIR = os.path.join(REPO_ROOT, "example_outputs", "experiments", "kv_cache")
 
 import matplotlib
 matplotlib.use("Agg")

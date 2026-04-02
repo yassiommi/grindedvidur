@@ -65,7 +65,7 @@ The critical ratio is **working set / cache capacity**. A single session at max 
 
 During the sustained-load phase, overcommitted configurations thrash continuously with no recovery. The 12-concurrent / 400-block case (5.1x overcommit) shows the pattern clearly:
 
-![Severe Thrashing](../report_figures/kv_cache/thrashing_severe.png)
+![Severe Thrashing](../example_outputs/experiments/kv_cache/thrashing_severe.png)
 
 | Config | Phase | Token Hit Rate | Cache Util | Evictions/req |
 |--------|-------|:---:|:---:|:---:|
@@ -80,7 +80,7 @@ In every case: high utilization, high eviction rate, low hit rate. The warmup ph
 
 When the working set fits in the cache, the three-phase pattern shows healthy behavior throughout:
 
-![No Thrashing](../report_figures/kv_cache/thrashing_none.png)
+![No Thrashing](../example_outputs/experiments/kv_cache/thrashing_none.png)
 
 | Config | Token Hit Rate | Cache Util | Evictions/req |
 |--------|:---:|:---:|:---:|
@@ -92,7 +92,7 @@ Hit rate is stable at ~80% across all three phases, evictions are low and steady
 
 ### 3.3 Thrashing Boundary Heatmap
 
-![Thrashing Heatmap](../report_figures/kv_cache/thrashing_heatmap.png)
+![Thrashing Heatmap](../example_outputs/experiments/kv_cache/thrashing_heatmap.png)
 
 The heatmap maps mid-phase token hit rate across all (concurrent sessions x cache size) configurations. The boundary is sharp and binary: configurations where the working set fits achieve ~80% hit rate, those that don't drop to 17-25%.
 
@@ -106,7 +106,7 @@ The heatmap maps mid-phase token hit rate across all (concurrent sessions x cach
 
 ### 3.4 Concurrent Sessions Sweep (Fixed Cache = 600 Blocks)
 
-![Concurrent Sweep](../report_figures/kv_cache/thrashing_concurrent_sweep.png)
+![Concurrent Sweep](../example_outputs/experiments/kv_cache/thrashing_concurrent_sweep.png)
 
 At a fixed 600-block cache:
 - **2-4 concurrent:** Stable 80%+ hit rate — working set fits comfortably
@@ -119,7 +119,7 @@ The bottom panel shows **near-100% cache utilization across all configurations**
 
 The 6-concurrent / 600-block case (1.7x overcommit) shows the borderline behavior with all three phases visible:
 
-![Thrashing Detail](../report_figures/kv_cache/thrashing_detail.png)
+![Thrashing Detail](../example_outputs/experiments/kv_cache/thrashing_detail.png)
 
 - **Warmup (early requests):** Sessions arrive one by one. Cache fills gradually. Hit rate starts high as early sessions benefit from the shared system prompt.
 - **Sustained load (middle):** Pool is full with sessions at different lifecycle stages. Working set exceeds capacity. Hit rate drops and stays low as sessions continuously evict each other's blocks.
@@ -209,7 +209,7 @@ Six mix configurations are swept across five cache sizes (200, 400, 600, 800, 12
 
 ### 6.3 Results: Agent Mix × Cache Size Heatmap
 
-![Hetero Mix Heatmap](../report_figures/kv_cache/hetero_mix_heatmap.png)
+![Hetero Mix Heatmap](../example_outputs/experiments/kv_cache/hetero_mix_heatmap.png)
 
 The heatmap reveals how dramatically agent composition affects thrashing:
 
@@ -230,7 +230,7 @@ The heatmap reveals how dramatically agent composition affects thrashing:
 
 ### 6.4 Cross-Type Eviction: The Fairness Problem
 
-![Short+Long Detail](../report_figures/kv_cache/hetero_detail_short_long.png)
+![Short+Long Detail](../example_outputs/experiments/kv_cache/hetero_detail_short_long.png)
 
 The 50% short / 50% long mix at 800 blocks (detailed 5-panel view above) exposes the cross-type eviction problem:
 
@@ -249,9 +249,9 @@ This is an **asymmetric fairness failure**: the resource-heavy agent type degrad
 
 ### 6.5 Three-Way Mix: Everyone Suffers
 
-![3-Way Detail](../report_figures/kv_cache/hetero_detail_3way.png)
+![3-Way Detail](../example_outputs/experiments/kv_cache/hetero_detail_3way.png)
 
-![3-Way Breakdown](../report_figures/kv_cache/hetero_3way_breakdown.png)
+![3-Way Breakdown](../example_outputs/experiments/kv_cache/hetero_3way_breakdown.png)
 
 The mixed_3way configuration (⅓ short / ⅓ medium / ⅓ long) at 800 blocks:
 
@@ -267,7 +267,7 @@ Notably, long agents actually *improve* slightly in the mix (31.0% vs 23.6% stan
 
 ### 6.6 High-Variance Token Sizes
 
-![High Variance Detail](../report_figures/kv_cache/hetero_high_var.png)
+![High Variance Detail](../example_outputs/experiments/kv_cache/hetero_high_var.png)
 
 Agents with unpredictable tool result sizes (CV=0.9) show distinctive behaviour at 800 blocks:
 
@@ -280,7 +280,7 @@ The high variance doesn't cause sustained thrashing (the *mean* working set stil
 
 ### 6.7 Step Count and Duration Sweep
 
-![Step Count Sweep](../report_figures/kv_cache/hetero_step_count_sweep.png)
+![Step Count Sweep](../example_outputs/experiments/kv_cache/hetero_step_count_sweep.png)
 
 The overlay of all six mixes at 800 blocks (windowed hit rate + utilisation) shows:
 
@@ -345,9 +345,9 @@ python experiments/experiment_unlimited_cache.py  # Part 3
 
 Output:
 - Console characterisation for homogeneous, heterogeneous, and unlimited experiments
-- 5 homogeneous plots in `report_figures/kv_cache/thrashing_*.png`
-- 7 heterogeneous plots in `report_figures/kv_cache/hetero_*.png`
-- 5 unlimited-cache plots in `report_figures/kv_cache/unlimited_*.png`
+- 5 homogeneous plots in `../example_outputs/experiments/kv_cache/thrashing_*.png`
+- 7 heterogeneous plots in `../example_outputs/experiments/kv_cache/hetero_*.png`
+- 5 unlimited-cache plots in `../example_outputs/experiments/kv_cache/unlimited_*.png`
 
 ---
 
@@ -384,7 +384,7 @@ delivered.
 
 ### 10.2 Homogeneous Results: The Binary Cliff
 
-![Overhead Heatmap](../report_figures/kv_cache/unlimited_overhead_heatmap.png)
+![Overhead Heatmap](../example_outputs/experiments/kv_cache/unlimited_overhead_heatmap.png)
 
 The heatmap reveals the same binary transition seen in the hit-rate analysis, now
 expressed as concrete compute cost:
@@ -406,7 +406,7 @@ nothing: the penalty is already maxed out at ~5.4× overhead.
 
 ### 10.3 Per-Request View: TTFT Inflation
 
-![Detail Comparison](../report_figures/kv_cache/unlimited_detail_comparison.png)
+![Detail Comparison](../example_outputs/experiments/kv_cache/unlimited_detail_comparison.png)
 
 The 4-panel view (8 concurrent, 400 blocks) shows the per-request picture:
 
@@ -422,7 +422,7 @@ The 4-panel view (8 concurrent, 400 blocks) shows the per-request picture:
 
 ### 10.4 TTFT Distribution
 
-![TTFT CDF](../report_figures/kv_cache/unlimited_ttft_cdf.png)
+![TTFT CDF](../example_outputs/experiments/kv_cache/unlimited_ttft_cdf.png)
 
 The CDF of per-request TTFT multipliers across five representative configurations:
 
@@ -441,7 +441,7 @@ greatest — but the blocks have already been evicted.
 
 ### 10.5 The Thrashing Cliff
 
-![Cost of Thrashing](../report_figures/kv_cache/unlimited_cost_of_thrashing.png)
+![Cost of Thrashing](../example_outputs/experiments/kv_cache/unlimited_cost_of_thrashing.png)
 
 Plotting compute overhead against the working-set/cache ratio makes the threshold
 structure explicit. The transition is sharp: below ws/cache ≈ 1, overhead is 1×
@@ -451,7 +451,7 @@ stays there regardless of how much more the working set grows. This is the
 
 ### 10.6 Heterogeneous Agent Results
 
-![Agent Mix Cost](../report_figures/kv_cache/unlimited_agent_mix_cost.png)
+![Agent Mix Cost](../example_outputs/experiments/kv_cache/unlimited_agent_mix_cost.png)
 
 The unlimited-cache comparison makes the heterogeneous cost structure stark:
 

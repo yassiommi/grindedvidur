@@ -41,7 +41,7 @@ The integrated framework enables us to:
 3. Quantify the impact of PCIe bandwidth on KV cache transfer times
 4. Analyze why sparse MoE models have fundamentally different bottleneck characteristics than dense models
 
-![Architecture](report_figures/fig1_architecture.png)
+![Architecture](../example_outputs/experiments/layer_timing_infersim/fig1_architecture.png)
 *Figure 1: Framework architecture showing the integration of Vidur (event-driven scheduling and profiling) with InferSim (hardware-aware FLOPs and bandwidth modeling).*
 
 ---
@@ -148,7 +148,7 @@ The scheduling model reflects real GPU hardware with three independent execution
 - **DMA Engine**: Transfers KV cache over PCIe, can operate concurrently with SM
 - **NVLink/NIC (NCCL)**: Runs all-reduce communication, serialized after SM compute
 
-![Three-Stream Scheduling](report_figures/fig2_three_stream_scheduling.png)
+![Three-Stream Scheduling](../example_outputs/experiments/layer_timing_infersim/fig2_three_stream_scheduling.png)
 *Figure 2: Three-stream hardware scheduling. Without prefetch (top), I/O runs sequentially before compute. With prefetch (bottom), the DMA engine loads the next layer's KV cache concurrently with the current layer's compute, saving up to min(compute_time, next_io_time) per layer.*
 
 **Scheduling Rules:**
@@ -173,7 +173,7 @@ KV cache size per token per layer depends on the attention architecture:
 | GQA | `2 * num_kv_heads * head_dim * 2B` | Llama-3-70B: 2 * 8 * 128 * 2 = **4,096 B** |
 | MLA | `(kv_lora_rank + qk_rope_head_dim) * 2B` | DeepSeek-V3: (512 + 64) * 2 = **1,152 B** |
 
-![KV Cache Size Comparison](report_figures/fig6_kv_cache_size_comparison.png)
+![KV Cache Size Comparison](../example_outputs/experiments/layer_timing_infersim/fig6_kv_cache_size_comparison.png)
 *Figure 3: KV cache size per token per layer across attention architectures. MLA achieves a 14.2x reduction vs. MHA, fundamentally changing the IO/compute balance.*
 
 The KV cache load time per layer is computed from PCIe bandwidth:
@@ -186,7 +186,7 @@ where the 0.8 factor accounts for protocol overhead, transaction sizes, and bus 
 
 For Mixture-of-Experts layers, the timing follows InferSim's FLOPs-based approach:
 
-![MoE Timing Model](report_figures/fig10_moe_timing_model.png)
+![MoE Timing Model](../example_outputs/experiments/layer_timing_infersim/fig10_moe_timing_model.png)
 *Figure 4: MoE layer timing model. Routed expert compute and weight loading overlap (taking the max), while shared expert computation and EP communication are additive.*
 
 **Router:** Small GEMM with very low MFU (5%) due to small matrix dimensions:
@@ -262,7 +262,7 @@ All experiments use the following common configuration:
 
 ### 5.1 Per-Layer Timing Breakdown
 
-![Layer Breakdown](report_figures/fig3_layer_breakdown_comparison.png)
+![Layer Breakdown](../example_outputs/experiments/layer_timing_infersim/fig3_layer_breakdown_comparison.png)
 *Figure 5: Per-layer timing breakdown during decode phase. Llama-2-7B is heavily IO-bound (KV load = 1.58 ms vs. compute = 1.14 ms). DeepSeek-V3 has more balanced timing due to MLA's 14x smaller KV cache, but introduces communication overhead from TP=8.*
 
 **Llama-2-7B (Dense, MHA, TP=1):**
@@ -283,7 +283,7 @@ All experiments use the following common configuration:
 
 ### 5.2 IO-Boundedness Distribution
 
-![IO-Bound Distribution](report_figures/fig5_io_bound_piechart.png)
+![IO-Bound Distribution](../example_outputs/experiments/layer_timing_infersim/fig5_io_bound_piechart.png)
 *Figure 6: Fraction of decode batches that are IO-bound (KV load > compute). Llama-2-7B is IO-bound in 100% of batches; DeepSeek-V3 in 60.3%.*
 
 **Llama-2-7B:** 100% of all 57,639 decode batches are IO-bound. The median IO/Compute ratio is 4.485x, meaning the KV cache load time is nearly 5x the compute time per layer. This is a direct consequence of MHA producing 16 KB of KV data per token per layer.
@@ -303,7 +303,7 @@ The P90-P95 range (2.4-2.9x) represents batches with longer average context leng
 
 ### 5.3 Request-Level Performance
 
-![Request Metrics](report_figures/fig9_request_metrics.png)
+![Request Metrics](../example_outputs/experiments/layer_timing_infersim/fig9_request_metrics.png)
 *Figure 7: Request-level performance metrics across models. DeepSeek-V3's higher latency is driven by distributed communication overhead (TP=8 all-reduce per layer x 61 layers), not by IO bottlenecks.*
 
 | Metric | Llama-2-7B | DeepSeek-V3 |
@@ -322,7 +322,7 @@ DeepSeek-V3's 14.8x higher TPOT (9.26 ms vs. 0.39 ms) is primarily due to:
 
 ### 5.4 Layer Execution Waterfall
 
-![Layer Waterfall](report_figures/fig8_layer_waterfall_deepseek.png)
+![Layer Waterfall](../example_outputs/experiments/layer_timing_infersim/fig8_layer_waterfall_deepseek.png)
 *Figure 8: Layer execution waterfall for DeepSeek-V3 decode with KV prefetch enabled. The DMA stream (blue) prefetches the next layer's KV cache concurrently with SM compute (green). NCCL communication (orange) runs after compute completes. Red hatching shows overlap savings.*
 
 The waterfall illustrates the three-stream scheduling in action:
@@ -337,7 +337,7 @@ The waterfall illustrates the three-stream scheduling in action:
 
 ### 6.1 KV Cache Load Time Scaling
 
-![PCIe Comparison](report_figures/fig4_pcie_comparison.png)
+![PCIe Comparison](../example_outputs/experiments/layer_timing_infersim/fig4_pcie_comparison.png)
 *Figure 9: Impact of PCIe generation on KV cache I/O. (Left) KV load time nearly doubles from Gen4 to Gen3. (Center) IO/Compute ratio increases proportionally. (Right) Prefetch savings remain nearly constant since they're bounded by compute time.*
 
 Halving the PCIe bandwidth (31.5 -> 16 GB/s) has a direct, near-linear impact on KV load time:
@@ -390,7 +390,7 @@ For DeepSeek-V3, the slight reduction at Gen3 is an artifact of scheduler behavi
 
 ### 7.1 Batch Size Does Not Affect IO/Compute Ratio
 
-![Batch Size Sweep](report_figures/fig7_batch_size_vs_context_length.png)
+![Batch Size Sweep](../example_outputs/experiments/layer_timing_infersim/fig7_batch_size_vs_context_length.png)
 *Figure 10: (Left) IO vs. Compute across batch size caps 16-512: both metrics remain constant. (Right) Analytical model showing KV load time scales with context length, not batch size, for MLA models.*
 
 We swept batch size caps from 16 to 512 for DeepSeek-V3:
@@ -444,7 +444,7 @@ From the IO crossover analysis, the analytical KV length where IO equals compute
 
 ### 8.1 Complete Summary
 
-![Summary Table](report_figures/fig11_summary_table.png)
+![Summary Table](../example_outputs/experiments/layer_timing_infersim/fig11_summary_table.png)
 *Figure 11: Complete experiment summary across all configurations.*
 
 ### 8.2 Key Findings
@@ -511,7 +511,7 @@ python -m vidur.main \
 
 ## Appendix B: Generated Figures
 
-All figures in this report are generated by `generate_report_figures.py` and stored in `report_figures/`.
+All figures in this report are generated by `generate_report_figures.py` and stored in `example_outputs/experiments/layer_timing_infersim/`.
 
 | Figure | File | Description |
 |--------|------|-------------|
