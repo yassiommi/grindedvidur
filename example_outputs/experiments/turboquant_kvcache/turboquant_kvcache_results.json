@@ -61,14 +61,14 @@
     "KV cache at 1M context: MHA FP16 requires 2560 GB vs MLA+TQ3 requires only 12.9 GB - a 199x reduction. Only MLA+TQ3 (12.9 GB) and GQA+TQ3 (60.0 GB) fit within H100 80GB HBM.",
     "GQA (FP16): compute/copy overlap hides 39.9% of I/O, achieving 1.67x speedup over sequential execution.",
     "MLA (FP16): compute/copy overlap hides 15.6% of I/O, achieving 1.19x speedup over sequential execution.",
-    "GQA + TQ (3-bit): compute/copy overlap hides 11.4% of I/O, achieving 1.13x speedup over sequential execution.",
-    "MLA + TQ (3-bit): compute/copy overlap hides 16.3% of I/O, achieving 1.20x speedup over sequential execution.",
+    "GQA + TQ (3-bit): compute/copy overlap hides 11.7% of I/O, achieving 1.13x speedup over sequential execution.",
+    "MLA + TQ (3-bit): compute/copy overlap hides 16.2% of I/O, achieving 1.19x speedup over sequential execution.",
     "I/O access patterns differ fundamentally: MHA reads 100% of KV cache contiguously, MLA reads only compressed latents (~7% of full dimensions), and TurboQuant DSA creates sparse discrete reads touching ~20-40% of addresses with 5.3x fewer bytes.",
     "MHA (FP16): TPOT=123.134ms, TTFT=72842.6ms, throughput=78 tok/s at batch=32.",
     "GQA (FP16): TPOT=17.805ms, TTFT=72842.6ms, throughput=106 tok/s at batch=32.",
     "MLA (FP16): TPOT=61.182ms, TTFT=54216.2ms, throughput=117 tok/s at batch=32.",
-    "MHA + TQ (3-bit): TPOT=24.725ms, TTFT=72842.6ms, throughput=104 tok/s at batch=32.",
-    "GQA + TQ (3-bit): TPOT=18.670ms, TTFT=72842.6ms, throughput=106 tok/s at batch=32.",
+    "MHA + TQ (3-bit): TPOT=23.088ms, TTFT=72842.6ms, throughput=104 tok/s at batch=32.",
+    "GQA + TQ (3-bit): TPOT=18.151ms, TTFT=72842.6ms, throughput=106 tok/s at batch=32.",
     "MLA + TQ (3-bit): TPOT=58.500ms, TTFT=54216.2ms, throughput=118 tok/s at batch=32."
   ],
   "experiments": {
@@ -223,97 +223,97 @@
         "layers": [
           {
             "layer": 0,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 1,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 2,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 3,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 4,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 5,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 6,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           },
           {
             "layer": 7,
-            "compute_ms": 0.2328,
+            "compute_ms": 0.2265,
             "io_ms": 0.035
           }
         ],
-        "total_pipelined_ms": 1.8973,
-        "total_sequential_ms": 2.1421,
-        "speedup": 1.129,
-        "io_hidden_pct": 11.4
+        "total_pipelined_ms": 1.8469,
+        "total_sequential_ms": 2.0918,
+        "speedup": 1.133,
+        "io_hidden_pct": 11.7
       },
       "MLA + TQ (3-bit)": {
         "layers": [
           {
             "layer": 0,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 1,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 2,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 3,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 4,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 5,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 6,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           },
           {
             "layer": 7,
-            "compute_ms": 0.2199,
+            "compute_ms": 0.2182,
             "io_ms": 0.9587
           }
         ],
-        "total_pipelined_ms": 7.8896,
-        "total_sequential_ms": 9.4292,
-        "speedup": 1.195,
-        "io_hidden_pct": 16.3
+        "total_pipelined_ms": 7.8878,
+        "total_sequential_ms": 9.415,
+        "speedup": 1.194,
+        "io_hidden_pct": 16.2
       }
     },
     "exp3": {
@@ -464,41 +464,41 @@
         {
           "batch_size": 1,
           "ttft_ms": 2276.333,
-          "tpot_ms": 0.773,
-          "total_gen_ms": 2474.1,
-          "throughput_tok_s": 103.5,
-          "req_throughput_s": 0.404,
-          "decode_compute_ms": 0.773,
+          "tpot_ms": 0.721,
+          "total_gen_ms": 2461.0,
+          "throughput_tok_s": 104.0,
+          "req_throughput_s": 0.406,
+          "decode_compute_ms": 0.643,
           "decode_io_ms": 0.721
         },
         {
           "batch_size": 8,
           "ttft_ms": 18210.661,
-          "tpot_ms": 6.181,
-          "total_gen_ms": 19793.1,
-          "throughput_tok_s": 103.5,
-          "req_throughput_s": 0.404,
-          "decode_compute_ms": 6.181,
+          "tpot_ms": 5.772,
+          "total_gen_ms": 19688.3,
+          "throughput_tok_s": 104.0,
+          "req_throughput_s": 0.406,
+          "decode_compute_ms": 5.143,
           "decode_io_ms": 5.772
         },
         {
           "batch_size": 32,
           "ttft_ms": 72842.645,
-          "tpot_ms": 24.725,
-          "total_gen_ms": 79172.4,
-          "throughput_tok_s": 103.5,
-          "req_throughput_s": 0.404,
-          "decode_compute_ms": 24.725,
+          "tpot_ms": 23.088,
+          "total_gen_ms": 78753.1,
+          "throughput_tok_s": 104.0,
+          "req_throughput_s": 0.406,
+          "decode_compute_ms": 20.573,
           "decode_io_ms": 23.088
         },
         {
           "batch_size": 64,
           "ttft_ms": 145685.291,
-          "tpot_ms": 49.451,
-          "total_gen_ms": 158344.7,
-          "throughput_tok_s": 103.5,
-          "req_throughput_s": 0.404,
-          "decode_compute_ms": 49.451,
+          "tpot_ms": 46.175,
+          "total_gen_ms": 157506.2,
+          "throughput_tok_s": 104.0,
+          "req_throughput_s": 0.406,
+          "decode_compute_ms": 41.146,
           "decode_io_ms": 46.175
         }
       ],
@@ -506,41 +506,41 @@
         {
           "batch_size": 1,
           "ttft_ms": 2276.333,
-          "tpot_ms": 0.583,
-          "total_gen_ms": 2425.7,
-          "throughput_tok_s": 105.5,
-          "req_throughput_s": 0.412,
-          "decode_compute_ms": 0.583,
+          "tpot_ms": 0.567,
+          "total_gen_ms": 2421.5,
+          "throughput_tok_s": 105.7,
+          "req_throughput_s": 0.413,
+          "decode_compute_ms": 0.567,
           "decode_io_ms": 0.09
         },
         {
           "batch_size": 8,
           "ttft_ms": 18210.661,
-          "tpot_ms": 4.667,
-          "total_gen_ms": 19405.5,
-          "throughput_tok_s": 105.5,
-          "req_throughput_s": 0.412,
-          "decode_compute_ms": 4.667,
+          "tpot_ms": 4.538,
+          "total_gen_ms": 19372.3,
+          "throughput_tok_s": 105.7,
+          "req_throughput_s": 0.413,
+          "decode_compute_ms": 4.538,
           "decode_io_ms": 0.721
         },
         {
           "batch_size": 32,
           "ttft_ms": 72842.645,
-          "tpot_ms": 18.67,
-          "total_gen_ms": 77622.1,
-          "throughput_tok_s": 105.5,
-          "req_throughput_s": 0.412,
-          "decode_compute_ms": 18.67,
+          "tpot_ms": 18.151,
+          "total_gen_ms": 77489.3,
+          "throughput_tok_s": 105.7,
+          "req_throughput_s": 0.413,
+          "decode_compute_ms": 18.151,
           "decode_io_ms": 2.886
         },
         {
           "batch_size": 64,
           "ttft_ms": 145685.291,
-          "tpot_ms": 37.34,
-          "total_gen_ms": 155244.3,
-          "throughput_tok_s": 105.5,
-          "req_throughput_s": 0.412,
-          "decode_compute_ms": 37.34,
+          "tpot_ms": 36.302,
+          "total_gen_ms": 154978.5,
+          "throughput_tok_s": 105.7,
+          "req_throughput_s": 0.413,
+          "decode_compute_ms": 36.302,
           "decode_io_ms": 5.772
         }
       ],
@@ -552,7 +552,7 @@
           "total_gen_ms": 5523.1,
           "throughput_tok_s": 46.4,
           "req_throughput_s": 0.181,
-          "decode_compute_ms": 0.42,
+          "decode_compute_ms": 0.416,
           "decode_io_ms": 14.956
         },
         {
@@ -562,7 +562,7 @@
           "total_gen_ms": 26977.2,
           "throughput_tok_s": 75.9,
           "req_throughput_s": 0.297,
-          "decode_compute_ms": 3.359,
+          "decode_compute_ms": 3.331,
           "decode_io_ms": 52.434
         },
         {
@@ -572,7 +572,7 @@
           "total_gen_ms": 69192.2,
           "throughput_tok_s": 118.4,
           "req_throughput_s": 0.462,
-          "decode_compute_ms": 13.436,
+          "decode_compute_ms": 13.325,
           "decode_io_ms": 58.5
         },
         {
@@ -582,7 +582,7 @@
           "total_gen_ms": 123566.8,
           "throughput_tok_s": 132.6,
           "req_throughput_s": 0.518,
-          "decode_compute_ms": 26.872,
+          "decode_compute_ms": 26.649,
           "decode_io_ms": 59.119
         }
       ]

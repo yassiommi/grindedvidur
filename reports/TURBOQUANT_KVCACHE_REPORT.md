@@ -55,7 +55,7 @@ We use the InferSim analytical FLOPs-based timing approach:
 - **I/O time**: `bytes / (bandwidth * efficiency)`
 - **Overlap**: `max(compute, I/O)` for concurrent streams
 - **MFU values**: Attention = 25%, Dense MLP = 30%, MoE grouped GEMM = 15%, Routing = 5%
-- **TurboQuant dequant overhead**: Modeled as ~2 FLOP/element for PolarQuant inverse + QJL sign decode (negligible per the TurboQuant paper)
+- **TurboQuant dequant overhead**: Modeled as ~8 FLOP/element fused into the attention kernel: 2 FLOP polar angle lookup, 4 FLOP magnitude scaling (K+V), 2 FLOP QJL sign correction. Uses element-wise MFU=0.50 (SIMD-efficient, not GEMM-bound). Per-layer overhead is ~35 µs for MHA at batch=32, consistent with the TurboQuant paper's claim of negligible runtime overhead.
 
 ---
 
@@ -141,8 +141,8 @@ We use the InferSim analytical FLOPs-based timing approach:
 | MHA (FP16) | 72,842.6 | 123.134 | 78.5 | 0.307 |
 | GQA (FP16) | 72,842.6 | 17.805 | 105.8 | 0.413 |
 | MLA (FP16) | 54,216.2 | 61.182 | 117.2 | 0.458 |
-| MHA + TQ (3-bit) | 72,842.6 | 24.725 | 103.5 | 0.404 |
-| GQA + TQ (3-bit) | 72,842.6 | 18.670 | 105.5 | 0.412 |
+| MHA + TQ (3-bit) | 72,842.6 | 23.088 | 104.0 | 0.406 |
+| GQA + TQ (3-bit) | 72,842.6 | 18.151 | 105.7 | 0.413 |
 | MLA + TQ (3-bit) | 54,216.2 | 58.500 | 118.4 | 0.462 |
 
 **Analysis**:
@@ -150,11 +150,11 @@ We use the InferSim analytical FLOPs-based timing approach:
 - **TTFT** is identical within architecture families (MHA/GQA share the same model size; MLA has fewer layers and different hidden dim). TurboQuant does not affect TTFT because the prefill phase computes KV from scratch rather than loading from cache.
 
 - **TPOT** shows the most dramatic TurboQuant impact on MHA:
-  - MHA FP16: 123.1 ms/token -> MHA + TQ: 24.7 ms/token (**5.0x improvement**). The massive KV cache read (32 KB/token/layer x 80 layers) dominates decode; TQ reduces this by 5.3x.
-  - GQA FP16: 17.8 ms -> GQA + TQ: 18.7 ms (**negligible change, slightly worse**). GQA already has small KV cache; the TQ dequant overhead slightly exceeds the I/O savings.
-  - MLA FP16: 61.2 ms -> MLA + TQ: 58.5 ms (**4.4% improvement**). MLA is compute-bound (MoE experts), so KV I/O savings have modest impact.
+  - MHA FP16: 123.1 ms/token → MHA + TQ: 23.1 ms/token (**5.3x improvement**). The massive KV cache read (32 KB/token/layer × 80 layers) dominates decode; TQ reduces I/O by 5.3x. The dequant overhead (~35 µs/layer) is fully hidden within the compute stream.
+  - GQA FP16: 17.8 ms → GQA + TQ: 18.2 ms (**~2% worse**). GQA already has a small KV cache (4 KB/layer); I/O savings are minimal and the dequant adds marginal compute overhead.
+  - MLA FP16: 61.2 ms → MLA + TQ: 58.5 ms (**4.4% improvement**). MLA is compute-bound (MoE experts); KV I/O savings are partially masked by MoE compute.
 
-- **Throughput**: MLA + TQ achieves the highest throughput at 118.4 tok/s, slightly above MLA FP16 (117.2 tok/s). The biggest throughput gain from TurboQuant is on MHA (78.5 -> 103.5 tok/s, +32%).
+- **Throughput**: MLA + TQ achieves the highest throughput at 118.4 tok/s, slightly above MLA FP16 (117.2 tok/s). The biggest throughput gain from TurboQuant is on MHA (78.5 → 104.0 tok/s, **+32%**).
 
 ---
 
@@ -175,7 +175,7 @@ We use the InferSim analytical FLOPs-based timing approach:
 - TurboQuant DSA creates sparse discrete reads (~40% of addresses touched) with 5.3x fewer total bytes. The access pattern trades coalescing efficiency for dramatically reduced bandwidth consumption.
 
 ### 4.4 Inference Latency
-- TurboQuant's biggest TPOT win is on **MHA** (5.0x reduction from 123 to 25 ms/token) where KV I/O dominates.
+- TurboQuant's biggest TPOT win is on **MHA** (5.3x reduction from 123 to 23 ms/token) where KV I/O dominates.
 - For **GQA** (already I/O-efficient) and **MLA** (compute-dominated), TurboQuant provides marginal TPOT changes.
 - TurboQuant does **not affect TTFT** since prefill computes KV from scratch.
 

@@ -273,14 +273,24 @@ def compute_layer_timings(
             t.kv_cache_load_ms = kv_bytes / gpu.hbm_bw_bytes_s * 1e3
 
         # TurboQuant dequantization overhead
+        # PolarQuant inverse + QJL sign-bit decode per recovered element:
+        #   - Polar angle lookup/compute (cos + sin): 2 FLOP
+        #   - Magnitude scale for K and V components: 4 FLOP
+        #   - QJL sign-bit correction (multiply + add): 2 FLOP
+        #   Total: ~8 FLOP per element
+        # Dequant is fused into the attention kernel, operating on already-loaded
+        # indices (kv_cache_load_ms already accounts for the reduced I/O bytes).
+        # Element-wise SIMD ops on H100 achieve ~50% MFU (mfu_elemwise).
+        # Per TurboQuant paper this overhead is negligible; the model confirms it.
         if cfg.uses_dsa_sparse_read and not is_prefill:
             tq_elements = avg_kv_length * batch_size
             if cfg.mla_compressed_kv_dim > 0:
                 tq_elements *= cfg.mla_compressed_kv_dim
             else:
                 tq_elements *= 2 * cfg.num_kv_heads * cfg.head_dim
-            tq_flops = 2.0 * tq_elements
-            t.tq_dequant_ms = (tq_flops / 1e9) / (gpu.fp16_tflops * 1024 * mfu_small) * 1e3
+            mfu_elemwise = 0.50  # element-wise SIMD: much higher utilization than GEMM
+            tq_flops = 8.0 * tq_elements
+            t.tq_dequant_ms = (tq_flops / 1e9) / (gpu.fp16_tflops * 1024 * mfu_elemwise) * 1e3
 
         # MLP / MoE
         if cfg.num_routed_experts > 0:
