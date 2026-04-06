@@ -188,20 +188,29 @@ for ax, name, io_pct, clr in [
             fontsize=13, fontweight="bold", color=ACCENT1)
     ax.set_title(name, pad=15)
 
-# 3b: Context length drives IO, not batch size
+# 3b: Context length drives IO (batch=32, DeepSeek-V3 MLA)
 ax = axes[2]
-ctx = np.array([512, 1024, 2048, 4096, 8192, 16384, 32768])
+ctx = np.array([1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072])
 kv_per_tok = 1152  # MLA bytes
-for bs, ls, alpha in [(1, "-", 0.5), (32, "-", 0.75), (128, "-", 1.0)]:
-    kv_ms = kv_per_tok * ctx * bs / (31.5e9 * 0.8) * 1e3
-    ax.plot(ctx, kv_ms, ls, linewidth=2.5, alpha=alpha, label=f"batch={bs}", zorder=3)
-ax.axhline(y=0.22, color=ACCENT2, linestyle="--", linewidth=2, label="Compute time")
-ax.axhline(y=0.22*1, color=ACCENT4, linestyle=":", linewidth=1.5, alpha=0.5)
-ax.text(40000, 0.25, "IO = Compute", fontsize=9, color=ACCENT4, fontstyle="italic")
+hbm_bw = 2.0e12    # A100 SXM HBM bandwidth (~2 TB/s)
+bs = 32
+kv_ms = kv_per_tok * ctx * bs / hbm_bw * 1e3
+ax.plot(ctx, kv_ms, "-o", linewidth=2.5, markersize=5, color=ACCENT1, zorder=3,
+        label=f"KV load (batch={bs})")
+# Total per-layer compute: 0.208 (attn) + 0.494 (MoE) = 0.702 ms
+compute_ms = 0.702
+ax.axhline(y=compute_ms, color=ACCENT2, linestyle="--", linewidth=2,
+           label=f"Compute ({compute_ms:.2f} ms)")
+ax.axvline(x=38480, color=ACCENT4, linestyle=":", linewidth=1.5, alpha=0.7)
+ax.text(38480, compute_ms * 0.3, "~38K tokens\n(crossover)", fontsize=9,
+        color=ACCENT4, fontstyle="italic", ha="center")
+ax.fill_between(ctx, kv_ms, compute_ms, where=kv_ms > compute_ms,
+                alpha=0.08, color=ACCENT4)
 ax.set_xlabel("Context Length (tokens)")
-ax.set_ylabel("KV Load Time / Layer (ms)")
-ax.set_title("Context Length Drives IO\n(not batch size)", pad=10)
+ax.set_ylabel("Time per Layer (ms)")
+ax.set_title("Context Length Drives IO\n(DeepSeek-V3, batch=32)", pad=10)
 ax.set_xscale("log", base=2)
+ax.set_yscale("log")
 ax.legend(fontsize=9, loc="upper left")
 
 fig.suptitle("The IO / Compute Shift: MHA is 100% IO-bound, MLA is Balanced",

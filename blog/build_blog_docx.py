@@ -228,17 +228,17 @@ para(
     "The simulator models three attention architectures with distinct KV cache footprints:"
 )
 para(
-    "MHA (Llama-2-7B): Every query head has its own KV head. "
-    "2 \u00d7 32 heads \u00d7 128 dims \u00d7 2 bytes = 16,384 bytes per token per layer."
+    "MHA (Llama-2-70B class): Every query head has its own KV head. "
+    "2 \u00d7 64 heads \u00d7 128 dims \u00d7 2 bytes = 32,768 bytes per token per layer."
 )
 para(
     "GQA (Llama-2-70B): 8 KV heads shared across 64 query heads. "
-    "2 \u00d7 8 \u00d7 128 \u00d7 2 = 4,096 bytes per token per layer \u2014 a 4\u00d7 reduction."
+    "2 \u00d7 8 \u00d7 128 \u00d7 2 = 4,096 bytes per token per layer \u2014 an 8\u00d7 reduction."
 )
 para(
     "MLA (DeepSeek-V3): Compresses KV into a low-rank latent of dimension 576 "
     "(kv_lora_rank=512 + rope_dim=64). "
-    "(512 + 64) \u00d7 2 = 1,152 bytes per token per layer \u2014 a 14.2\u00d7 reduction from MHA."
+    "(512 + 64) \u00d7 2 = 1,152 bytes per token per layer \u2014 a 28.4\u00d7 reduction from MHA."
 )
 img("fig02_kv_cache_size_landscape.png")
 caption("Figure 4: Left \u2014 KV bytes per token per layer (log scale). "
@@ -534,7 +534,7 @@ spacer()
 table(
     ["Layer", "Technique", "What It Reduces", "Measured Compression"],
     [
-        ["Architecture", "MHA \u2192 GQA \u2192 MLA", "KV bytes per token", "14.2\u00d7"],
+        ["Architecture", "MHA \u2192 GQA \u2192 MLA", "KV bytes per token", "28.4\u00d7"],
         ["Attention sparsity", "Sparse attention", "Tokens attended per query", "variable"],
         ["Conditional memory", "Engram", "HBM expert IO per layer", "24% reduction"],
         ["Quantization", "TurboQuant 3-bit", "KV bits per element", "5.33\u00d7"],
