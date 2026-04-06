@@ -214,8 +214,9 @@ para(
     "point (IO = compute) is at ~38,480 tokens."
 )
 img("fig03_io_compute_shift.png")
-caption("Figure 3: Left/Center \u2014 IO-bound fraction: 100% for MHA vs. 60.3% for MLA. "
-        "Right \u2014 KV load time scales with context length, not batch size.")
+caption("Figure 3: Left/Center \u2014 Per-layer time breakdown: Llama-2-7B spends 58% of its "
+        "layer time on KV cache IO vs. only 24% for DeepSeek-V3 with MLA. "
+        "Right \u2014 KV load time scales with context length; crossover at ~38K tokens.")
 spacer()
 
 doc.add_page_break()

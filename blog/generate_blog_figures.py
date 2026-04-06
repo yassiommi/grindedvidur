@@ -175,20 +175,55 @@ save(fig, "fig02_kv_cache_size_landscape.png")
 # ================================================================
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
-# 3a: Donut charts — IO-bound fraction
-for ax, name, io_pct, clr in [
-    (axes[0], "Llama-2-7B (MHA)", 100.0, ACCENT5),
-    (axes[1], "DeepSeek-V3 (MLA)", 60.3, ACCENT6),
-]:
-    sizes = [io_pct, 100-io_pct]
-    colors_d = [ACCENT1, ACCENT2]
-    wedges, _ = ax.pie(sizes, colors=colors_d, startangle=90,
-                       wedgeprops=dict(width=0.4, edgecolor="white", linewidth=2))
-    ax.text(0, 0, f"{io_pct:.0f}%\nIO-bound", ha="center", va="center",
-            fontsize=13, fontweight="bold", color=ACCENT1)
-    ax.set_title(name, pad=15)
+# 3a & 3b: Stacked bars showing IO vs Compute vs Comm per model
+# Using the same per-layer data from Fig 1
+models_data = [
+    ("Llama-2-7B\n(MHA)", {
+        "KV Cache IO": 1.583, "Compute": 0.462 + 0.681, "Comm": 0.0
+    }, "100% of batches\nIO-bound", ACCENT4),
+    ("DeepSeek-V3\n(MLA)", {
+        "KV Cache IO": 0.320, "Compute": 0.208 + 0.494, "Comm": 0.307 + 0.307
+    }, "60% of batches\nIO-bound", ACCENT3),
+]
+for ax_idx, (name, data, annotation, ann_color) in enumerate(models_data):
+    ax = axes[ax_idx]
+    components = list(data.keys())
+    values = list(data.values())
+    colors_bar = [ACCENT1, ACCENT2, ACCENT3]
+    bottom = 0
+    for comp, val, clr in zip(components, values, colors_bar):
+        if val > 0:
+            bar = ax.bar(0, val, bottom=bottom, color=clr, edgecolor="white",
+                         linewidth=1.5, width=0.5, zorder=3, label=comp)
+            if val > 0.15:
+                ax.text(0, bottom + val/2, f"{comp}\n{val:.2f} ms",
+                        ha="center", va="center", fontsize=8.5,
+                        fontweight="bold", color="white")
+            bottom += val
+    total = sum(values)
+    io_frac = data["KV Cache IO"] / total * 100
+    ax.text(0, bottom + 0.08, f"Total: {total:.2f} ms\nIO = {io_frac:.0f}% of time",
+            ha="center", va="bottom", fontsize=9, fontweight="bold")
+    # Annotation about batch IO-boundedness
+    ax.text(0.5, 0.95, annotation, transform=ax.transAxes, ha="center", va="top",
+            fontsize=10, fontweight="bold", color=ann_color,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF5F5" if ann_color == ACCENT4 else "#FFF8F0",
+                      edgecolor=ann_color, linewidth=1.2))
+    ax.set_title(name, pad=12, fontsize=12)
+    ax.set_ylabel("Time per Layer (ms)")
+    ax.set_xlim(-0.8, 0.8)
+    ax.set_xticks([])
+    ax.set_ylim(0, max(total * 1.35, 2.0))
 
-# 3b: Context length drives IO (batch=32, DeepSeek-V3 MLA)
+# Add a shared legend
+handles = [
+    mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO"),
+    mpatches.Patch(facecolor=ACCENT2, label="Compute (Attn + MLP/MoE)"),
+    mpatches.Patch(facecolor=ACCENT3, label="Communication (TP)"),
+]
+axes[0].legend(handles=handles, fontsize=8, loc="upper right")
+
+# 3c: Context length drives IO (batch=32, DeepSeek-V3 MLA)
 ax = axes[2]
 ctx = np.array([1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072])
 kv_per_tok = 1152  # MLA bytes
