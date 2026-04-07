@@ -89,7 +89,7 @@ subtitle = doc.add_paragraph()
 subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
 run = subtitle.add_run(
     "From Dense Attention to Sparse Lookup:\n"
-    "Characterizing IO-Bound LLM Inference with Vidur"
+    "Characterizing IO-Bound LLM Inference with InferLens"
 )
 run.font.size = Pt(14)
 run.font.color.rgb = RGBColor(0x6A, 0x73, 0x7D)
@@ -104,7 +104,7 @@ heading("Abstract", 1)
 para(
     "Autoregressive LLM decoding is fundamentally IO-bound: every generated token requires "
     "loading the full KV cache from GPU memory, and that load dominates compute by up to 4.94\u00d7. "
-    "We use Vidur, a high-fidelity LLM inference simulator extended with per-layer timing, "
+    "We use InferLens, a high-fidelity LLM inference simulator extended with per-layer timing, "
     "GPU-initiated KV cache prefetching, and first-principles MoE modeling, to characterize this "
     "bottleneck across the full landscape of modern techniques: from dense MHA through GQA and MLA, "
     "to DeepSeek\u2019s sparse attention and Engram conditional memory, and Google\u2019s TurboQuant "
@@ -125,7 +125,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 # 1. INTRODUCTION — THE SIMULATOR
 # ══════════════════════════════════════════════════════════════
-heading("1. Vidur: A Flexible LLM Inference Simulator", 1)
+heading("1. InferLens: A Flexible LLM Inference Simulator", 1)
 para(
     "Studying LLM inference performance is expensive. Profiling a single model configuration "
     "on a single GPU SKU at a single batch size requires dedicated hardware, careful benchmarking, "
@@ -134,7 +134,7 @@ para(
     "NVLink), and workload patterns (static chat, agentic tool-use) quickly becomes intractable."
 )
 para(
-    "Vidur addresses this by simulating the full LLM inference stack without GPUs. Originally "
+    "InferLens addresses this by simulating the full LLM inference stack without GPUs. Originally "
     "developed as an event-driven simulator with production-grade batch scheduling (vLLM, Sarathi, "
     "PDD) and profiling-based execution time prediction, we extended it with:"
 )
@@ -146,6 +146,14 @@ para("\u2022  GPU-initiated KV cache prefetching with analytical overlap budgets
 para("\u2022  First-principles MoE timing using InferSim\u2019s FLOPs-based model with empirical MFU values")
 para("\u2022  A radix-tree prefix cache manager with LRU eviction and block-level tracking")
 para("\u2022  Pluggable attention architecture models (MHA, GQA, MLA) with per-token KV sizing")
+para(
+    "A note on methodology: compute and communication times are derived from real GPU profiling "
+    "data \u2014 empirical MFU (Model FLOPs Utilization) values measured on actual hardware and "
+    "profiled interconnect throughput. IO times (KV cache loads, expert weight transfers) are "
+    "currently calculated theoretically from published HBM and PCIe bandwidth specifications. "
+    "We plan to replace the theoretical IO model with real profiling data in a future release, "
+    "which will capture effects like bandwidth contention and memory access pattern irregularities."
+)
 para(
     "The result is a framework where adding a new technique \u2014 like TurboQuant\u2019s 3-bit "
     "quantization or Engram\u2019s conditional memory \u2014 requires only specifying its IO and "
@@ -191,6 +199,32 @@ para(
     "compression, brings this ratio to 1.47\u00d7 \u2014 a qualitatively different regime where "
     "39.7% of batches are actually compute-bound."
 )
+para(
+    "This result is expected from first principles: during decode, each token generation loads "
+    "the KV cache for all past tokens but computes only for the single new token. The arithmetic "
+    "intensity is O(1) \u2014 a constant number of FLOPs per byte loaded \u2014 making decode "
+    "inherently memory-bandwidth-bound regardless of model size or GPU generation."
+)
+
+heading("Prefill Is Always Compute-Bound", 2)
+para(
+    "An important contrast: while decode is IO-bound, prefill is always compute-bound \u2014 "
+    "regardless of context length, model size, or prefix sharing fraction. During prefill, the "
+    "model processes the entire input prompt in a single forward pass, performing large GEMMs "
+    "(QKV projection, attention output, MLP/MoE) over all input tokens to generate the KV cache "
+    "from scratch. There is no KV cache to load \u2014 it is being computed for the first time."
+)
+para(
+    "The simulator\u2019s Gantt charts confirm this: prefill layers show only compute bars "
+    "(attention and MLP) with zero IO bars. This also explains why TurboQuant\u2019s KV compression "
+    "has no effect on TTFT (time to first token): prefill does not load KV from cache, so "
+    "compressing it saves nothing during that phase. The speedup is confined entirely to decode, "
+    "where KV cache IO dominates."
+)
+img("fig12_prefill_vs_decode.png")
+caption("Figure 12: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
+        "Decode (right) is dominated by KV cache IO, loading previously computed KV for every past token.")
+spacer()
 
 heading("The Three-Stream Hardware Model", 2)
 para(
@@ -204,13 +238,22 @@ img("fig09_three_stream_scheduling.png")
 caption("Figure 2: Sequential IO (top) vs. GPU-initiated prefetch (bottom). DMA overlaps with "
         "SM compute, but savings are capped by compute time.")
 spacer()
+para(
+    "A critical implication: in dense architectures, decode IO can never be fully covered by "
+    "compute. Prefetch savings are bounded by min(compute_time, next_kv_load_time). For MHA, "
+    "where the IO/Compute ratio is 4.94\u00d7, the compute window is roughly one-fifth the "
+    "duration of the next KV load \u2014 at most ~20% of the IO can be hidden behind compute. "
+    "The remaining ~80% is exposed latency that no scheduling trick can eliminate. The only "
+    "remedy is reducing the bytes themselves (via architectural compression or quantization)."
+)
 
 heading("Context Length, Not Batch Size, Drives IO", 2)
 para(
     "We swept batch sizes from 16 to 512 for DeepSeek-V3 and found the IO/Compute ratio "
-    "constant at 1.34\u00d7 across every batch size. The reason: MLA\u2019s per-token KV is so "
-    "small (1,152 bytes) that batch size barely moves the needle. What drives IO-boundedness is "
-    "context length \u2014 the accumulated tokens in each request\u2019s KV cache. The crossover "
+    "constant at 1.34\u00d7 across every batch size. Both KV cache IO and compute scale linearly "
+    "with batch size, so their ratio remains fixed \u2014 batch size does not shift the balance "
+    "between IO and compute. What drives the transition from compute-bound to IO-bound is "
+    "context length: the accumulated tokens in each request\u2019s KV cache. The crossover "
     "point (IO = compute) is at ~38,480 tokens."
 )
 img("fig03_io_compute_shift.png")
@@ -240,6 +283,13 @@ para(
     "MLA (DeepSeek-V3): Compresses KV into a low-rank latent of dimension 576 "
     "(kv_lora_rank=512 + rope_dim=64). "
     "(512 + 64) \u00d7 2 = 1,152 bytes per token per layer \u2014 a 28.4\u00d7 reduction from MHA."
+)
+para(
+    "These compression ratios follow directly from the architecture parameters: GQA shares KV heads "
+    "across query heads, reducing bytes by the query-to-KV head ratio (64/8 = 8\u00d7). MLA "
+    "projects the full KV state into a low-rank latent space, reducing bytes proportionally to "
+    "the latent dimension ratio (32,768 / 1,152 = 28.4\u00d7). These are structural properties "
+    "of the architecture, not empirical findings."
 )
 img("fig02_kv_cache_size_landscape.png")
 caption("Figure 4: Left \u2014 KV bytes per token per layer (log scale). "
@@ -282,6 +332,11 @@ para(
     "distributed inference (TP=8 all-reduce contributes 0.614 ms/layer, comparable to total compute)."
 )
 para(
+    "The mechanism composes: attending to fewer tokens means less KV data loaded from memory, "
+    "and sparse attention operates over already-compressed MLA representations \u2014 each selected "
+    "token carries only 1,152 bytes instead of 32,768, so the savings multiply."
+)
+para(
     "This is one of the simulation\u2019s most useful findings: it identifies communication, "
     "not KV IO, as the emerging bottleneck for sparse MoE models at moderate context lengths. "
     "The simulator decomposes these contributions cleanly, which would be difficult to isolate "
@@ -302,7 +357,7 @@ para(
     "with a 5.7B-parameter lookup table that lives in host DRAM."
 )
 para(
-    "Simulating Engram in Vidur required modeling three new components: the per-token hash lookup "
+    "Simulating Engram in InferLens required modeling three new components: the per-token hash lookup "
     "IO (bytes transferred over PCIe), the context-aware gating compute (a small GEMM), and "
     "crucially, the deterministic prefetch overlap. Unlike MoE expert routing \u2014 which is "
     "activation-dependent and unpredictable \u2014 Engram addresses depend only on input token IDs. "
@@ -337,6 +392,13 @@ para(
     "the DMA transfer by 9\u00d7 at layer 2 and 64\u00d7 at layer 15 \u2014 the ratio is a "
     "structural constant, independent of batch size."
 )
+para(
+    "Why this works: fewer routed experts means proportionally less HBM weight loading per layer. "
+    "Engram\u2019s hash-based lookup is O(1) and deterministic \u2014 the address depends only on "
+    "the input token ID, not on activations. This makes it perfectly amenable to prefetching: "
+    "DMA transfers can be scheduled before any layer executes, unlike MoE expert routing which "
+    "requires activation-dependent gating."
+)
 
 heading("O(1) Scaling and HBM Savings", 2)
 para(
@@ -357,7 +419,7 @@ para(
     "Google\u2019s TurboQuant (arXiv:2504.19874, April 2025) compresses KV cache entries from "
     "FP16 to 3 bits per element via PolarQuant (rotational grid mapping) + QJL (sign-bit error "
     "correction), achieving 5.33\u00d7 compression with negligible accuracy loss. It was published "
-    "after Vidur\u2019s original development, but integrating it required only specifying the "
+    "after InferLens\u2019s original development, but integrating it required only specifying the "
     "new bit width, the dequantization overhead (~8 FLOP/element at 50% MFU), and the sparse "
     "discrete access pattern."
 )
@@ -382,6 +444,13 @@ spacer()
 para(
     "The combination of MLA and TurboQuant achieves a 199\u00d7 reduction in KV cache size at "
     "1M context: from 2,560 GB (MHA FP16) to 12.9 GB, using only 16% of a single H100\u2019s HBM."
+)
+para(
+    "The speedup mechanism is direct: fewer bits per KV element means proportionally fewer bytes "
+    "transferred from HBM. For IO-bound configurations (MHA), the speedup approximates the "
+    "compression ratio (16/3 = 5.33\u00d7). For configurations already near the compute-IO "
+    "boundary (GQA, MLA), reducing IO below compute time yields diminishing returns \u2014 "
+    "the bottleneck shifts to compute, and further IO reduction has minimal effect."
 )
 img("fig05_turboquant_impact.png")
 caption("Figure 7: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
@@ -408,7 +477,7 @@ doc.add_page_break()
 heading("7. Prefix Caching: When Workloads Share Structure", 1)
 para(
     "Architecture reduces KV bytes per token; prefix caching avoids recomputing tokens entirely. "
-    "We implemented a radix-tree prefix cache manager in Vidur with LRU eviction and block-level "
+    "We implemented a radix-tree prefix cache manager in InferLens with LRU eviction and block-level "
     "tracking, then swept shared prefix fractions from 0% to 90% across 200 requests with "
     "5 prefix groups."
 )
@@ -431,6 +500,12 @@ para(
     "<5% loss from block-alignment rounding. The radix tree\u2019s leaf-only LRU eviction "
     "naturally protects shared prefix nodes (they always have children), so popular prefixes "
     "are never evicted even without explicit pinning."
+)
+para(
+    "The savings are directly proportional to sharing: shared prefix tokens are computed once "
+    "during the first request\u2019s prefill and reused by all subsequent requests with that "
+    "prefix. A 90% shared fraction eliminates 85% of prefill compute because the remaining "
+    "~5% loss comes from block-alignment rounding in the radix tree."
 )
 para(
     "For chat applications with shared system prompts, this eliminates up to 85% of prefill "
@@ -467,6 +542,13 @@ para(
     "The thrashing boundary is not a gradient \u2014 it is a cliff. Configurations where the "
     "working set fits achieve ~80% hit rate. Those that don\u2019t drop to 17\u201325% and stay "
     "there for the entire sustained-load phase. There is no intermediate regime."
+)
+para(
+    "This is classic cache thrashing: LRU eviction under cyclic access patterns where the "
+    "working set exceeds cache capacity. Each block insertion evicts the least-recently-used "
+    "block, which \u2014 under round-robin session scheduling \u2014 is exactly the block that "
+    "will be needed soonest by another session. The result is near-zero reuse: every cache "
+    "lookup is a miss, and every prefill recomputes tokens that were recently evicted."
 )
 
 heading("Quantifying the Cost", 2)
@@ -587,7 +669,7 @@ para(
 )
 spacer()
 para(
-    "All experiments, scripts, profiling data, and generated figures are available in the Vidur "
+    "All experiments, scripts, profiling data, and generated figures are available in the InferLens "
     "repository. The simulator runs without GPUs and can be extended with new techniques by "
     "specifying their IO and compute characteristics \u2014 no hardware required.",
     italic=True
@@ -597,7 +679,7 @@ spacer()
 p = doc.add_paragraph()
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 run = p.add_run(
-    "Vidur: High-Fidelity LLM Inference Simulator  \u00b7  "
+    "InferLens: High-Fidelity LLM Inference Simulator  \u00b7  "
     "MSR-India Systems Group & Systems for AI Lab @ Georgia Tech  \u00b7  "
     "MLSys\u201924  (arxiv.org/abs/2405.05465)"
 )

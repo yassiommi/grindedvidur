@@ -686,5 +686,71 @@ ax.annotate("17x fewer\nevictions", xy=(6, 347), xytext=(4.5, 3000),
 plt.tight_layout()
 save(fig, "fig11_prefix_caching.png")
 
+# ================================================================
+# FIGURE 12: Prefill vs Decode — Compute-bound vs IO-bound
+# ================================================================
+fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+
+# 12a: Prefill — compute only (no KV load from cache)
+ax = axes[0]
+# Llama-2-7B prefill: ~1.14 ms total per layer (from Gantt description)
+prefill_data = [("Attention\n(QKV + core)", 0.50, ACCENT2),
+                ("MLP\n(FFN)", 0.64, "#3CB371")]
+bottom = 0
+for label, val, clr in prefill_data:
+    ax.bar(0, val, bottom=bottom, color=clr, edgecolor="white",
+           linewidth=1.5, width=0.5, zorder=3)
+    ax.text(0, bottom + val/2, f"{label}\n{val:.2f} ms",
+            ha="center", va="center", fontsize=9.5, fontweight="bold", color="white")
+    bottom += val
+ax.set_title("Prefill\n(Compute-Bound)", pad=12, fontsize=13, fontweight="bold")
+ax.set_ylabel("Time per Layer (ms)")
+ax.set_xlim(-0.8, 0.8)
+ax.set_xticks([])
+ax.set_ylim(0, 2.8)
+ax.text(0, bottom + 0.15, f"Total: {bottom:.2f} ms\n100% compute, 0% IO",
+        ha="center", fontsize=10, fontweight="bold")
+ax.text(0, 2.4, "No KV cache IO\n(KV computed fresh via GEMMs)", ha="center",
+        fontsize=10, fontweight="bold", color=ACCENT2,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0FFF0", edgecolor=ACCENT2, linewidth=1.2))
+
+# 12b: Decode — IO-dominated (Llama-2-7B MHA data from Fig 1)
+ax = axes[1]
+decode_data = [("KV Cache\nLoad (IO)", 1.583, ACCENT1),
+               ("Attention\nCompute", 0.462, ACCENT2),
+               ("MLP\nCompute", 0.681, "#3CB371")]
+bottom = 0
+for label, val, clr in decode_data:
+    ax.bar(0, val, bottom=bottom, color=clr, edgecolor="white",
+           linewidth=1.5, width=0.5, zorder=3)
+    ax.text(0, bottom + val/2, f"{label}\n{val:.3f} ms",
+            ha="center", va="center", fontsize=9, fontweight="bold", color="white")
+    bottom += val
+total_decode = sum(v for _, v, _ in decode_data)
+io_frac = 1.583 / total_decode * 100
+ax.set_title("Decode (MHA)\n(IO-Bound, 4.94\u00d7)", pad=12, fontsize=13, fontweight="bold")
+ax.set_xlim(-0.8, 0.8)
+ax.set_xticks([])
+ax.set_ylim(0, 2.8 * (total_decode / 1.14))  # scale to match visual weight
+ax.text(0, total_decode + 0.1, f"Total: {total_decode:.2f} ms\nIO = {io_frac:.0f}% of layer time",
+        ha="center", fontsize=10, fontweight="bold")
+ax.text(0, ax.get_ylim()[1] * 0.88, "IO dominates:\n4.94\u00d7 more IO than compute",
+        ha="center", fontsize=10, fontweight="bold", color=ACCENT4,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF0F0", edgecolor=ACCENT4, linewidth=1.2))
+
+fig.suptitle("Prefill vs Decode: Fundamentally Different Bottlenecks  (Llama-2-7B, A100)",
+             fontsize=14, fontweight="bold", y=1.03)
+
+# Shared legend
+legend_elements = [
+    mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO (DMA)"),
+    mpatches.Patch(facecolor=ACCENT2, label="Attention Compute"),
+    mpatches.Patch(facecolor="#3CB371", label="MLP Compute"),
+]
+fig.legend(handles=legend_elements, loc="upper center", ncol=3,
+           bbox_to_anchor=(0.5, 1.0), fontsize=10)
+plt.tight_layout()
+save(fig, "fig12_prefill_vs_decode.png")
+
 print(f"\nAll figures saved to {OUT}/")
 print("Done!")
