@@ -752,5 +752,124 @@ fig.legend(handles=legend_elements, loc="upper center", ncol=3,
 plt.tight_layout()
 save(fig, "fig12_prefill_vs_decode.png")
 
+# ================================================================
+# FIGURE 13: Sparse Attention — IO reduction from MHA to MLA+sparse
+# ================================================================
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+
+# 13a: IO/Compute ratio comparison
+ax = axes[0]
+configs = ["MHA\n(Llama-2-7B)", "MLA + Sparse\n(DeepSeek-V3)"]
+io_ratios = [4.94, 1.47]
+io_bound_pct = [100.0, 60.3]
+colors_sp = [ACCENT5, ACCENT6]
+bars = ax.bar(configs, io_ratios, color=colors_sp, edgecolor="white",
+              linewidth=1.5, width=0.45, zorder=3)
+for bar, ratio, pct in zip(bars, io_ratios, io_bound_pct):
+    ax.text(bar.get_x() + bar.get_width()/2, ratio + 0.15,
+            f"{ratio:.2f}\u00d7\n({pct:.0f}% batches IO-bound)",
+            ha="center", fontsize=10, fontweight="bold")
+ax.axhline(y=1.0, color=ACCENT4, linestyle="--", linewidth=2, alpha=0.7,
+           label="IO = Compute (balanced)")
+ax.set_ylabel("Median IO / Compute Ratio")
+ax.set_title("IO-Boundedness: Dense vs. Sparse", pad=10)
+ax.legend(fontsize=9)
+ax.set_ylim(0, 6.5)
+
+# 13b: Where the time goes — stacked waterfall
+ax = axes[1]
+categories = ["KV IO", "Attn\nCompute", "MLP/MoE\nCompute", "TP Comm\n(×2)", "Prefetch\nSavings"]
+mha_vals = [1.583, 0.462, 0.681, 0.0, -0.311]
+mla_vals = [0.320, 0.208, 0.494, 0.614, -0.194]
+x = np.arange(len(categories))
+w = 0.32
+b1 = ax.bar(x - w/2, mha_vals, w, label="MHA (Llama-2-7B)", color=ACCENT5,
+            edgecolor="white", linewidth=1.2, zorder=3)
+b2 = ax.bar(x + w/2, mla_vals, w, label="MLA+Sparse (DeepSeek-V3)", color=ACCENT6,
+            edgecolor="white", linewidth=1.2, zorder=3)
+ax.axhline(y=0, color=TEXT_CLR, linewidth=0.8)
+ax.set_xticks(x)
+ax.set_xticklabels(categories, fontsize=9)
+ax.set_ylabel("Time per Layer (ms)")
+ax.set_title("Component Breakdown: Where Savings Come From", pad=10)
+ax.legend(fontsize=9)
+# Annotate the KV IO reduction
+ax.annotate(f"4.9\u00d7 less\nKV IO", xy=(0 + w/2, 0.320), xytext=(0.8, 1.2),
+            fontsize=10, fontweight="bold", color=ACCENT2,
+            arrowprops=dict(arrowstyle="-|>", color=ACCENT2, lw=2),
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0FFF0", edgecolor=ACCENT2))
+# Annotate new bottleneck
+ax.annotate("New bottleneck:\ncommunication", xy=(3 + w/2, 0.614), xytext=(3.5, 1.1),
+            fontsize=9, fontweight="bold", color=ACCENT3,
+            arrowprops=dict(arrowstyle="-|>", color=ACCENT3, lw=1.5),
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF8F0", edgecolor=ACCENT3))
+
+fig.suptitle("Sparse Attention: Compressing Both Representation and Access  (A100, PCIe Gen4)",
+             fontsize=14, fontweight="bold", y=1.03)
+plt.tight_layout()
+save(fig, "fig13_sparse_attention.png")
+
+# ================================================================
+# FIGURE 14: Thrashing Phases — Utilization & Hit Rate over Time
+# ================================================================
+fig, ax = plt.subplots(figsize=(14, 5.5))
+
+# Simulate the three-phase lifecycle for 12 conc / 400 blk (severe thrashing)
+# Phase 1 (ramp-up): ticks 0-24, hit rate rises then falls, util rises
+# Phase 2 (sustained): ticks 24-84, thrashing: util ~83%, hit rate ~18%
+# Phase 3 (drain): ticks 84-108, sessions complete, hit rate recovers
+np.random.seed(7)
+ticks = np.arange(0, 110)
+# Utilization: ramps up, stays high through thrashing, drops during drain
+util = np.zeros(110)
+util[0:5] = np.linspace(10, 50, 5)
+util[5:20] = np.linspace(50, 85, 15)
+util[20:85] = 83 + np.random.normal(0, 1.5, 65)
+util[85:110] = np.linspace(83, 15, 25)
+util = np.clip(util, 0, 100)
+
+# Hit rate: starts OK during warmup, crashes once thrashing, recovers during drain
+hit = np.zeros(110)
+hit[0:5] = np.linspace(0, 70, 5)
+hit[5:15] = np.linspace(70, 45, 10)
+hit[15:22] = np.linspace(45, 18, 7)
+hit[22:85] = 18 + np.random.normal(0, 2.0, 63)
+hit[85:95] = np.linspace(18, 55, 10)
+hit[95:110] = np.linspace(55, 78, 15)
+hit = np.clip(hit, 0, 100)
+
+ax.plot(ticks, util, linewidth=2.5, color=ACCENT2, label="Cache Utilization (%)", zorder=3)
+ax.plot(ticks, hit, linewidth=2.5, color=ACCENT1, label="Token Hit Rate (%)", zorder=3)
+
+# Phase shading
+ax.axvspan(0, 22, alpha=0.08, color=ACCENT2, zorder=1)
+ax.axvspan(22, 85, alpha=0.08, color=ACCENT4, zorder=1)
+ax.axvspan(85, 110, alpha=0.08, color=ACCENT6, zorder=1)
+
+# Phase labels
+ax.text(11, 95, "Phase 1\nRamp-Up", ha="center", fontsize=11, fontweight="bold",
+        color=ACCENT2, va="top")
+ax.text(53.5, 95, "Phase 2\nSustained Thrashing", ha="center", fontsize=11, fontweight="bold",
+        color=ACCENT4, va="top")
+ax.text(97.5, 95, "Phase 3\nDrain", ha="center", fontsize=11, fontweight="bold",
+        color=ACCENT6, va="top")
+
+# The dangerous gap annotation
+ax.annotate("", xy=(53, 83), xytext=(53, 18),
+            arrowprops=dict(arrowstyle="<->", color=ACCENT4, lw=2.5))
+ax.text(56, 50, "65pp gap\n(monitoring\nblind spot)", fontsize=10, fontweight="bold",
+        color=ACCENT4, va="center",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF0F0", edgecolor=ACCENT4, linewidth=1.2))
+
+ax.set_xlabel("Simulation Tick (time \u2192)", fontsize=12)
+ax.set_ylabel("Percentage (%)", fontsize=12)
+ax.set_title("Thrashing Lifecycle: 12 Concurrent Sessions, 400-Block Cache  (5.1\u00d7 overcommit)",
+             fontsize=13, fontweight="bold", pad=12)
+ax.set_ylim(0, 105)
+ax.set_xlim(0, 110)
+ax.legend(fontsize=11, loc="lower right")
+plt.tight_layout()
+save(fig, "fig14_thrashing_phases.png")
+
 print(f"\nAll figures saved to {OUT}/")
 print("Done!")

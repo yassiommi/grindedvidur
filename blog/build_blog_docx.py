@@ -116,7 +116,7 @@ para(
     "A key contribution is the simulator\u2019s flexibility: without requiring any GPU hardware, "
     "we reproduce the performance characteristics of techniques published as recently as April 2025 "
     "(TurboQuant) and January 2025 (Engram), obtaining results quantitatively consistent with their "
-    "respective papers. All experiments, scripts, and data are open-source."
+    "respective papers."
 )
 
 spacer()
@@ -146,6 +146,8 @@ para("\u2022  GPU-initiated KV cache prefetching with analytical overlap budgets
 para("\u2022  First-principles MoE timing using InferSim\u2019s FLOPs-based model with empirical MFU values")
 para("\u2022  A radix-tree prefix cache manager with LRU eviction and block-level tracking")
 para("\u2022  Pluggable attention architecture models (MHA, GQA, MLA) with per-token KV sizing")
+para("\u2022  Agentic workload simulation with configurable session lifecycles, concurrent agent "
+     "pools, and heterogeneous agent types (varying step counts and context growth rates)")
 para(
     "A note on methodology: compute and communication times are derived from real GPU profiling "
     "data \u2014 empirical MFU (Model FLOPs Utilization) values measured on actual hardware and "
@@ -222,7 +224,7 @@ para(
     "where KV cache IO dominates."
 )
 img("fig12_prefill_vs_decode.png")
-caption("Figure 12: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
+caption("Figure 2: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
         "Decode (right) is dominated by KV cache IO, loading previously computed KV for every past token.")
 spacer()
 
@@ -235,7 +237,7 @@ para(
     "is too short to hide much."
 )
 img("fig09_three_stream_scheduling.png")
-caption("Figure 2: Sequential IO (top) vs. GPU-initiated prefetch (bottom). DMA overlaps with "
+caption("Figure 3: Sequential IO (top) vs. GPU-initiated prefetch (bottom). DMA overlaps with "
         "SM compute, but savings are capped by compute time.")
 spacer()
 para(
@@ -250,14 +252,15 @@ para(
 heading("Context Length, Not Batch Size, Drives IO", 2)
 para(
     "We swept batch sizes from 16 to 512 for DeepSeek-V3 and found the IO/Compute ratio "
-    "constant at 1.34\u00d7 across every batch size. Both KV cache IO and compute scale linearly "
-    "with batch size, so their ratio remains fixed \u2014 batch size does not shift the balance "
-    "between IO and compute. What drives the transition from compute-bound to IO-bound is "
-    "context length: the accumulated tokens in each request\u2019s KV cache. The crossover "
-    "point (IO = compute) is at ~38,480 tokens."
+    "constant at 1.34\u00d7 across every batch size. This is expected: doubling the batch doubles "
+    "both the total KV bytes loaded (IO) and the total FLOPs computed, so the ratio cancels. "
+    "What does change the ratio is context length: longer contexts mean more KV bytes per "
+    "request, but the MLP compute per token (which dominates at short contexts) stays fixed. "
+    "As context grows, IO grows while MLP compute does not, eventually tipping the balance. "
+    "For DeepSeek-V3 with MLA, the crossover (IO = compute) occurs at ~38,480 tokens."
 )
 img("fig03_io_compute_shift.png")
-caption("Figure 3: Left/Center \u2014 Per-layer time breakdown: Llama-2-7B spends 58% of its "
+caption("Figure 4: Left/Center \u2014 Per-layer time breakdown: Llama-2-7B spends 58% of its "
         "layer time on KV cache IO vs. only 24% for DeepSeek-V3 with MLA. "
         "Right \u2014 KV load time scales with context length; crossover at ~38K tokens.")
 spacer()
@@ -292,7 +295,7 @@ para(
     "of the architecture, not empirical findings."
 )
 img("fig02_kv_cache_size_landscape.png")
-caption("Figure 4: Left \u2014 KV bytes per token per layer (log scale). "
+caption("Figure 5: Left \u2014 KV bytes per token per layer (log scale). "
         "Right \u2014 Total KV at 1M context; only MLA-based configs fit a single H100.")
 spacer()
 
@@ -303,7 +306,7 @@ para(
     "changes the calculus:"
 )
 img("fig08_pdd_transfer_dominance.png")
-caption("Figure 5: KV transfer / decode compute ratio in PDD. MHA: 64.7\u00d7 \u2014 the transfer "
+caption("Figure 6: KV transfer / decode compute ratio in PDD. MHA: 64.7\u00d7 \u2014 the transfer "
         "is two orders of magnitude above compute. MLA: 1.8\u00d7 \u2014 PDD becomes practical.")
 spacer()
 para(
@@ -324,6 +327,11 @@ para(
     "relevant KV entries rather than the full context. The two techniques compose: sparse selection "
     "over a compressed representation yields a doubly-reduced IO footprint."
 )
+img("fig13_sparse_attention.png")
+caption("Figure 7: Left \u2014 IO/Compute ratio drops from 4.94\u00d7 (MHA) to 1.47\u00d7 "
+        "(MLA+sparse). Right \u2014 Component breakdown showing KV IO collapses "
+        "while communication emerges as the new bottleneck.")
+spacer()
 para(
     "In our simulation, the shift from MHA to MLA+sparse attention moves DeepSeek-V3 from a "
     "severely IO-bound regime (4.94\u00d7 ratio, 100% of batches IO-bound) to a near-balanced "
@@ -380,7 +388,7 @@ table(
 )
 spacer()
 img("fig04_engram_pareto.png")
-caption("Figure 6: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
+caption("Figure 8: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
         "Center \u2014 Engram is 21\u201331% faster. Right \u2014 Prefetch headroom: "
         "DMA never stalls (9\u201364\u00d7 budget).")
 spacer()
@@ -453,7 +461,7 @@ para(
     "the bottleneck shifts to compute, and further IO reduction has minimal effect."
 )
 img("fig05_turboquant_impact.png")
-caption("Figure 7: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
+caption("Figure 9: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
         "on IO-bound MHA, minimal change on already-compact GQA. Right \u2014 Access patterns: "
         "MHA reads everything; MLA reads 1.6%; TQ reads sparse discrete.")
 spacer()
@@ -492,7 +500,7 @@ table(
 )
 spacer()
 img("fig11_prefix_caching.png")
-caption("Figure 8: Left \u2014 Token hit rate scales linearly with sharing fraction. "
+caption("Figure 10: Left \u2014 Token hit rate scales linearly with sharing fraction. "
         "Right \u2014 Eviction pressure drops 17\u00d7 at 90% sharing.")
 spacer()
 para(
@@ -530,10 +538,15 @@ para(
     "We simulated this with a three-phase lifecycle (ramp-up, sustained load, drain) across "
     "concurrent sessions (2\u201312) and cache sizes (200\u20131,200 blocks)."
 )
+img("fig14_thrashing_phases.png")
+caption("Figure 11: Cache utilization (green) stays high throughout, but token hit rate (blue) "
+        "collapses during sustained thrashing (Phase 2). The 65-percentage-point gap between "
+        "utilization and hit rate is the monitoring blind spot.")
+spacer()
 
 heading("A Binary Cliff", 2)
 img("fig06_thrashing_cliff.png")
-caption("Figure 9: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
+caption("Figure 12: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
         "hit rate is nearly instantaneous. Right \u2014 Below the threshold: no penalty. "
         "Above it: immediate 5\u00d7 compute overhead, 81% wasted.")
 spacer()
@@ -585,7 +598,7 @@ para(
 
 heading("Heterogeneous Agents Make It Worse", 2)
 img("fig07_utilization_lies_hetero.png")
-caption("Figure 10: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
+caption("Figure 13: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
         "Right \u2014 Agent mix at 800 blocks: short+long (21%) is worse than all-medium (56%).")
 spacer()
 
@@ -609,7 +622,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("9. The Full Compression Stack", 1)
 img("fig10_full_compression_stack.png")
-caption("Figure 11: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
+caption("Figure 14: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
         "Prefix Cache (1.9 GB effective at 1M context). The H100 80 GB line shows the "
         "single-GPU feasibility boundary.")
 spacer()
@@ -669,8 +682,7 @@ para(
 )
 spacer()
 para(
-    "All experiments, scripts, profiling data, and generated figures are available in the InferLens "
-    "repository. The simulator runs without GPUs and can be extended with new techniques by "
+    "The simulator runs without GPUs and can be extended with new techniques by "
     "specifying their IO and compute characteristics \u2014 no hardware required.",
     italic=True
 )
