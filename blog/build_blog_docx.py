@@ -142,7 +142,8 @@ para("\u2022  Per-layer timing decomposition into 7 independent components (atte
      "MLP/MoE compute, KV cache load, expert weight load, TP communication, EP communication, "
      "prefetch overlap savings)")
 para("\u2022  Three-stream hardware scheduling (SM, DMA, NCCL) with overlap computation")
-para("\u2022  GPU-initiated KV cache prefetching with analytical overlap budgets")
+para("\u2022  GPU-initiated KV cache prefetching (overlapping the next layer\u2019s KV load "
+     "with the current layer\u2019s compute)")
 para("\u2022  First-principles MoE timing using InferSim\u2019s FLOPs-based model with empirical MFU values")
 para("\u2022  A radix-tree prefix cache manager with LRU eviction and block-level tracking")
 para("\u2022  Pluggable attention architecture models (MHA, GQA, MLA) with per-token KV sizing")
@@ -396,9 +397,10 @@ spacer()
 para(
     "The mechanism is straightforward: fewer routed experts = 24% less HBM IO per layer. "
     "The Engram lookup adds negligible overhead (<0.1 ms per Engram layer) because the DMA is "
-    "fully hidden behind preceding layers\u2019 compute. At batch=32, the prefetch budget exceeds "
-    "the DMA transfer by 9\u00d7 at layer 2 and 64\u00d7 at layer 15 \u2014 the ratio is a "
-    "structural constant, independent of batch size."
+    "fully hidden behind preceding layers\u2019 compute. The prefetch budget exceeds "
+    "the DMA transfer by 9\u00d7 at layer 2 and 64\u00d7 at layer 15. Because both compute "
+    "and DMA scale identically with batch size, these ratios are structural constants \u2014 "
+    "they hold at any batch size."
 )
 para(
     "Why this works: fewer routed experts means proportionally less HBM weight loading per layer. "
