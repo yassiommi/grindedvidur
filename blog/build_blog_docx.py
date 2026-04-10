@@ -114,8 +114,8 @@ para(
 )
 para(
     "A key contribution is the simulator\u2019s flexibility: without requiring any GPU hardware, "
-    "we reproduce the performance characteristics of techniques published as recently as April 2025 "
-    "(TurboQuant) and January 2025 (Engram), obtaining results quantitatively consistent with their "
+    "we reproduce the performance characteristics of techniques published as recently as April 2026 "
+    "(TurboQuant) and January 2026 (Engram), obtaining results quantitatively consistent with their "
     "respective papers."
 )
 
@@ -141,7 +141,7 @@ para(
 para("\u2022  Per-layer timing decomposition into 7 independent components (attention compute, "
      "MLP/MoE compute, KV cache load, expert weight load, TP communication, EP communication, "
      "prefetch overlap savings)")
-para("\u2022  Three-stream hardware scheduling (SM, DMA, NCCL) with overlap computation")
+para("\u2022  Three-stream hardware scheduling (compute, IO, communication) with overlap computation")
 para("\u2022  GPU-initiated KV cache prefetching (overlapping the next layer\u2019s KV load "
      "with the current layer\u2019s compute)")
 para("\u2022  First-principles MoE timing using InferSim\u2019s FLOPs-based model with empirical MFU values")
@@ -231,15 +231,15 @@ spacer()
 
 heading("The Three-Stream Hardware Model", 2)
 para(
-    "The simulator models three independent GPU execution units: SM (compute), DMA (memory "
-    "transfers), and NCCL (communication). KV cache prefetching overlaps the next layer\u2019s "
-    "DMA load with the current layer\u2019s compute. But savings are bounded by "
+    "The simulator models three independent GPU execution streams: compute, IO (memory "
+    "transfers), and communication. KV cache prefetching overlaps the next layer\u2019s "
+    "IO load with the current layer\u2019s compute. But savings are bounded by "
     "min(compute_time, next_kv_load_time) \u2014 when IO \u226b compute, the compute window "
     "is too short to hide much."
 )
 img("fig09_three_stream_scheduling.png")
-caption("Figure 3: Sequential IO (top) vs. GPU-initiated prefetch (bottom). DMA overlaps with "
-        "SM compute, but savings are capped by compute time.")
+caption("Figure 3: Sequential IO (top) vs. GPU-initiated prefetch (bottom). IO overlaps with "
+        "compute, but savings are capped by compute time.")
 spacer()
 para(
     "A critical implication: in dense architectures, decode IO can never be fully covered by "
@@ -359,7 +359,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("5. Engram: Simulating Conditional Memory", 1)
 para(
-    "DeepSeek\u2019s Engram module (arXiv:2601.07372) is a fundamentally different approach to "
+    "DeepSeek\u2019s Engram module (arXiv:2601.07372, January 2026) is a fundamentally different approach to "
     "sparsity. Rather than reducing the KV cache, it offloads static pattern recall (named entities, "
     "common phrases, grammatical templates) to O(1) hash-based lookup tables, freeing the "
     "transformer\u2019s depth for genuine reasoning. This replaces 17 of 72 routed MoE experts "
@@ -370,7 +370,7 @@ para(
     "IO (bytes transferred over PCIe), the context-aware gating compute (a small GEMM), and "
     "crucially, the deterministic prefetch overlap. Unlike MoE expert routing \u2014 which is "
     "activation-dependent and unpredictable \u2014 Engram addresses depend only on input token IDs. "
-    "DMA transfers can begin before layer 0 executes."
+    "IO transfers can begin before layer 0 executes."
 )
 
 heading("Results: A Pareto Improvement", 2)
@@ -391,22 +391,22 @@ spacer()
 img("fig04_engram_pareto.png")
 caption("Figure 8: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
         "Center \u2014 Engram is 21\u201331% faster. Right \u2014 Prefetch headroom: "
-        "DMA never stalls (9\u201364\u00d7 budget).")
+        "IO never stalls (9\u201364\u00d7 budget).")
 spacer()
 
 para(
     "The mechanism is straightforward: fewer routed experts = 24% less HBM IO per layer. "
-    "The Engram lookup adds negligible overhead (<0.1 ms per Engram layer) because the DMA is "
+    "The Engram lookup adds negligible overhead (<0.1 ms per Engram layer) because the IO is "
     "fully hidden behind preceding layers\u2019 compute. The prefetch budget exceeds "
     "the DMA transfer by 9\u00d7 at layer 2 and 64\u00d7 at layer 15. Because both compute "
-    "and DMA scale identically with batch size, these ratios are structural constants \u2014 "
+    "and IO scale identically with batch size, these ratios are structural constants \u2014 "
     "they hold at any batch size."
 )
 para(
     "Why this works: fewer routed experts means proportionally less HBM weight loading per layer. "
     "Engram\u2019s hash-based lookup is O(1) and deterministic \u2014 the address depends only on "
     "the input token ID, not on activations. This makes it perfectly amenable to prefetching: "
-    "DMA transfers can be scheduled before any layer executes, unlike MoE expert routing which "
+    "IO transfers can be scheduled before any layer executes, unlike MoE expert routing which "
     "requires activation-dependent gating."
 )
 
@@ -426,7 +426,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("6. TurboQuant: Simulating the Latest KV Compression", 1)
 para(
-    "Google\u2019s TurboQuant (arXiv:2504.19874, April 2025) compresses KV cache entries from "
+    "Google\u2019s TurboQuant (arXiv:2504.19874, April 2026) compresses KV cache entries from "
     "FP16 to 3 bits per element via PolarQuant (rotational grid mapping) + QJL (sign-bit error "
     "correction), achieving 5.33\u00d7 compression with negligible accuracy loss. It was published "
     "after InferLens\u2019s original development, but integrating it required only specifying the "
@@ -661,7 +661,7 @@ para(
 para(
     "3. Engram achieves a Pareto improvement \u2014 better quality AND lower latency \u2014 "
     "because deterministic prefetching makes its IO structurally invisible. The simulator "
-    "confirms the prefetch budget never drops below 9\u00d7 the DMA transfer.",
+    "confirms the prefetch budget never drops below 9\u00d7 the IO transfer.",
     bold=False
 )
 para(

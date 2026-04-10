@@ -111,9 +111,9 @@ for ax, title, data, accent, reported_ratio in [
 fig.suptitle("Per-Layer Decode Timing: Where the Time Goes  (A100, PCIe Gen4)",
              fontsize=15, fontweight="bold", y=1.04)
 legend_elements = [
-    mpatches.Patch(facecolor=ACCENT2, label="Compute (SM)"),
-    mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO (DMA)"),
-    mpatches.Patch(facecolor=ACCENT3, label="Communication (NCCL)"),
+    mpatches.Patch(facecolor=ACCENT2, label="Compute"),
+    mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO"),
+    mpatches.Patch(facecolor=ACCENT3, label="Communication"),
     mpatches.Patch(facecolor=ACCENT4, label="Prefetch Savings"),
 ]
 fig.legend(handles=legend_elements, loc="upper center", ncol=4,
@@ -305,11 +305,11 @@ ax.axhline(y=1.0, color=ACCENT4, linestyle="--", linewidth=2, label="Stall thres
 ax.set_xticks(range(len(layers)))
 ax.set_xticklabels([f"L{l}" for l in layers])
 ax.set_xlabel("Engram Layer Position")
-ax.set_ylabel("Compute Budget / DMA Time")
-ax.set_title("Prefetch Headroom: DMA Never Stalls", pad=10)
+ax.set_ylabel("Compute Budget / IO Time")
+ax.set_title("Prefetch Headroom: IO Never Stalls", pad=10)
 ax.set_yscale("log")
 ax.legend(fontsize=9)
-ax.text(3, 2.5, "SAFE ZONE\n(DMA hidden by compute)", fontsize=9,
+ax.text(3, 2.5, "SAFE ZONE\n(IO hidden by compute)", fontsize=9,
         ha="center", color=ACCENT2, fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0FFF0", edgecolor=ACCENT2))
 
@@ -550,7 +550,7 @@ for ax, title, prefetch in [
     ax.set_xlim(-0.2, 8)
     ax.set_ylim(-0.8, 3)
     ax.set_yticks([0, 1, 2])
-    ax.set_yticklabels(["NCCL", "DMA (IO)", "SM (Compute)"], fontsize=10)
+    ax.set_yticklabels(["Communication", "IO", "Compute"], fontsize=10)
     ax.set_xlabel("Time (ms)", fontsize=10)
     ax.grid(False)
     ax.spines["top"].set_visible(False)
@@ -575,7 +575,7 @@ for ax, title, prefetch in [
         ax.text(1.5, 2.7, "Layer N", ha="center", fontsize=10, fontstyle="italic", color=GRAY)
         ax.text(4.5, 2.7, "Layer N+1", ha="center", fontsize=10, fontstyle="italic", color=GRAY)
     else:
-        # Layer N: compute + DMA overlap
+        # Layer N: compute + IO overlap
         ax.barh(2, 1.1, left=0, height=bh, color=ACCENT2, alpha=0.9, edgecolor="white", lw=1.5, zorder=3)
         ax.text(0.55, 2, "Compute", ha="center", va="center", fontsize=9, color="white", fontweight="bold")
         ax.barh(1, 1.5, left=0, height=bh, color=ACCENT1, alpha=0.9, edgecolor="white", lw=1.5, zorder=3)
@@ -743,7 +743,7 @@ fig.suptitle("Prefill vs Decode: Fundamentally Different Bottlenecks  (Llama-2-7
 
 # Shared legend
 legend_elements = [
-    mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO (DMA)"),
+    mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO"),
     mpatches.Patch(facecolor=ACCENT2, label="Attention Compute"),
     mpatches.Patch(facecolor="#3CB371", label="MLP Compute"),
 ]
