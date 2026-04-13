@@ -547,3 +547,219 @@ average. A pool with 25% long agents requires the same cache as 100% long agents
 
 Under-sizing by even one session worth of blocks pushes the system over the cliff
 into the 81–91% compute-waste regime with no intermediate penalty level.
+
+---
+
+## 12. Escaping the Cliff with a Tiered Cache: PCIe KV Reloading
+
+Sections 1–11 took HBM as the only place where KV state can live. Once an
+entry is evicted from HBM, the request has to **recompute** it from scratch
+via prefill — and that recomputation is exactly what makes the thrashing
+cliff so brutal (Finding 12).
+
+But HBM isn't the only fast memory on the node. A typical inference server has
+hundreds of GB of host DRAM sitting idle behind the PCIe bus. If we treat it
+as a **second-tier KV cache**, an HBM eviction becomes recoverable: on the
+next use we copy the blocks back over PCIe instead of recomputing them.
+
+The new experiment (`experiments/experiment_pcie_kv_reload.py`) models exactly
+that. Over the same agentic workload as Sections 1–11, each prefix lookup now
+has three possible outcomes:
+
+| Outcome              | Path                          | Cost / token (A100 + 7B)              |
+|----------------------|-------------------------------|---------------------------------------|
+| HBM hit              | already on GPU                | 0                                     |
+| HBM miss, DRAM hit   | host DRAM → HBM over PCIe     | 512 KB / 25.2 GB/s ≈ **0.021 ms**     |
+| Full miss            | run prefill                   | 14 GFLOPs / 175 TFLOPS ≈ **0.080 ms** |
+
+PCIe reload is **3.8× cheaper per token than recomputing** on A100, and up to
+**61× cheaper on 70B** (where prefill is dominated by heavy matmul). Every
+token that had been wasted on re-prefill in Sections 1–11 becomes a candidate
+for reloading.
+
+### 12.1 The tiered model
+
+We run two `PrefixCacheManager`s in parallel over the same request stream:
+
+- `hbm_cache`  — same capacity as the thrashing experiment (200 / 400 / 600 / 800 / 1200 blocks)
+- `dram_cache` — 10× the HBM capacity (host DRAM backing store)
+
+Both see the same inserts, so DRAM is a strict superset of HBM until its own
+LRU kicks in (in practice the DRAM tier is rarely the bottleneck — see
+Finding 15). On each request:
+
+```
+hbm_tokens  = hbm_cache.match_prefix(token_ids)
+dram_tokens = dram_cache.match_prefix(token_ids)
+pcie_tokens = max(hbm_tokens, dram_tokens) - hbm_tokens   # reload over PCIe
+miss_tokens = total_tokens - max(hbm_tokens, dram_tokens) # real prefill
+
+baseline_cost = (total_tokens - hbm_tokens)      * prefill_ms_per_token
+tiered_cost   = pcie_tokens * pcie_ms_per_token  + miss_tokens * prefill_ms_per_token
+```
+
+We compare the two costs request-by-request across the same sweep
+(`concurrent_sessions × cache_size`) as Sections 1–11.
+
+### 12.2 Deep-dive: 8 concurrent, 400-block HBM (severe thrashing)
+
+This is the same configuration that collapsed to ~18% token hit rate and 82
+evictions per request in Section 5. With a 4000-block DRAM tier added:
+
+| Metric                 | Baseline (HBM only) | Tiered (HBM + DRAM PCIe) |
+|------------------------|---------------------|--------------------------|
+| Requests               | 780                 | 780                      |
+| HBM hits               | 23.1 % of tokens    | 23.1 % of tokens         |
+| PCIe reloads           | —                   | **62.6 % of tokens**     |
+| Full recomputes        | 76.9 % of tokens    | **14.3 % of tokens**     |
+| Total prefill compute  | 71.9 s              | **28.6 s**               |
+| Avg cost per request   | 92.2 ms             | **36.7 ms**              |
+| **Compute time saved** | —                   | **43.3 s  (60.2 %)**     |
+
+In the worst-thrashing configuration we tested (8 concurrent × 200-block HBM),
+savings reach **62 % and 50.9 s of avoided prefill** over 547 requests — a
+direct recovery of most of the compute that the thrashing cliff destroyed.
+
+See `report_figures/kv_cache/pcie_reload_detail.png` for the 5-panel
+request-level breakdown (token disposition, per-request cost, cumulative
+cost, working-set vs capacity, cumulative savings).
+
+**Finding 13: PCIe reload turns a thrashing miss into a ~4× cheaper reload.**
+
+### 12.3 Savings map across the full sweep
+
+Re-running the Section 3 sweep with the tiered cache produces this savings map
+(`pcie_reload_savings_heatmap.png`, values = % prefill compute saved):
+
+| Concurrent ↓ / HBM → | 200   | 400   | 600   | 800   | 1200  |
+|----------------------|:-----:|:-----:|:-----:|:-----:|:-----:|
+| 2                    | 39 %  |  0 %  |  0 %  |  0 %  |  0 %  |
+| 4                    | 61 %  | 24 %  |  0 %  |  0 %  |  0 %  |
+| 6                    | 62 %  | 60 %  |  0 %  |  0 %  |  0 %  |
+| 8                    | 62 %  | **60 %** |  0 %  |  0 %  |  0 %  |
+| 12                   | 62 %  | 60 %  |  0 %  |  0 %  |  0 %  |
+
+Two phase boundaries are visible:
+
+1. The **thrashing cliff** itself (same as Section 3) — any cell with non-zero
+   savings is a cell where the baseline was thrashing.
+2. A **savings plateau** at 60–62 % for every thrashing configuration. Once
+   the working set exceeds HBM, the *proportion* of tokens reloadable from
+   DRAM is roughly constant (~63 %) and the per-token speedup is constant
+   (3.8×), so the savings percentage flattens out regardless of how hard the
+   system is thrashing.
+
+The zeros in the table are not a weakness — they simply mean the baseline was
+already not thrashing, so there was nothing to reload. The tiered cache pays
+only for what it recovers.
+
+**Finding 14: PCIe reload erases ~60 % of thrashing compute waste across the
+entire cliff region, without affecting configurations that weren't thrashing
+to begin with.**
+
+### 12.4 DRAM tier sizing
+
+We varied the DRAM tier from 2× to 50× HBM:
+
+| DRAM multiplier | Savings | PCIe-reload token share |
+|:---------------:|:-------:|:-----------------------:|
+| 2× HBM          | 60.2 %  | 62.6 %                  |
+| 5× HBM          | 60.2 %  | 62.6 %                  |
+| 10× HBM         | 60.2 %  | 62.6 %                  |
+| 50× HBM         | 60.2 %  | 62.6 %                  |
+
+Diminishing returns are absolute, not gradual. Once the DRAM tier is large
+enough to hold the blocks HBM just evicted (roughly 2× HBM is already enough
+for our workload), adding more DRAM does nothing — the LRU-eviction horizon
+matches the block-reuse horizon. Capacity planning for the DRAM tier is
+therefore almost trivial: **2–3× HBM is sufficient** to absorb all thrashing
+spill for this class of agent.
+
+**Finding 15: The DRAM tier needs only ~2× HBM capacity. Beyond that, more
+host memory is wasted on KV state.**
+
+### 12.5 Tier-2 bandwidth: where the disk tier breaks down
+
+Varying the tier-2 bandwidth from slow NVMe to future CXL fabrics
+(`pcie_reload_bandwidth_sweep.png`):
+
+| Tier-2 backing        | BW (GB/s) | ms/tok | Ratio vs recompute  | Savings   |
+|-----------------------|:---------:|:------:|:-------------------:|:---------:|
+| NVMe SSD              | 7         | 0.094  | **0.9× (slower!)**  | **−14 %** |
+| PCIe Gen3 x16         | 16        | 0.041  | 2.0×                | 40 %      |
+| PCIe Gen4 x16 (A100)  | 31.5      | 0.021  | 3.8×                | **60 %**  |
+| PCIe Gen5 x16 (H100)  | 64        | 0.010  | 7.8×                | 71 %      |
+| CXL-class             | 128       | 0.005  | 15.6×               | 76 %      |
+
+**Finding 16: Disk (NVMe) is too slow to reload KV on 7B — it makes things
+worse.**  At 7 GB/s a disk reload (0.094 ms/tok) costs *more* than a fresh
+prefill (0.080 ms/tok). The tiered cache is strictly worse if the only
+backing store is SSD. PCIe Gen3 is the minimum bar that beats recompute
+(2.0×), Gen4 is the first that provides the full ~60 % win, and Gen5 / CXL
+continue to scale into the 70 %+ regime.
+
+For larger models the cost balance shifts drastically. A 70B model takes
+~0.8 ms/token to prefill, so even NVMe (0.094 ms/tok) would be an 8.5×
+improvement. **Disk-tier KV reload only makes sense above some model-size
+threshold** determined by `prefill_ms_per_token / nvme_ms_per_token > 1`.
+
+### 12.6 Hardware-dependent savings
+
+The same workload under three hardware configurations:
+
+| Config                    | prefill ms/tok | PCIe ms/tok | Speedup | Savings | Baseline compute | Tiered compute |
+|---------------------------|:--------------:|:-----------:|:-------:|:-------:|:----------------:|:--------------:|
+| A100 + Llama-2-7B         | 0.080          | 0.021       | 3.8×    | **60 %** | 71.9 s           | 28.6 s         |
+| H100 + Llama-2-7B         | 0.028          | 0.010       | 2.7×    | 52 %    | 25.2 s           | 12.2 s         |
+| A100 + Llama-2-70B (GQA)  | 0.800          | 0.013       | 61.5×   | **80 %** | 719.1 s          | 143.3 s        |
+
+Two effects fight each other:
+- **H100 helps recompute more than it helps reload.** FP16 compute scales
+  faster than PCIe Gen5 bandwidth, so the speedup ratio drops from 3.8× to
+  2.7×. Savings dip to 52 %.
+- **Larger models dramatically increase prefill cost** without proportionally
+  increasing KV bytes (thanks to GQA: 70B has 8:1 GQA so its KV-per-token is
+  actually *smaller* than 7B, only 320 KB vs 512 KB). This produces a 61× cost
+  ratio and 80 % savings.
+
+**Finding 17: PCIe KV reload is most valuable on big models with GQA, least
+valuable on small dense models on top-tier hardware.** The technique follows
+the same scaling trend as the FLOPs/byte ratio — the more compute-bound a
+model is, the bigger the win.
+
+### 12.7 Takeaways for system design
+
+1. **HBM thrashing is no longer terminal.** Adding a tier-2 cache over PCIe
+   converts 60 % of the thrashing penalty back into throughput. The cliff
+   doesn't disappear — it just gets shallower by a factor of the recompute /
+   reload cost ratio.
+
+2. **The tier-2 store should be DRAM, not disk**, for 7B-class models. NVMe
+   only beats recompute at ~70B+.
+
+3. **DRAM is cheap to over-provision but pointless to over-provision.** 2×
+   HBM is already enough; every additional GB of host memory beyond that is
+   unused.
+
+4. **PCIe bandwidth, not disk or CPU, is the limiting factor.** Savings scale
+   almost linearly with PCIe generation: Gen3 → 40 %, Gen4 → 60 %, Gen5 →
+   71 %, CXL → 76 %. Hardware upgrades translate directly to reclaimed
+   compute.
+
+5. **Capacity planning becomes softer.** With a DRAM tier the block-sizing
+   rule from Section 11 is no longer a hard cliff; it becomes the threshold
+   below which you *start paying for PCIe traffic instead of HBM hits*.
+   Systems can deliberately under-provision HBM and lean on the tier-2 cache
+   — trading a small per-request latency increase (0.021 ms/tok) for a large
+   reduction in HBM pressure.
+
+All results for Section 12 are captured in
+`experiments/experiment_pcie_kv_reload_results.json`. The figures live in
+`report_figures/kv_cache/`:
+
+- `pcie_reload_detail.png` — 5-panel breakdown of the 8×400 config
+- `pcie_reload_savings_heatmap.png` — savings across the full sweep
+- `pcie_reload_concurrent_sweep.png` — cumulative savings per concurrency level
+- `pcie_reload_dram_sweep.png` — DRAM tier size diminishing returns
+- `pcie_reload_bandwidth_sweep.png` — bandwidth / disk-vs-DRAM comparison
+- `pcie_reload_hardware_comparison.png` — cross-hardware savings
