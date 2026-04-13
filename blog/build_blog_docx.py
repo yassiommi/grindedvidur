@@ -633,6 +633,13 @@ para(
     "recovery from cache failures. The architecture\u2019s IO footprint determines not just "
     "steady-state performance but also resilience to capacity failures."
 )
+img("fig16_ttft_over_time.png")
+caption("Figure 14: Top \u2014 Per-request TTFT over time for the 8-concurrent / 400-block "
+        "configuration. Baseline (recompute, red) tracks the thrashing phases exactly: TTFT "
+        "inflates to ~120 ms during sustained thrashing and recovers during drain. "
+        "Tiered (PCIe reload, blue) stays at ~40 ms throughout, saving ~61% of latency. "
+        "Bottom \u2014 HBM hit rate mirrors the TTFT curves: thrashing collapses hit rate, "
+        "inflating latency; the DRAM tier absorbs the damage via IO instead of compute.")
 spacer()
 
 heading("Utilization Masks the Problem", 2)
@@ -645,7 +652,7 @@ para(
 
 heading("Heterogeneous Agents Make It Worse", 2)
 img("fig07_utilization_lies_hetero.png")
-caption("Figure 14: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
+caption("Figure 15: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
         "Right \u2014 Agent mix at 800 blocks: short+long (21%) is worse than all-medium (56%).")
 spacer()
 
@@ -669,7 +676,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("9. The Full Compression Stack", 1)
 img("fig10_full_compression_stack.png")
-caption("Figure 15: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
+caption("Figure 16: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
         "Prefix Cache (1.9 GB effective at 1M context). The H100 80 GB line shows the "
         "single-GPU feasibility boundary.")
 spacer()

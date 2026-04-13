@@ -963,5 +963,102 @@ ax2.annotate("GQA shrinks KV 8\u00d7\nbut prefill stays expensive\n\u2192 reload
 plt.tight_layout()
 save(fig, "fig15_pcie_kv_reload.png")
 
+# ================================================================
+# FIGURE 16: TTFT Over Time — Thrashing degrades latency, reload recovers it
+# ================================================================
+# Run the actual tiered-cache simulation for the severe-thrashing config
+# (8 concurrent, 400-block HBM) and plot per-request TTFT for both strategies
+# alongside hit rate to show the correlation.
+
+import sys
+sys.path.insert(0, os.path.join(REPO, "experiments"))
+from experiment_pcie_kv_reload import simulate_pcie_reload, HardwareConfig, DEFAULT_HW
+
+traces = simulate_pcie_reload(
+    concurrent_sessions=8,
+    hbm_cache_blocks=400,
+    dram_cache_blocks=4000,  # 10× HBM
+    hw=DEFAULT_HW,
+)
+
+req_idx = np.array([t.request_idx for t in traces])
+baseline_ms = np.array([t.baseline_cost_ms for t in traces])
+tiered_ms = np.array([t.tiered_cost_ms for t in traces])
+hit_frac = np.array([t.hbm_hit_frac for t in traces]) * 100  # HBM hit rate %
+
+# Smoothed TTFT for readability (rolling window)
+window = 15
+def smooth(arr, w):
+    kernel = np.ones(w) / w
+    return np.convolve(arr, kernel, mode="same")
+
+baseline_smooth = smooth(baseline_ms, window)
+tiered_smooth = smooth(tiered_ms, window)
+hit_smooth = smooth(hit_frac, window)
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
+                                gridspec_kw={"height_ratios": [2.2, 1]})
+
+# --- Top panel: TTFT over time ---
+ax1.fill_between(req_idx, baseline_smooth, tiered_smooth,
+                 alpha=0.15, color=ACCENT4, zorder=1, label="_nolegend_")
+ax1.plot(req_idx, baseline_smooth, linewidth=2.0, color=ACCENT4,
+         label="Baseline TTFT (recompute on miss)", zorder=3)
+ax1.plot(req_idx, tiered_smooth, linewidth=2.0, color=ACCENT1,
+         label="Tiered TTFT (PCIe reload on miss)", zorder=3)
+
+# Phase shading (approximate: ramp-up ~first 16 requests, drain starts ~680)
+n = len(req_idx)
+ramp_end = min(16, n)
+drain_start = int(n * 0.87)
+ax1.axvspan(0, ramp_end, alpha=0.06, color=ACCENT2, zorder=0)
+ax1.axvspan(ramp_end, drain_start, alpha=0.06, color=ACCENT4, zorder=0)
+ax1.axvspan(drain_start, n, alpha=0.06, color=ACCENT6, zorder=0)
+
+ax1.text(ramp_end / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
+         "Ramp", ha="center", fontsize=9, color=ACCENT2, fontweight="bold", va="top")
+ax1.text((ramp_end + drain_start) / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
+         "Sustained Thrashing", ha="center", fontsize=9, color=ACCENT4,
+         fontweight="bold", va="top")
+ax1.text((drain_start + n) / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
+         "Drain", ha="center", fontsize=9, color=ACCENT6, fontweight="bold", va="top")
+
+# Annotate the gap
+mid = (ramp_end + drain_start) // 2
+gap_y_base = baseline_smooth[mid]
+gap_y_tier = tiered_smooth[mid]
+ax1.annotate("", xy=(mid, gap_y_tier), xytext=(mid, gap_y_base),
+             arrowprops=dict(arrowstyle="<->", color=ACCENT5, lw=2))
+savings_at_mid = (1 - gap_y_tier / gap_y_base) * 100 if gap_y_base > 0 else 0
+ax1.text(mid + 15, (gap_y_base + gap_y_tier) / 2,
+         f"{savings_at_mid:.0f}% saved\n(IO replaces\ncompute)",
+         fontsize=9, fontweight="bold", color=ACCENT5, va="center",
+         bbox=dict(boxstyle="round,pad=0.3", facecolor="#F5F0FF",
+                   edgecolor=ACCENT5, linewidth=0.8, alpha=0.9))
+
+ax1.set_ylabel("Per-request TTFT (ms)", fontsize=12)
+ax1.legend(fontsize=10, loc="upper left")
+ax1.set_title("TTFT Over Time: Thrashing Inflates Latency, PCIe Reload Recovers It\n"
+              "(8 concurrent sessions, 400-block HBM, A100 + Llama-2-7B)",
+              fontsize=13, fontweight="bold", pad=10)
+
+# --- Bottom panel: HBM hit rate ---
+ax2.fill_between(req_idx, 0, hit_smooth, alpha=0.2, color=ACCENT2, zorder=1)
+ax2.plot(req_idx, hit_smooth, linewidth=2.0, color=ACCENT2,
+         label="HBM token hit rate (%)", zorder=3)
+
+# Phase shading (same)
+ax2.axvspan(0, ramp_end, alpha=0.06, color=ACCENT2, zorder=0)
+ax2.axvspan(ramp_end, drain_start, alpha=0.06, color=ACCENT4, zorder=0)
+ax2.axvspan(drain_start, n, alpha=0.06, color=ACCENT6, zorder=0)
+
+ax2.set_xlabel("Request index (time \u2192)", fontsize=12)
+ax2.set_ylabel("HBM hit rate (%)", fontsize=12)
+ax2.set_ylim(0, 100)
+ax2.legend(fontsize=10, loc="upper right")
+
+plt.tight_layout()
+save(fig, "fig16_ttft_over_time.png")
+
 print(f"\nAll figures saved to {OUT}/")
 print("Done!")
