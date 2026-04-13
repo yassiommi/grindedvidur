@@ -871,5 +871,97 @@ ax.legend(fontsize=11, loc="lower right")
 plt.tight_layout()
 save(fig, "fig14_thrashing_phases.png")
 
+# ================================================================
+# FIGURE 15: PCIe KV Reload — Tiered cache turns thrashing into IO
+# ================================================================
+# Data from experiments/experiment_pcie_kv_reload.py (Section 12 of THRASHING_REPORT.md)
+# When KV is evicted from HBM, reload from host DRAM over PCIe instead of recomputing.
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+# --- Left panel: Tier-2 bandwidth sweep ---
+# Shows how savings scale with IO bandwidth — the pure IO perspective
+bw_labels = ["NVMe SSD\n(7 GB/s)", "PCIe Gen3\n(16 GB/s)", "PCIe Gen4\n(31.5 GB/s)",
+             "PCIe Gen5\n(64 GB/s)", "CXL\n(128 GB/s)"]
+bw_savings = [-14, 40, 60, 71, 76]  # % compute saved
+bw_ms_tok = [0.094, 0.041, 0.021, 0.010, 0.005]  # ms per token to reload
+prefill_ms_tok = 0.080  # recompute cost (A100 + 7B)
+
+bw_colors = [ACCENT4 if s < 0 else ACCENT2 for s in bw_savings]
+x_bw = np.arange(len(bw_labels))
+bars1 = ax1.bar(x_bw, bw_savings, color=bw_colors, width=0.55, edgecolor="white",
+                linewidth=1.5, alpha=0.85, zorder=3)
+
+# Reference line at 0
+ax1.axhline(0, color=TEXT_CLR, linestyle="-", linewidth=1.0, zorder=2)
+
+# Value labels
+for i, (bar, sav, ms) in enumerate(zip(bars1, bw_savings, bw_ms_tok)):
+    h = bar.get_height()
+    va = "bottom" if h >= 0 else "top"
+    y_off = 2.5 if h >= 0 else -2.5
+    color = ACCENT4 if sav < 0 else ACCENT2
+    ax1.text(bar.get_x() + bar.get_width()/2, h + y_off,
+             f"{sav:+d}%", ha="center", va=va, fontsize=11,
+             fontweight="bold", color=color)
+    # Show ms/tok below x-axis
+    ratio_vs_recompute = prefill_ms_tok / ms
+    ratio_label = f"{ratio_vs_recompute:.1f}\u00d7" if ratio_vs_recompute >= 1.0 else f"{ratio_vs_recompute:.1f}\u00d7"
+    ax1.text(bar.get_x() + bar.get_width()/2, -22,
+             f"{ms:.3f} ms/tok\n({ratio_label} vs recompute)",
+             ha="center", va="top", fontsize=7.5, color=GRAY)
+
+# Annotate the NVMe bar
+ax1.annotate("Disk reload is\nslower than\nrecomputing",
+             xy=(0, -14), xytext=(1.2, -30),
+             fontsize=9, color=ACCENT4, fontstyle="italic",
+             arrowprops=dict(arrowstyle="->", color=ACCENT4, lw=1.5),
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF5F5",
+                       edgecolor=ACCENT4, linewidth=0.8, alpha=0.9))
+
+ax1.set_xticks(x_bw)
+ax1.set_xticklabels(bw_labels, fontsize=8.5)
+ax1.set_ylabel("Prefill compute saved (%)")
+ax1.set_title("Tier-2 Bandwidth Determines Savings\n(A100 + Llama-2-7B, 8 concurrent, 400-block HBM)",
+              fontweight="bold")
+ax1.set_ylim(-40, 90)
+ax1.grid(axis="x", visible=False)
+
+# --- Right panel: Hardware × model comparison ---
+# Shows that bigger models with GQA get massive wins (IO footprint story)
+hw_labels = ["A100\nLlama-2-7B", "H100\nLlama-2-7B", "A100\nLlama-2-70B\n(GQA)"]
+hw_savings = [60.2, 51.4, 80.1]
+hw_speedups = [3.8, 2.7, 61.5]
+hw_colors = [ACCENT3, ACCENT1, ACCENT5]
+
+x_hw = np.arange(len(hw_labels))
+bars2 = ax2.bar(x_hw, hw_savings, color=hw_colors, width=0.5, edgecolor="white",
+                linewidth=1.5, alpha=0.85, zorder=3)
+
+for i, (bar, sav, spd) in enumerate(zip(bars2, hw_savings, hw_speedups)):
+    h = bar.get_height()
+    ax2.text(bar.get_x() + bar.get_width()/2, h + 1.5,
+             f"{sav:.0f}%\n({spd:.0f}\u00d7 cheaper)", ha="center", va="bottom",
+             fontsize=10, fontweight="bold", color=hw_colors[i])
+
+ax2.set_xticks(x_hw)
+ax2.set_xticklabels(hw_labels, fontsize=9)
+ax2.set_ylabel("Prefill compute saved (%)")
+ax2.set_title("Savings by Hardware \u00d7 Model Size\n(PCIe reload vs recompute, 8 conc, 400-block HBM)",
+              fontweight="bold")
+ax2.set_ylim(0, 100)
+ax2.grid(axis="x", visible=False)
+
+# Annotation for 70B
+ax2.annotate("GQA shrinks KV 8\u00d7\nbut prefill stays expensive\n\u2192 reload wins by 61\u00d7",
+             xy=(2, 80), xytext=(1.0, 55),
+             fontsize=9, color=ACCENT5, fontstyle="italic",
+             arrowprops=dict(arrowstyle="->", color=ACCENT5, lw=1.5),
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="#F5F0FF",
+                       edgecolor=ACCENT5, linewidth=0.8, alpha=0.9))
+
+plt.tight_layout()
+save(fig, "fig15_pcie_kv_reload.png")
+
 print(f"\nAll figures saved to {OUT}/")
 print("Done!")

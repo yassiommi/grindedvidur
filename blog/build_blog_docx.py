@@ -590,6 +590,51 @@ para(
     "reaches 11.55\u00d7, wasting 91% of compute."
 )
 
+heading("What If You Load Instead of Recompute?", 2)
+para(
+    "The numbers above assume the standard recovery strategy: when a cache miss occurs, the "
+    "server recomputes the evicted KV entries via prefill. But there is an alternative \u2014 "
+    "keep evicted KV in host DRAM as a second-tier cache, and reload it over PCIe when needed. "
+    "This converts the miss penalty from a compute cost to an IO cost."
+)
+para(
+    "We ran the same agentic workload through a two-tier cache: a small HBM tier (same as "
+    "before) backed by a host DRAM tier at 10\u00d7 the HBM capacity. On each request, tokens "
+    "found in HBM are free; tokens evicted from HBM but still in DRAM are reloaded over PCIe "
+    "(0.021 ms/token on A100, PCIe Gen4); only tokens missing from both tiers trigger a full "
+    "prefill recompute (0.080 ms/token)."
+)
+img("fig15_pcie_kv_reload.png")
+caption("Figure 13: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
+        "(reload costs more than recompute); PCIe Gen4 recovers 60% of wasted compute; CXL "
+        "reaches 76%. Right \u2014 70B with GQA achieves 80% savings because prefill is expensive "
+        "but GQA\u2019s 8\u00d7 smaller KV makes PCIe reload 61\u00d7 cheaper than recomputing.")
+spacer()
+
+para(
+    "In the worst thrashing configuration (8 concurrent, 400-block HBM), the DRAM tier "
+    "catches 62.6% of tokens that would have been recomputed. Total prefill compute drops "
+    "from 71.9 s to 28.6 s \u2014 a 60% reduction in wasted compute. The average per-request "
+    "cost falls from 92.2 ms to 36.7 ms."
+)
+para(
+    "Two findings are striking from an IO perspective. First, bandwidth determines everything: "
+    "NVMe (7 GB/s) is actually 14% worse than recomputing because disk reload (0.094 ms/token) "
+    "costs more than prefill (0.080 ms/token). PCIe Gen3 is the minimum viable tier-2. "
+    "Second, the DRAM tier needs only ~2\u00d7 HBM capacity \u2014 beyond that, additional "
+    "host memory is unused because the LRU eviction horizon matches the block-reuse horizon."
+)
+para(
+    "For larger models the IO calculus shifts dramatically. Llama-2-70B with GQA has "
+    "8\u00d7 smaller KV per token than 7B (320 KB vs 512 KB, thanks to grouped queries) "
+    "but 10\u00d7 more expensive prefill. The reload-vs-recompute ratio jumps to 61\u00d7, "
+    "recovering 80% of thrashing waste. This is the IO perspective in full: the same "
+    "KV compression that reduces the IO wall during normal decode also enables IO-based "
+    "recovery from cache failures. The architecture\u2019s IO footprint determines not just "
+    "steady-state performance but also resilience to capacity failures."
+)
+spacer()
+
 heading("Utilization Masks the Problem", 2)
 para(
     "The most operationally dangerous finding: during severe thrashing (12 concurrent, 400 blocks), "
@@ -600,7 +645,7 @@ para(
 
 heading("Heterogeneous Agents Make It Worse", 2)
 img("fig07_utilization_lies_hetero.png")
-caption("Figure 13: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
+caption("Figure 14: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
         "Right \u2014 Agent mix at 800 blocks: short+long (21%) is worse than all-medium (56%).")
 spacer()
 
@@ -624,7 +669,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("9. The Full Compression Stack", 1)
 img("fig10_full_compression_stack.png")
-caption("Figure 14: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
+caption("Figure 15: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
         "Prefix Cache (1.9 GB effective at 1M context). The H100 80 GB line shows the "
         "single-GPU feasibility boundary.")
 spacer()
@@ -677,7 +722,13 @@ para(
     bold=False
 )
 para(
-    "6. Faster GPUs widen the IO gap. "
+    "6. PCIe KV reload recovers 60% of thrashing waste by converting misses from compute to IO. "
+    "A host DRAM tier (just 2\u00d7 HBM capacity) turns the binary cliff into a softer slope. "
+    "For 70B GQA models, reload is 61\u00d7 cheaper than recompute, recovering 80% of waste.",
+    bold=False
+)
+para(
+    "7. Faster GPUs widen the IO gap. "
     "H100\u2019s 3.2\u00d7 compute improvement outpaces its 2\u00d7 bandwidth improvement. "
     "Each GPU generation makes KV IO relatively more of the bottleneck.",
     bold=False
