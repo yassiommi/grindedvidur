@@ -643,6 +643,17 @@ caption("Figure 14: Top \u2014 Per-request TTFT over time for the 8-concurrent /
         "HBM hit rate mirrors the TTFT curves: thrashing collapses hit rate, inflating "
         "latency; the DRAM tier absorbs most of the damage via IO instead of compute.")
 spacer()
+para(
+    "A subtlety worth flagging: the experiment sums PCIe reload time and remaining-recompute "
+    "time sequentially, which overstates the blue\u2013green gap. In a realistic prefill, the "
+    "PCIe DMA for evicted KV can overlap with the GPU compute for the tokens that actually "
+    "need recomputing \u2014 the same overlap principle as the GPU-initiated KV prefetching "
+    "from Section 3. Under that accounting the tiered TTFT becomes max(IO, compute) rather "
+    "than their sum, shrinking the gap to oracle from ~25 ms to ~2 ms. In other words: the "
+    "PCIe transfer cost is small enough to hide behind compute the request was already "
+    "going to do. The blue line in Figure 14 is a conservative upper bound; the true tiered "
+    "TTFT sits almost on top of the green oracle line."
+)
 
 heading("Utilization Masks the Problem", 2)
 para(
