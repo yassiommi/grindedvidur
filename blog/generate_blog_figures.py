@@ -981,9 +981,21 @@ traces = simulate_pcie_reload(
     hw=DEFAULT_HW,
 )
 
+# Also run with an effectively unlimited cache (oracle baseline — no evictions).
+# This gives the theoretical minimum TTFT: every reusable token is free.
+unlimited_traces = simulate_pcie_reload(
+    concurrent_sessions=8,
+    hbm_cache_blocks=500_000,   # never evicts
+    dram_cache_blocks=500_000,  # irrelevant when HBM is unlimited
+    hw=DEFAULT_HW,
+)
+
 req_idx = np.array([t.request_idx for t in traces])
 baseline_ms = np.array([t.baseline_cost_ms for t in traces])
 tiered_ms = np.array([t.tiered_cost_ms for t in traces])
+# With an unlimited cache, no tokens are evicted, so baseline == tiered and equals
+# the per-request cost of just computing the genuinely-new tokens.
+unlimited_ms = np.array([t.baseline_cost_ms for t in unlimited_traces])
 hit_frac = np.array([t.hbm_hit_frac for t in traces]) * 100  # HBM hit rate %
 
 # Smoothed TTFT for readability (rolling window)
@@ -994,18 +1006,26 @@ def smooth(arr, w):
 
 baseline_smooth = smooth(baseline_ms, window)
 tiered_smooth = smooth(tiered_ms, window)
+unlimited_smooth = smooth(unlimited_ms, window)
 hit_smooth = smooth(hit_frac, window)
 
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
                                 gridspec_kw={"height_ratios": [2.2, 1]})
 
 # --- Top panel: TTFT over time ---
+# Shade the thrashing gap (baseline vs tiered) and the tiered-vs-oracle residual
 ax1.fill_between(req_idx, baseline_smooth, tiered_smooth,
-                 alpha=0.15, color=ACCENT4, zorder=1, label="_nolegend_")
+                 alpha=0.13, color=ACCENT4, zorder=1, label="_nolegend_")
+ax1.fill_between(req_idx, tiered_smooth, unlimited_smooth,
+                 alpha=0.13, color=ACCENT1, zorder=1, label="_nolegend_")
+
 ax1.plot(req_idx, baseline_smooth, linewidth=2.0, color=ACCENT4,
          label="Baseline TTFT (recompute on miss)", zorder=3)
 ax1.plot(req_idx, tiered_smooth, linewidth=2.0, color=ACCENT1,
          label="Tiered TTFT (PCIe reload on miss)", zorder=3)
+ax1.plot(req_idx, unlimited_smooth, linewidth=2.0, color=ACCENT2,
+         linestyle="--",
+         label="Unlimited cache (oracle, no evictions)", zorder=3)
 
 # Phase shading (approximate: ramp-up ~first 16 requests, drain starts ~680)
 n = len(req_idx)

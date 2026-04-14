@@ -635,11 +635,13 @@ para(
 )
 img("fig16_ttft_over_time.png")
 caption("Figure 14: Top \u2014 Per-request TTFT over time for the 8-concurrent / 400-block "
-        "configuration. Baseline (recompute, red) tracks the thrashing phases exactly: TTFT "
-        "inflates to ~120 ms during sustained thrashing and recovers during drain. "
-        "Tiered (PCIe reload, blue) stays at ~40 ms throughout, saving ~61% of latency. "
-        "Bottom \u2014 HBM hit rate mirrors the TTFT curves: thrashing collapses hit rate, "
-        "inflating latency; the DRAM tier absorbs the damage via IO instead of compute.")
+        "configuration, under three cache conditions. Baseline (recompute, red) inflates to "
+        "~120 ms during sustained thrashing and recovers during drain. Tiered (PCIe reload, "
+        "blue) stays at ~40 ms, saving ~61% of latency. The oracle unlimited-cache line "
+        "(dashed green) sits at ~15 ms \u2014 the theoretical floor. The red band shows what "
+        "PCIe reload reclaims; the blue band shows the irreducible residual. Bottom \u2014 "
+        "HBM hit rate mirrors the TTFT curves: thrashing collapses hit rate, inflating "
+        "latency; the DRAM tier absorbs most of the damage via IO instead of compute.")
 spacer()
 
 heading("Utilization Masks the Problem", 2)
