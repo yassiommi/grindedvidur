@@ -602,7 +602,10 @@ para(
     "before) backed by a host DRAM tier at 10\u00d7 the HBM capacity. On each request, tokens "
     "found in HBM are free; tokens evicted from HBM but still in DRAM are reloaded over PCIe "
     "(0.021 ms/token on A100, PCIe Gen4); only tokens missing from both tiers trigger a full "
-    "prefill recompute (0.080 ms/token)."
+    "prefill recompute (0.080 ms/token). Crucially, the PCIe DMA for the reloaded range can "
+    "run concurrently with the prefill kernel that computes the residual tokens \u2014 the "
+    "same GPU-initiated overlap principle from Section 3, applied to the miss-recovery path. "
+    "The reported tiered cost is the wall-clock max(IO, compute), not the sum."
 )
 img("fig15_pcie_kv_reload.png")
 caption("Figure 13: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
@@ -613,9 +616,10 @@ spacer()
 
 para(
     "In the worst thrashing configuration (8 concurrent, 400-block HBM), the DRAM tier "
-    "catches 62.6% of tokens that would have been recomputed. Total prefill compute drops "
-    "from 71.9 s to 28.6 s \u2014 a 60% reduction in wasted compute. The average per-request "
-    "cost falls from 92.2 ms to 36.7 ms."
+    "catches 62.6% of tokens that would have been recomputed. With the PCIe DMA overlapped "
+    "against the residual recompute, total prefill wall-time drops from 71.9 s to 19.4 s \u2014 "
+    "a 73% reduction. The average per-request TTFT falls from 92.2 ms to 24.8 ms, within "
+    "~8 ms of the unlimited-cache oracle (~17 ms)."
 )
 para(
     "Two findings are striking from an IO perspective. First, bandwidth determines everything: "
@@ -635,25 +639,18 @@ para(
 )
 img("fig16_ttft_over_time.png")
 caption("Figure 14: Top \u2014 Per-request TTFT over time for the 8-concurrent / 400-block "
-        "configuration, under three cache conditions. Baseline (recompute, red) inflates to "
-        "~120 ms during sustained thrashing and recovers during drain. Tiered (PCIe reload, "
-        "blue) stays at ~40 ms, saving ~61% of latency. The oracle unlimited-cache line "
-        "(dashed green) sits at ~15 ms \u2014 the theoretical floor. The red band shows what "
-        "PCIe reload reclaims; the blue band shows the irreducible residual. Bottom \u2014 "
-        "HBM hit rate mirrors the TTFT curves: thrashing collapses hit rate, inflating "
-        "latency; the DRAM tier absorbs most of the damage via IO instead of compute.")
+        "configuration, under three cache conditions, with PCIe reload overlapped against "
+        "residual recompute (wall-clock = max(IO, compute)). Baseline (recompute, red) "
+        "inflates to ~120 ms during sustained thrashing. Tiered (blue) stays at ~25 ms. "
+        "The oracle unlimited-cache line (dashed green) sits at ~17 ms \u2014 the "
+        "theoretical floor. The red band is the full cost of thrashing above the floor; "
+        "the blue band is the residual above the floor after PCIe reload + overlap. "
+        "What the two bands show: thrashing inflates TTFT by ~100 ms above oracle; "
+        "tiered reload collapses that to ~8 ms \u2014 IO replaces compute, and overlap "
+        "hides the IO behind the compute that remains. Bottom \u2014 HBM hit rate mirrors "
+        "the TTFT curves: thrashing collapses hit rate; the DRAM tier absorbs the damage "
+        "via IO instead of compute.")
 spacer()
-para(
-    "A subtlety worth flagging: the experiment sums PCIe reload time and remaining-recompute "
-    "time sequentially, which overstates the blue\u2013green gap. In a realistic prefill, the "
-    "PCIe DMA for evicted KV can overlap with the GPU compute for the tokens that actually "
-    "need recomputing \u2014 the same overlap principle as the GPU-initiated KV prefetching "
-    "from Section 3. Under that accounting the tiered TTFT becomes max(IO, compute) rather "
-    "than their sum, shrinking the gap to oracle from ~25 ms to ~2 ms. In other words: the "
-    "PCIe transfer cost is small enough to hide behind compute the request was already "
-    "going to do. The blue line in Figure 14 is a conservative upper bound; the true tiered "
-    "TTFT sits almost on top of the green oracle line."
-)
 
 heading("Utilization Masks the Problem", 2)
 para(
@@ -742,9 +739,11 @@ para(
     bold=False
 )
 para(
-    "6. PCIe KV reload recovers 60% of thrashing waste by converting misses from compute to IO. "
-    "A host DRAM tier (just 2\u00d7 HBM capacity) turns the binary cliff into a softer slope. "
-    "For 70B GQA models, reload is 61\u00d7 cheaper than recompute, recovering 80% of waste.",
+    "6. PCIe KV reload recovers 73% of thrashing waste by converting misses from compute to IO "
+    "and overlapping the PCIe DMA with the residual recompute kernel. A host DRAM tier "
+    "(just 2\u00d7 HBM capacity) turns the binary cliff into a soft shoulder \u2014 tiered "
+    "TTFT lands within ~8 ms of the oracle floor. For 70B GQA models, reload is 61\u00d7 "
+    "cheaper than recompute, recovering 80% of waste.",
     bold=False
 )
 para(

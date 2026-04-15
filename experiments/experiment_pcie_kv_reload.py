@@ -173,13 +173,15 @@ class PCIeReloadTrace:
 
     # Cost comparison (ms)
     baseline_cost_ms: float       # recompute all non-HBM-cached tokens
-    tiered_cost_ms: float         # PCIe reload + recompute remainder
+    tiered_cost_ms: float         # PCIe reload + recompute remainder (sequential)
+    tiered_cost_overlap_ms: float # max(PCIe reload, recompute remainder) — IO/compute overlap
     savings_ms: float
     savings_pct: float
 
     # Cumulative
     cum_baseline_ms: float
     cum_tiered_ms: float
+    cum_tiered_overlap_ms: float
     cum_savings_ms: float
     cum_savings_pct: float
 
@@ -318,6 +320,7 @@ def simulate_pcie_reload(
     traces: List[PCIeReloadTrace] = []
     cum_baseline = 0.0
     cum_tiered = 0.0
+    cum_tiered_overlap = 0.0
 
     prefill_cost = hw.prefill_ms_per_token
     pcie_cost = hw.pcie_ms_per_token
@@ -341,15 +344,25 @@ def simulate_pcie_reload(
         baseline_recompute = total_tokens - hbm_cached
         baseline_cost = baseline_recompute * prefill_cost
 
-        # Tiered: PCIe-load the DRAM-only portion, recompute the rest.
-        tiered_cost = (pcie_reload_tokens * pcie_cost
-                       + recompute_tokens * prefill_cost)
+        # Tiered (sequential): PCIe-load the DRAM-only portion, then recompute.
+        pcie_time = pcie_reload_tokens * pcie_cost
+        recompute_time = recompute_tokens * prefill_cost
+        tiered_cost = pcie_time + recompute_time
+
+        # Tiered (overlap-aware): the PCIe DMA and the recompute kernel run
+        # concurrently — the prefill layer can stream in KV for the reloaded
+        # range while computing new tokens — so the wall-clock cost is the
+        # larger of the two, not their sum. This mirrors the GPU-initiated
+        # KV prefetch mechanism (overlap the next layer's load with the
+        # current layer's compute) applied to the miss-recovery path.
+        tiered_cost_overlap = max(pcie_time, recompute_time)
 
         savings = baseline_cost - tiered_cost
         savings_pct = (savings / baseline_cost * 100) if baseline_cost > 0 else 0.0
 
         cum_baseline += baseline_cost
         cum_tiered += tiered_cost
+        cum_tiered_overlap += tiered_cost_overlap
         cum_savings = cum_baseline - cum_tiered
         cum_savings_pct = (cum_savings / cum_baseline * 100
                            if cum_baseline > 0 else 0.0)
@@ -388,10 +401,12 @@ def simulate_pcie_reload(
             recompute_tokens=recompute_tokens,
             baseline_cost_ms=baseline_cost,
             tiered_cost_ms=tiered_cost,
+            tiered_cost_overlap_ms=tiered_cost_overlap,
             savings_ms=savings,
             savings_pct=savings_pct,
             cum_baseline_ms=cum_baseline,
             cum_tiered_ms=cum_tiered,
+            cum_tiered_overlap_ms=cum_tiered_overlap,
             cum_savings_ms=cum_savings,
             cum_savings_pct=cum_savings_pct,
             hbm_hit_frac=hbm_frac,
@@ -421,10 +436,13 @@ class TierSummary:
     recompute_tokens: int
     baseline_total_ms: float
     tiered_total_ms: float
+    tiered_overlap_total_ms: float
     savings_total_ms: float
     savings_pct: float
+    savings_overlap_pct: float
     avg_baseline_ms_per_req: float
     avg_tiered_ms_per_req: float
+    avg_tiered_overlap_ms_per_req: float
 
     @property
     def hbm_hit_frac(self) -> float:
@@ -442,15 +460,18 @@ class TierSummary:
 def summarize(traces: List[PCIeReloadTrace]) -> TierSummary:
     n = len(traces)
     if n == 0:
-        return TierSummary(0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return TierSummary(0, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     total_tokens = sum(t.num_prefill_tokens for t in traces)
     hbm_tok = sum(t.hbm_cached_tokens for t in traces)
     pcie_tok = sum(t.pcie_reload_tokens for t in traces)
     reco_tok = sum(t.recompute_tokens for t in traces)
     base_total = traces[-1].cum_baseline_ms
     tier_total = traces[-1].cum_tiered_ms
+    tier_overlap_total = traces[-1].cum_tiered_overlap_ms
     savings = base_total - tier_total
     pct = (savings / base_total * 100) if base_total > 0 else 0.0
+    overlap_savings = base_total - tier_overlap_total
+    overlap_pct = (overlap_savings / base_total * 100) if base_total > 0 else 0.0
     return TierSummary(
         num_requests=n,
         total_tokens=total_tokens,
@@ -459,10 +480,13 @@ def summarize(traces: List[PCIeReloadTrace]) -> TierSummary:
         recompute_tokens=reco_tok,
         baseline_total_ms=base_total,
         tiered_total_ms=tier_total,
+        tiered_overlap_total_ms=tier_overlap_total,
         savings_total_ms=savings,
         savings_pct=pct,
+        savings_overlap_pct=overlap_pct,
         avg_baseline_ms_per_req=base_total / n,
         avg_tiered_ms_per_req=tier_total / n,
+        avg_tiered_overlap_ms_per_req=tier_overlap_total / n,
     )
 
 
@@ -762,9 +786,11 @@ def print_tier_summary(summary: TierSummary, label: str) -> None:
     print(f"    Baseline : {summary.baseline_total_ms:>10,.1f} ms "
           f"({summary.avg_baseline_ms_per_req:6.2f} ms/req)")
     print(f"    Tiered   : {summary.tiered_total_ms:>10,.1f} ms "
-          f"({summary.avg_tiered_ms_per_req:6.2f} ms/req)")
+          f"({summary.avg_tiered_ms_per_req:6.2f} ms/req)  [sequential]")
+    print(f"    Tiered-O : {summary.tiered_overlap_total_ms:>10,.1f} ms "
+          f"({summary.avg_tiered_overlap_ms_per_req:6.2f} ms/req)  [IO/compute overlap]")
     print(f"    Savings  : {summary.savings_total_ms:>10,.1f} ms "
-          f"({summary.savings_pct:5.1f}%)")
+          f"({summary.savings_pct:5.1f}%)  / overlap: {summary.savings_overlap_pct:5.1f}%")
 
 
 def print_hardware_info(hw: HardwareConfig) -> None:
@@ -803,10 +829,13 @@ def dump_results_json(
             "miss_frac": summary.miss_frac,
             "baseline_total_ms": summary.baseline_total_ms,
             "tiered_total_ms": summary.tiered_total_ms,
+            "tiered_overlap_total_ms": summary.tiered_overlap_total_ms,
             "savings_total_ms": summary.savings_total_ms,
             "savings_pct": summary.savings_pct,
+            "savings_overlap_pct": summary.savings_overlap_pct,
             "avg_baseline_ms_per_req": summary.avg_baseline_ms_per_req,
             "avg_tiered_ms_per_req": summary.avg_tiered_ms_per_req,
+            "avg_tiered_overlap_ms_per_req": summary.avg_tiered_overlap_ms_per_req,
         }
 
     data = {

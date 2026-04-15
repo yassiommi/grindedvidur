@@ -992,7 +992,11 @@ unlimited_traces = simulate_pcie_reload(
 
 req_idx = np.array([t.request_idx for t in traces])
 baseline_ms = np.array([t.baseline_cost_ms for t in traces])
-tiered_ms = np.array([t.tiered_cost_ms for t in traces])
+# Use the overlap-aware tiered cost: PCIe DMA runs concurrently with the
+# recompute kernel, so wall-clock = max(IO, compute) rather than their sum.
+# This mirrors the GPU-initiated KV prefetch mechanism (Section 3) applied
+# to the miss-recovery path.
+tiered_ms = np.array([t.tiered_cost_overlap_ms for t in traces])
 # With an unlimited cache, no tokens are evicted, so baseline == tiered and equals
 # the per-request cost of just computing the genuinely-new tokens.
 unlimited_ms = np.array([t.baseline_cost_ms for t in unlimited_traces])
@@ -1013,16 +1017,19 @@ fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
                                 gridspec_kw={"height_ratios": [2.2, 1]})
 
 # --- Top panel: TTFT over time ---
-# Shade the thrashing gap (baseline vs tiered) and the tiered-vs-oracle residual
-ax1.fill_between(req_idx, baseline_smooth, tiered_smooth,
+# Two bands, both anchored at the oracle floor:
+#   • red  : baseline − oracle (total cost of thrashing)
+#   • blue : tiered  − oracle (residual cost after PCIe reload + overlap)
+# The baseline-vs-tiered gap is implied by the two bands and not drawn.
+ax1.fill_between(req_idx, unlimited_smooth, baseline_smooth,
                  alpha=0.13, color=ACCENT4, zorder=1, label="_nolegend_")
-ax1.fill_between(req_idx, tiered_smooth, unlimited_smooth,
-                 alpha=0.13, color=ACCENT1, zorder=1, label="_nolegend_")
+ax1.fill_between(req_idx, unlimited_smooth, tiered_smooth,
+                 alpha=0.22, color=ACCENT1, zorder=2, label="_nolegend_")
 
 ax1.plot(req_idx, baseline_smooth, linewidth=2.0, color=ACCENT4,
          label="Baseline TTFT (recompute on miss)", zorder=3)
 ax1.plot(req_idx, tiered_smooth, linewidth=2.0, color=ACCENT1,
-         label="Tiered TTFT (PCIe reload on miss)", zorder=3)
+         label="Tiered TTFT (PCIe reload + IO/compute overlap)", zorder=3)
 ax1.plot(req_idx, unlimited_smooth, linewidth=2.0, color=ACCENT2,
          linestyle="--",
          label="Unlimited cache (oracle, no evictions)", zorder=3)
@@ -1043,18 +1050,35 @@ ax1.text((ramp_end + drain_start) / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 
 ax1.text((drain_start + n) / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
          "Drain", ha="center", fontsize=9, color=ACCENT6, fontweight="bold", va="top")
 
-# Annotate the gap
+# Annotate: baseline-to-oracle (total thrashing cost)
+# and tiered-to-oracle (residual after IO/compute overlap)
 mid = (ramp_end + drain_start) // 2
 gap_y_base = baseline_smooth[mid]
 gap_y_tier = tiered_smooth[mid]
-ax1.annotate("", xy=(mid, gap_y_tier), xytext=(mid, gap_y_base),
-             arrowprops=dict(arrowstyle="<->", color=ACCENT5, lw=2))
-savings_at_mid = (1 - gap_y_tier / gap_y_base) * 100 if gap_y_base > 0 else 0
-ax1.text(mid + 15, (gap_y_base + gap_y_tier) / 2,
-         f"{savings_at_mid:.0f}% saved\n(IO replaces\ncompute)",
-         fontsize=9, fontweight="bold", color=ACCENT5, va="center",
-         bbox=dict(boxstyle="round,pad=0.3", facecolor="#F5F0FF",
-                   edgecolor=ACCENT5, linewidth=0.8, alpha=0.9))
+gap_y_oracle = unlimited_smooth[mid]
+
+# Red arrow: baseline − oracle (what thrashing costs)
+ax1.annotate("", xy=(mid, gap_y_oracle), xytext=(mid, gap_y_base),
+             arrowprops=dict(arrowstyle="<->", color=ACCENT4, lw=2))
+base_to_oracle_pct = (1 - gap_y_oracle / gap_y_base) * 100 if gap_y_base > 0 else 0
+ax1.text(mid + 15, (gap_y_base + gap_y_oracle) / 2,
+         f"Thrashing cost\n{base_to_oracle_pct:.0f}% above floor",
+         fontsize=9, fontweight="bold", color=ACCENT4, va="center",
+         bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF0F0",
+                   edgecolor=ACCENT4, linewidth=0.8, alpha=0.9))
+
+# Blue arrow: tiered − oracle (residual after PCIe reload + overlap)
+mid2 = int(mid * 0.55)
+gap_y_tier2 = tiered_smooth[mid2]
+gap_y_oracle2 = unlimited_smooth[mid2]
+ax1.annotate("", xy=(mid2, gap_y_oracle2), xytext=(mid2, gap_y_tier2),
+             arrowprops=dict(arrowstyle="<->", color=ACCENT1, lw=2))
+tier_to_oracle_pct = (1 - gap_y_oracle2 / gap_y_tier2) * 100 if gap_y_tier2 > 0 else 0
+ax1.text(mid2 - 15, (gap_y_tier2 + gap_y_oracle2) / 2,
+         f"Residual\n{tier_to_oracle_pct:.0f}% above floor",
+         fontsize=9, fontweight="bold", color=ACCENT1, va="center", ha="right",
+         bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0F4FF",
+                   edgecolor=ACCENT1, linewidth=0.8, alpha=0.9))
 
 ax1.set_ylabel("Per-request TTFT (ms)", fontsize=12)
 ax1.legend(fontsize=10, loc="upper left")
