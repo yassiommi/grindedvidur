@@ -164,6 +164,32 @@ para(
     "a tour of what this flexibility enables."
 )
 
+heading("Roadmap", 2)
+para(
+    "The rest of the post walks the KV cache problem end-to-end, each section answering one "
+    "question the simulator lets us ask cheaply:"
+)
+para("\u2022  \u00a7 2. Establishing the IO Wall \u2014 decompose decode latency per layer "
+     "and show KV load, not compute, is what stalls the GPU.")
+para("\u2022  \u00a7 3. The Compression Ladder: MHA \u2192 GQA \u2192 MLA \u2014 trace how "
+     "each generation of attention shrinks the per-token KV footprint, and what that does "
+     "to prefill-decode disaggregation.")
+para("\u2022  \u00a7 4. DeepSeek Sparse Attention \u2014 push compression past the representation "
+     "layer into the access pattern itself: not every token needs to be read every step.")
+para("\u2022  \u00a7 5. Engram: Conditional Memory \u2014 make the KV cache content-addressable so "
+     "decode IO becomes O(1) in context length instead of O(n).")
+para("\u2022  \u00a7 6. TurboQuant \u2014 simulate 3-bit KV quantization across every architecture "
+     "in one sweep, and cross-validate against Google\u2019s published numbers.")
+para("\u2022  \u00a7 7. Prefix Caching \u2014 what happens when workloads share structure and "
+     "the cache can actually hit.")
+para("\u2022  \u00a7 8. The Thrashing Cliff \u2014 what happens when they don\u2019t: a binary "
+     "collapse in agentic workloads, plus a tiered-cache experiment that converts cache "
+     "misses from compute back into IO (and hides the IO behind compute).")
+para("\u2022  \u00a7 9. The Full Compression Stack \u2014 compose every technique above and "
+     "measure how far the IO wall actually moves.")
+para("\u2022  \u00a7 10. What the Simulator Shows \u2014 the findings that fell out of running "
+     "these experiments at zero GPU cost.")
+
 spacer()
 doc.add_page_break()
 
