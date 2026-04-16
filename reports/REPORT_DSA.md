@@ -199,31 +199,83 @@ Source layout:
 Sweep BS from 1 to 256, all five seq_lens, both modes.  Compute times
 at BS > 1 use profiled data where available (num_tokens ≤ 4096) and
 analytical GEMM scaling otherwise.  MoE expert GEMM uses a grouped-GEMM
-model where unique experts scale as `32 × (1 − (31/32)^BS)`.
+model where unique active experts on the GPU scale as
+`32 × (1 − (31/32)^BS)`.
 
-Two TPOT definitions:
-- **Standard** — `layer_total × 61 / BS` (sequential per-layer, no overlap).
-- **Pipelined** — `max(compute, io) × 61 / BS` (IO of layer N overlapped
-  with compute of layer N−1 via double-buffering).
+### Two metrics — and which one answers the question
 
-### TPOT vs. batch size
+A clarification matters here, because they point in **opposite directions**:
+
+- **TPOT (per-sequence step latency)** = `layer_time × 61`. This is what each
+  user waits between successive output tokens. It **increases with BS**
+  because the batched decode step does more work (larger GEMMs, more
+  expert activations, more bytes of indexer K to read for the whole batch).
+  Per-user latency monotonically gets *worse* as BS grows in both modes.
+- **Aggregate throughput (tokens/sec)** = `BS / (TPOT/1000)`. This is the
+  system-level token rate across the whole batch. It **increases with BS**
+  until the shared bottleneck (HBM weight read or PCIe indexer K read)
+  saturates.
+
+The original framing "does BS make TPOT lines converge?" is the wrong
+question — *real TPOT diverges in both modes*. The right question is
+"does BS make offload's **throughput** catch up to HBM's?" Answer below.
+
+Both modes additionally expose a pipelined regime where layer N's IO is
+double-buffered behind layer N−1's compute, so the per-layer cost
+becomes `max(compute, io)` rather than `compute + io`.
+
+### Per-sequence TPOT vs. batch size
 
 ![TPOT vs BS](figures/dsa_tpot_vs_bs.png)
 
-Key observations from the standard (no-overlap) TPOT:
+| seq_len | mode | TPOT @ BS=1 | TPOT @ BS=8 | TPOT @ BS=64 | TPOT @ BS=256 |
+|---:|:--|---:|---:|---:|---:|
+| 4K  | hbm | 47.5 ms | 125.4 ms | 628.8 ms | 2116.3 ms |
+| 4K  | offload | 48.9 ms | 168.0 ms | 971.8 ms | 3488.3 ms |
+| 32K | hbm | 47.5 ms | 144.0 ms | 779.3 ms | 2718.3 ms |
+| 32K | offload | 66.8 ms | 311.6 ms | 2120.2 ms | 8081.7 ms |
+| 128K | hbm | 54.7 ms | 208.5 ms | 1295.3 ms | 4782.3 ms |
+| 128K | offload | 128.3 ms | 803.7 ms | 6057.4 ms | 23.8 s |
+| 1M  | hbm | 130.0 ms | 810.5 ms | 6.1 s | 24.0 s |
+| 1M  | offload | 702.5 ms | 5.4 s | 42.8 s | 170.8 s |
 
-| seq_len | BS=1 ratio | BS=256 ratio | trend |
-|---:|---:|---:|:--|
-| 4K | 1.03× | 1.65× | lines stay close — offload nearly free |
-| 32K | 1.41× | 2.97× | gap widens with BS |
-| 128K | 2.35× | 4.98× | gap widens |
-| 512K | 4.31× | 6.66× | gap widens |
-| 1M | 5.41× | 7.10× | gap widens |
+Per-user latency grows roughly linearly with BS (compute and IO both
+scale O(BS)). The offload/HBM TPOT slowdown ratio also widens with BS
+(from 5.41× to 7.10× at 1M as BS goes 1→256), because compute has more
+constant overhead per step than IO does.
 
-**The lines do NOT converge.** They actually *diverge* as BS increases.
-Why? Both IO and compute scale linearly with BS, but the IO constant is
-much larger: at 128K the indexer K read alone is `BS × 64 MB / 51.5 GB/s`,
-dwarfing the compute growth rate.
+![offload TPOT slowdown](figures/dsa_offload_gap_vs_bs.png)
+
+### Aggregate throughput vs. batch size — the right metric
+
+![throughput vs BS](figures/dsa_throughput_vs_bs.png)
+
+| seq_len | mode | tok/s @ BS=1 | tok/s @ BS=8 | tok/s @ BS=64 | tok/s @ BS=256 |
+|---:|:--|---:|---:|---:|---:|
+| 4K  | hbm | 21.0 | 63.8 | 101.8 | **121.0** |
+| 4K  | offload | 20.4 | 47.6 | 65.9 | **73.4** |
+| 32K | hbm | 21.0 | 55.6 | 82.1 | **94.2** |
+| 32K | offload | 15.0 | 25.7 | 30.2 | **31.7** (saturated) |
+| 128K | hbm | 18.3 | 38.4 | 49.4 | **53.5** |
+| 128K | offload | 7.8 | 10.0 | 10.6 | **10.7** (saturated) |
+| 512K | hbm | 11.5 | 17.2 | 19.1 | **19.6** |
+| 512K | offload | 2.7 | 2.9 | 2.9 | **2.9** (saturated) |
+| 1M  | hbm | 7.7 | 9.9 | 10.5 | **10.6** |
+| 1M  | offload | 1.4 | 1.5 | 1.5 | **1.5** (saturated) |
+
+**Key finding — throughput does *not* converge either.** At every
+seq_len the offload curve saturates well below HBM's:
+
+- 4K: offload tops out at ~73 tok/s, HBM still climbing past 121 tok/s
+- 32K and above: offload throughput saturates within 2× of its BS=1
+  value, while HBM continues scaling
+- 128K: offload locks at ~10.7 tok/s (entirely PCIe-bound on the
+  indexer K read), HBM still gaining at BS=256
+
+Offload throughput saturates because the PCIe indexer K read scales as
+`BS × seq_len × 512 B / 51.5 GB/s` and dominates the per-step time as
+soon as BS or seq_len is large enough to escape the 0.020 ms PCIe floor.
+Once IO dominates, doubling BS doubles IO time and throughput plateaus.
 
 ### IO vs. compute per layer (offload mode)
 
@@ -231,67 +283,92 @@ dwarfing the compute growth rate.
 
 | seq_len | IO > compute at BS ≥ | IO/compute ratio at BS=256 |
 |---:|---:|---:|
-| **4K** | **never** (compute always wins) | 0.69× |
-| 32K | 8 | 2.22× |
-| 128K | 1 (always IO-bound) | 4.89× |
-| 512K | 1 | 7.52× |
-| 1M | 1 | 8.30× |
+| **4K**  | **never** (compute always wins) | 0.69× |
+| 32K     | 8 | 2.22× |
+| 128K    | 1 (always IO-bound) | 4.89× |
+| 512K    | 1 | 7.52× |
+| 1M      | 1 | 8.30× |
 
 At 4K context the indexer K read is only `BS × 2 MB` — a few ms at
-BS=256 via PCIe, easily hidden behind the ~34 ms of compute.  But at
-128K the indexer read is `BS × 64 MB`; even at BS=1 this exceeds
-compute, and the gap only grows.
+BS=256 via PCIe, easily hidden behind ~34 ms of compute. At 128K the
+indexer read is `BS × 64 MB`; even at BS=1 this exceeds compute, and
+the gap only grows.
 
-### Pipelined TPOT: can double-buffering save offload?
+### Pipelined throughput: can double-buffering save offload?
 
-![Pipelined TPOT](figures/dsa_tpot_pipelined_vs_bs.png)
-![Pipelined gap](figures/dsa_pipelined_gap_vs_bs.png)
+![Pipelined throughput](figures/dsa_throughput_pipelined_vs_bs.png)
+![Pipelined TPOT slowdown](figures/dsa_pipelined_gap_vs_bs.png)
 
-With perfect inter-layer IO overlap (each layer fetches its KV while
-the previous layer's compute runs):
+Under perfect inter-layer IO overlap (each layer fetches KV while the
+previous layer's compute runs), the effective per-layer cost becomes
+`max(compute, io)`. Pipelined throughput at BS=256:
 
-| seq_len | pipelined ratio at BS=4 | pipelined offload TPOT | HBM TPOT at BS=256 |
-|---:|---:|---:|---:|
-| **4K** | **1.00×** — offload matches HBM | 8.1 ms | 8.1 ms |
-| 32K | 1.00× (but saturates at 1.27× by BS=8) | 21.8 ms | 9.8 ms |
-| 128K | 2.75× | 77.3 ms (flat) | 15.8 ms |
-| 512K | 5.75× | 299.4 ms (flat) | 39.8 ms |
-| 1M | 7.09× | 595.5 ms (flat) | 71.8 ms |
+| seq_len | mode | pipelined tok/s @ BS=256 | speedup vs. no-overlap | catches HBM? |
+|---:|:--|---:|---:|:--|
+| 4K  | hbm | 124.1 | +2.6% | — |
+| 4K  | offload | **124.1** | +69% | **yes**, exact match (BS≥8) |
+| 32K | hbm | 102.0 | +8% | — |
+| 32K | offload | 46.0 | +45% | only up to BS=4 (ratio 1.00×) |
+| 128K | hbm | 63.3 | +18% | — |
+| 128K | offload | 12.9 (flat across BS) | +20% | **no** — IO-bound |
+| 512K | hbm | 25.1 | +28% | — |
+| 512K | offload | 3.3 (flat) | +14% | **no** |
+| 1M  | hbm | 13.9 | +31% | — |
+| 1M  | offload | 1.7 (flat) | +13% | **no** |
 
-**At ≤ 4K context**: pipelining makes offload competitive with HBM at
-*every* batch size — the compute always exceeds the IO.
+**At ≤ 4K context**: with pipelining, offload throughput exactly matches
+HBM at every BS ≥ 8 (compute always exceeds IO, so the IO becomes
+"free"). This is the regime where offloading is fully competitive.
 
-**At 32K**: pipelining works for BS ≤ 4 (ratio 1.0×) but by BS = 8 the
-IO starts dominating, and the offload TPOT flatlines at 21.8 ms while
-HBM keeps improving.
+**At 32K**: pipelining matches HBM only up to BS=4. Beyond that the
+indexer-K PCIe read overtakes compute and offload throughput flatlines
+at 46 tok/s while HBM keeps climbing.
 
-**At ≥ 128K**: offload's pipelined TPOT is IO-bound and completely flat
-(77.3 ms at 128K regardless of BS) because the PCIe indexer K read
-always exceeds compute.  No amount of batching can fix a fundamentally
-bandwidth-limited transfer.
+**At ≥ 128K**: offload's pipelined throughput is **completely flat in
+BS** (12.9 tok/s at 128K, 3.3 at 512K, 1.7 at 1M). The PCIe indexer K
+read is the bottleneck and pipelining only hides the (smaller) compute
+behind it — so the throughput ceiling becomes `1000 / (61 × indexer_io_per_token_ms)`,
+which is set by `seq_len × 512 B / PCIe_bw` per sequence and is
+independent of BS. **Adding sequences just spreads the same PCIe budget
+over more users, so per-user TPOT grows linearly while throughput stays
+constant.**
 
 ### Why doesn't batching help at long context?
 
-The root cause is the `O(BS × seq_len)` scaling of the indexer K read
-over PCIe:
+The root cause is that the `O(BS × seq_len)` indexer K read over PCIe
+fundamentally outpaces compute growth:
 
 ```
 PCIe indexer time = BS × seq_len × 512 B / 51.5 GB/s
-HBM indexer time  = BS × seq_len × 512 B / 1384 GB/s
-Ratio = 1384 / 51.5 ≈ 27×
+HBM  indexer time = BS × seq_len × 512 B / 1384 GB/s
+Bandwidth ratio   = 1384 / 51.5 ≈ 27×
 ```
 
-Compute also scales O(BS) but with a *constant* that depends only on
-model dimensions, not seq_len.  So the IO/compute ratio is proportional
-to seq_len:
+Compute also scales O(BS) but with a per-token constant set by model
+dimensions, not seq_len. So the IO/compute ratio is proportional to
+seq_len:
 
-- At 4K: IO constant is small → compute dominates → offload ≈ HBM
-- At 128K: IO constant is 32× larger → IO always wins → offload stuck
+- At 4K: IO per layer is tiny → compute dominates → offload ≈ HBM
+- At 128K: IO is ~32× larger → IO always wins → offload throughput is
+  capped, regardless of how aggressively you batch or pipeline
 
-This means **DSA offloading is only viable for short-to-medium context
-(≤ 32K) with pipelining, or up to 4K without.** Beyond that, the system
-must keep the indexer K cache on HBM to maintain reasonable TPOT, even
-if the full MLA KV is offloaded. A hybrid approach — indexer K on HBM,
-MLA KV on CPU — could be the sweet spot: the indexer is only 512 B/token
-(FP8) vs. 1152 B/token for the full KV, so it occupies less than half
-the memory and removes the dominant PCIe bottleneck.
+### Bottom line
+
+Batching does **not** rescue PCIe-offloaded DSA at long context.
+
+- **TPOT** (per-user latency) gets *worse* with BS in both modes — that's
+  baked into batched decoding, not specific to offloading.
+- **Throughput** (the right metric for "does offload catch up?") only
+  converges at ≤ 4K context, and only with double-buffered pipelining.
+- For 32K context, pipelining lets offload match HBM through BS=4 then
+  saturates at half HBM's ceiling.
+- For ≥ 128K context, offload throughput is hard-capped by the PCIe
+  bandwidth used to stream indexer K. No amount of batching changes
+  that bound — adding sequences only carves up the same PCIe budget
+  among more users.
+
+A practical mitigation: keep the **indexer K cache on HBM** (only 512 B
+per token, FP8) and offload only the larger MLA KV (1152 B/token).
+This removes the dominant PCIe term and lets the gather-of-2560-tokens
+(2.88 MB/seq, constant in seq_len) run unaffected over PCIe at the
+~0.06 ms/layer floor.

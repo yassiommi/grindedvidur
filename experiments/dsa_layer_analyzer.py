@@ -436,6 +436,19 @@ def analyze_layer_bs(
     # max(compute, io) rather than compute + io.
     pipelined_layer_ms = max(compute_ms, io_ms)
 
+    # Per-sequence decode-step latency — what each user waits between
+    # successive tokens (the real TPOT). Grows with batch size because
+    # the batched step does more work.
+    step_latency_ms = layer_total_ms * NUM_LAYERS
+    pipelined_step_latency_ms = pipelined_layer_ms * NUM_LAYERS
+
+    # Aggregate system throughput in tokens/sec (across all BS sequences).
+    throughput_tok_per_s = bs / (step_latency_ms / 1000.0) if step_latency_ms > 0 else 0.0
+    pipelined_throughput_tok_per_s = (
+        bs / (pipelined_step_latency_ms / 1000.0)
+        if pipelined_step_latency_ms > 0 else 0.0
+    )
+
     return {
         "seq_len": seq_len,
         "mode": mode,
@@ -455,11 +468,20 @@ def analyze_layer_bs(
         "attention_total_ms": attention_total_ms,
         "layer_total_ms": layer_total_ms,
         "all_layers_ms": layer_total_ms * NUM_LAYERS,
-        "tpot_ms": layer_total_ms * NUM_LAYERS / bs,
+        # True per-sequence TPOT (= decode-step latency each user waits)
+        "step_latency_ms": step_latency_ms,
+        "tpot_ms": step_latency_ms,   # alias: real TPOT
+        # System throughput (tokens/sec across the batch)
+        "throughput_tok_per_s": throughput_tok_per_s,
+        # Legacy amortized metric (step_time / BS) — kept for back-compat
+        # but should be interpreted as "per-token amortized cost", not TPOT.
+        "amortized_per_token_ms": step_latency_ms / bs,
         # Pipelined (overlap IO with previous layer compute)
         "pipelined_layer_ms": pipelined_layer_ms,
-        "pipelined_all_layers_ms": pipelined_layer_ms * NUM_LAYERS,
-        "pipelined_tpot_ms": pipelined_layer_ms * NUM_LAYERS / bs,
+        "pipelined_step_latency_ms": pipelined_step_latency_ms,
+        "pipelined_tpot_ms": pipelined_step_latency_ms,    # real TPOT under pipeline
+        "pipelined_throughput_tok_per_s": pipelined_throughput_tok_per_s,
+        "pipelined_amortized_per_token_ms": pipelined_step_latency_ms / bs,
         # Expert detail
         "expert_gemm_ms": expert_gemm_ms,
     }
