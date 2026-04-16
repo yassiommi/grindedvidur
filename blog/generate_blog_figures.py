@@ -972,13 +972,18 @@ save(fig, "fig15_pcie_kv_reload.png")
 
 import sys
 sys.path.insert(0, os.path.join(REPO, "experiments"))
-from experiment_pcie_kv_reload import simulate_pcie_reload, HardwareConfig, DEFAULT_HW
+from experiment_pcie_kv_reload import simulate_pcie_reload, HardwareConfig, HW_A100_70B
+
+# Llama-2-70B with GQA on A100. KV/token = 320 KB (8× smaller than 7B MHA),
+# prefill = 0.8 ms/token (10× slower than 7B). Reload-vs-recompute ratio = 61×,
+# which maximises the "IO replaces compute" argument.
+HW = HW_A100_70B
 
 traces = simulate_pcie_reload(
     concurrent_sessions=8,
     hbm_cache_blocks=400,
     dram_cache_blocks=4000,  # 10× HBM
-    hw=DEFAULT_HW,
+    hw=HW,
 )
 
 # Also run with an effectively unlimited cache (oracle baseline — no evictions).
@@ -987,7 +992,7 @@ unlimited_traces = simulate_pcie_reload(
     concurrent_sessions=8,
     hbm_cache_blocks=500_000,   # never evicts
     dram_cache_blocks=500_000,  # irrelevant when HBM is unlimited
-    hw=DEFAULT_HW,
+    hw=HW,
 )
 
 req_idx = np.array([t.request_idx for t in traces])
@@ -1083,7 +1088,7 @@ ax1.text(mid2 - 15, (gap_y_tier2 + gap_y_oracle2) / 2,
 ax1.set_ylabel("Per-request TTFT (ms)", fontsize=12)
 ax1.legend(fontsize=10, loc="upper left")
 ax1.set_title("TTFT Over Time: Thrashing Inflates Latency, PCIe Reload Recovers It\n"
-              "(8 concurrent sessions, 400-block HBM, A100 + Llama-2-7B)",
+              "(8 concurrent sessions, 400-block HBM, A100 + Llama-2-70B GQA)",
               fontsize=13, fontweight="bold", pad=10)
 
 # --- Bottom panel: HBM hit rate ---

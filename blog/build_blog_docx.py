@@ -664,18 +664,19 @@ para(
     "steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
-caption("Figure 14: Top \u2014 Per-request TTFT over time for the 8-concurrent / 400-block "
-        "configuration, under three cache conditions, with PCIe reload overlapped against "
+caption("Figure 14: Per-request TTFT over time for the 8-concurrent / 400-block "
+        "configuration on A100 + Llama-2-70B (GQA), with PCIe reload overlapped against "
         "residual recompute (wall-clock = max(IO, compute)). Baseline (recompute, red) "
-        "inflates to ~120 ms during sustained thrashing. Tiered (blue) stays at ~25 ms. "
-        "The oracle unlimited-cache line (dashed green) sits at ~17 ms \u2014 the "
-        "theoretical floor. The red band is the full cost of thrashing above the floor; "
-        "the blue band is the residual above the floor after PCIe reload + overlap. "
-        "What the two bands show: thrashing inflates TTFT by ~100 ms above oracle; "
-        "tiered reload collapses that to ~8 ms \u2014 IO replaces compute, and overlap "
-        "hides the IO behind the compute that remains. Bottom \u2014 HBM hit rate mirrors "
-        "the TTFT curves: thrashing collapses hit rate; the DRAM tier absorbs the damage "
-        "via IO instead of compute.")
+        "inflates to ~900\u20131,200 ms during sustained thrashing. The oracle "
+        "unlimited-cache line (dashed green) sits at ~171 ms \u2014 the theoretical floor. "
+        "Tiered (blue) lands on top of the oracle: because the reload-vs-recompute ratio "
+        "is 61\u00d7 for 70B GQA, the PCIe DMA always finishes well inside the time the "
+        "GPU is already busy computing the residual miss tokens. The red band is the full "
+        "cost of thrashing above the floor (~81%); the blue band (~0%) is visually "
+        "collapsed \u2014 there is effectively no residual once the IO is hidden behind "
+        "compute. Bottom \u2014 HBM hit rate mirrors the thrashing phase. The story is "
+        "purely IO: the same GQA compression that shrinks the steady-state IO wall also "
+        "makes cache-miss recovery free.")
 spacer()
 
 heading("Utilization Masks the Problem", 2)
