@@ -665,18 +665,21 @@ para(
 )
 img("fig16_ttft_over_time.png")
 caption("Figure 14: Per-request TTFT over time for the 8-concurrent / 400-block "
-        "configuration on A100 + Llama-2-70B (GQA), with PCIe reload overlapped against "
-        "residual recompute (wall-clock = max(IO, compute)). Baseline (recompute, red) "
-        "inflates to ~900\u20131,200 ms during sustained thrashing. The oracle "
-        "unlimited-cache line (dashed green) sits at ~171 ms \u2014 the theoretical floor. "
-        "Tiered (blue) lands on top of the oracle: because the reload-vs-recompute ratio "
-        "is 61\u00d7 for 70B GQA, the PCIe DMA always finishes well inside the time the "
-        "GPU is already busy computing the residual miss tokens. The red band is the full "
-        "cost of thrashing above the floor (~81%); the blue band (~0%) is visually "
-        "collapsed \u2014 there is effectively no residual once the IO is hidden behind "
-        "compute. Bottom \u2014 HBM hit rate mirrors the thrashing phase. The story is "
-        "purely IO: the same GQA compression that shrinks the steady-state IO wall also "
-        "makes cache-miss recovery free.")
+        "configuration, with PCIe reload overlapped against residual recompute "
+        "(wall-clock = max(IO, compute)). Both panels share the same workload; only "
+        "the hardware/architecture differs. Left \u2014 A100 + Llama-2-7B (MHA): "
+        "reload-vs-recompute ratio is 3.8\u00d7, baseline thrashes to ~120 ms, tiered "
+        "drops to ~25 ms, oracle floor ~17 ms \u2014 a residual ~29% above floor. "
+        "Right \u2014 A100 + Llama-2-70B (GQA): reload-vs-recompute ratio jumps to 61\u00d7, "
+        "baseline thrashes to ~900\u20131,200 ms, and the tiered line lands exactly on the "
+        "oracle (~171 ms) \u2014 residual 0%. The larger the model, the more aggressively "
+        "IO hides behind the compute that was going to happen anyway. Bottom \u2014 HBM "
+        "hit rate is identical across the two panels because it is a workload-only "
+        "property; the same collapse in hit rate produces wildly different baseline "
+        "TTFTs because the compute cost of a miss scales with model size, while the "
+        "tiered-reload cost scales only with the KV footprint. This is the IO "
+        "perspective in full: the same GQA compression that shrinks the steady-state "
+        "IO wall also makes cache-miss recovery asymptotically free.")
 spacer()
 
 heading("Utilization Masks the Problem", 2)

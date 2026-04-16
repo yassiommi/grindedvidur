@@ -972,40 +972,9 @@ save(fig, "fig15_pcie_kv_reload.png")
 
 import sys
 sys.path.insert(0, os.path.join(REPO, "experiments"))
-from experiment_pcie_kv_reload import simulate_pcie_reload, HardwareConfig, HW_A100_70B
-
-# Llama-2-70B with GQA on A100. KV/token = 320 KB (8× smaller than 7B MHA),
-# prefill = 0.8 ms/token (10× slower than 7B). Reload-vs-recompute ratio = 61×,
-# which maximises the "IO replaces compute" argument.
-HW = HW_A100_70B
-
-traces = simulate_pcie_reload(
-    concurrent_sessions=8,
-    hbm_cache_blocks=400,
-    dram_cache_blocks=4000,  # 10× HBM
-    hw=HW,
+from experiment_pcie_kv_reload import (
+    simulate_pcie_reload, HardwareConfig, HW_A100_7B, HW_A100_70B,
 )
-
-# Also run with an effectively unlimited cache (oracle baseline — no evictions).
-# This gives the theoretical minimum TTFT: every reusable token is free.
-unlimited_traces = simulate_pcie_reload(
-    concurrent_sessions=8,
-    hbm_cache_blocks=500_000,   # never evicts
-    dram_cache_blocks=500_000,  # irrelevant when HBM is unlimited
-    hw=HW,
-)
-
-req_idx = np.array([t.request_idx for t in traces])
-baseline_ms = np.array([t.baseline_cost_ms for t in traces])
-# Use the overlap-aware tiered cost: PCIe DMA runs concurrently with the
-# recompute kernel, so wall-clock = max(IO, compute) rather than their sum.
-# This mirrors the GPU-initiated KV prefetch mechanism (Section 3) applied
-# to the miss-recovery path.
-tiered_ms = np.array([t.tiered_cost_overlap_ms for t in traces])
-# With an unlimited cache, no tokens are evicted, so baseline == tiered and equals
-# the per-request cost of just computing the genuinely-new tokens.
-unlimited_ms = np.array([t.baseline_cost_ms for t in unlimited_traces])
-hit_frac = np.array([t.hbm_hit_frac for t in traces]) * 100  # HBM hit rate %
 
 # Smoothed TTFT for readability (rolling window)
 window = 15
@@ -1013,100 +982,132 @@ def smooth(arr, w):
     kernel = np.ones(w) / w
     return np.convolve(arr, kernel, mode="same")
 
-baseline_smooth = smooth(baseline_ms, window)
-tiered_smooth = smooth(tiered_ms, window)
-unlimited_smooth = smooth(unlimited_ms, window)
+
+def _run_both(hw):
+    """Return (tiered_traces, oracle_traces) for the 8×400 config."""
+    tiered = simulate_pcie_reload(
+        concurrent_sessions=8, hbm_cache_blocks=400,
+        dram_cache_blocks=4000, hw=hw,
+    )
+    oracle = simulate_pcie_reload(
+        concurrent_sessions=8, hbm_cache_blocks=500_000,
+        dram_cache_blocks=500_000, hw=hw,
+    )
+    return tiered, oracle
+
+
+traces_7b, unlimited_7b = _run_both(HW_A100_7B)
+traces_70b, unlimited_70b = _run_both(HW_A100_70B)
+
+# Hit rate is workload-only (same for both hardware configs), so use one series.
+req_idx = np.array([t.request_idx for t in traces_7b])
+hit_frac = np.array([t.hbm_hit_frac for t in traces_7b]) * 100
 hit_smooth = smooth(hit_frac, window)
 
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
-                                gridspec_kw={"height_ratios": [2.2, 1]})
-
-# --- Top panel: TTFT over time ---
-# Two bands, both anchored at the oracle floor:
-#   • red  : baseline − oracle (total cost of thrashing)
-#   • blue : tiered  − oracle (residual cost after PCIe reload + overlap)
-# The baseline-vs-tiered gap is implied by the two bands and not drawn.
-ax1.fill_between(req_idx, unlimited_smooth, baseline_smooth,
-                 alpha=0.13, color=ACCENT4, zorder=1, label="_nolegend_")
-ax1.fill_between(req_idx, unlimited_smooth, tiered_smooth,
-                 alpha=0.22, color=ACCENT1, zorder=2, label="_nolegend_")
-
-ax1.plot(req_idx, baseline_smooth, linewidth=2.0, color=ACCENT4,
-         label="Baseline TTFT (recompute on miss)", zorder=3)
-ax1.plot(req_idx, tiered_smooth, linewidth=2.0, color=ACCENT1,
-         label="Tiered TTFT (PCIe reload + IO/compute overlap)", zorder=3)
-ax1.plot(req_idx, unlimited_smooth, linewidth=2.0, color=ACCENT2,
-         linestyle="--",
-         label="Unlimited cache (oracle, no evictions)", zorder=3)
-
-# Phase shading (approximate: ramp-up ~first 16 requests, drain starts ~680)
 n = len(req_idx)
 ramp_end = min(16, n)
 drain_start = int(n * 0.87)
-ax1.axvspan(0, ramp_end, alpha=0.06, color=ACCENT2, zorder=0)
-ax1.axvspan(ramp_end, drain_start, alpha=0.06, color=ACCENT4, zorder=0)
-ax1.axvspan(drain_start, n, alpha=0.06, color=ACCENT6, zorder=0)
 
-ax1.text(ramp_end / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
-         "Ramp", ha="center", fontsize=9, color=ACCENT2, fontweight="bold", va="top")
-ax1.text((ramp_end + drain_start) / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
-         "Sustained Thrashing", ha="center", fontsize=9, color=ACCENT4,
-         fontweight="bold", va="top")
-ax1.text((drain_start + n) / 2, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 200,
-         "Drain", ha="center", fontsize=9, color=ACCENT6, fontweight="bold", va="top")
+fig = plt.figure(figsize=(16, 7.5))
+gs = fig.add_gridspec(2, 2, height_ratios=[2.4, 1.0], hspace=0.32, wspace=0.18)
+ax_7b = fig.add_subplot(gs[0, 0])
+ax_70b = fig.add_subplot(gs[0, 1])
+ax_hit = fig.add_subplot(gs[1, :], sharex=ax_7b)
 
-# Annotate: baseline-to-oracle (total thrashing cost)
-# and tiered-to-oracle (residual after IO/compute overlap)
-mid = (ramp_end + drain_start) // 2
-gap_y_base = baseline_smooth[mid]
-gap_y_tier = tiered_smooth[mid]
-gap_y_oracle = unlimited_smooth[mid]
 
-# Red arrow: baseline − oracle (what thrashing costs)
-ax1.annotate("", xy=(mid, gap_y_oracle), xytext=(mid, gap_y_base),
-             arrowprops=dict(arrowstyle="<->", color=ACCENT4, lw=2))
-base_to_oracle_pct = (1 - gap_y_oracle / gap_y_base) * 100 if gap_y_base > 0 else 0
-ax1.text(mid + 15, (gap_y_base + gap_y_oracle) / 2,
-         f"Thrashing cost\n{base_to_oracle_pct:.0f}% above floor",
-         fontsize=9, fontweight="bold", color=ACCENT4, va="center",
-         bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF0F0",
-                   edgecolor=ACCENT4, linewidth=0.8, alpha=0.9))
+def _plot_ttft(ax, tiered_traces, oracle_traces, title, text_mid_offset=15):
+    baseline = smooth(
+        np.array([t.baseline_cost_ms for t in tiered_traces]), window)
+    tiered = smooth(
+        np.array([t.tiered_cost_overlap_ms for t in tiered_traces]), window)
+    oracle = smooth(
+        np.array([t.baseline_cost_ms for t in oracle_traces]), window)
 
-# Blue arrow: tiered − oracle (residual after PCIe reload + overlap)
-mid2 = int(mid * 0.55)
-gap_y_tier2 = tiered_smooth[mid2]
-gap_y_oracle2 = unlimited_smooth[mid2]
-ax1.annotate("", xy=(mid2, gap_y_oracle2), xytext=(mid2, gap_y_tier2),
-             arrowprops=dict(arrowstyle="<->", color=ACCENT1, lw=2))
-tier_to_oracle_pct = (1 - gap_y_oracle2 / gap_y_tier2) * 100 if gap_y_tier2 > 0 else 0
-ax1.text(mid2 - 15, (gap_y_tier2 + gap_y_oracle2) / 2,
-         f"Residual\n{tier_to_oracle_pct:.0f}% above floor",
-         fontsize=9, fontweight="bold", color=ACCENT1, va="center", ha="right",
-         bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0F4FF",
-                   edgecolor=ACCENT1, linewidth=0.8, alpha=0.9))
+    # Bands anchored at the oracle floor:
+    #   red  = baseline − oracle (total cost of thrashing)
+    #   blue = tiered  − oracle (residual after PCIe reload + overlap)
+    ax.fill_between(req_idx, oracle, baseline,
+                    alpha=0.13, color=ACCENT4, zorder=1, label="_nolegend_")
+    ax.fill_between(req_idx, oracle, tiered,
+                    alpha=0.25, color=ACCENT1, zorder=2, label="_nolegend_")
 
-ax1.set_ylabel("Per-request TTFT (ms)", fontsize=12)
-ax1.legend(fontsize=10, loc="upper left")
-ax1.set_title("TTFT Over Time: Thrashing Inflates Latency, PCIe Reload Recovers It\n"
-              "(8 concurrent sessions, 400-block HBM, A100 + Llama-2-70B GQA)",
-              fontsize=13, fontweight="bold", pad=10)
+    ax.plot(req_idx, baseline, linewidth=1.8, color=ACCENT4,
+            label="Baseline (recompute on miss)", zorder=3)
+    ax.plot(req_idx, tiered, linewidth=1.8, color=ACCENT1,
+            label="Tiered (PCIe reload + IO/compute overlap)", zorder=3)
+    ax.plot(req_idx, oracle, linewidth=1.8, color=ACCENT2,
+            linestyle="--",
+            label="Unlimited cache (oracle)", zorder=3)
 
-# --- Bottom panel: HBM hit rate ---
-ax2.fill_between(req_idx, 0, hit_smooth, alpha=0.2, color=ACCENT2, zorder=1)
-ax2.plot(req_idx, hit_smooth, linewidth=2.0, color=ACCENT2,
-         label="HBM token hit rate (%)", zorder=3)
+    # Phase shading
+    ax.axvspan(0, ramp_end, alpha=0.06, color=ACCENT2, zorder=0)
+    ax.axvspan(ramp_end, drain_start, alpha=0.06, color=ACCENT4, zorder=0)
+    ax.axvspan(drain_start, n, alpha=0.06, color=ACCENT6, zorder=0)
 
-# Phase shading (same)
-ax2.axvspan(0, ramp_end, alpha=0.06, color=ACCENT2, zorder=0)
-ax2.axvspan(ramp_end, drain_start, alpha=0.06, color=ACCENT4, zorder=0)
-ax2.axvspan(drain_start, n, alpha=0.06, color=ACCENT6, zorder=0)
+    # Annotations: baseline-to-oracle and tiered-to-oracle percentage gaps
+    mid = (ramp_end + drain_start) // 2
+    gap_base = baseline[mid]
+    gap_oracle = oracle[mid]
+    ax.annotate("", xy=(mid, gap_oracle), xytext=(mid, gap_base),
+                arrowprops=dict(arrowstyle="<->", color=ACCENT4, lw=1.8))
+    base_pct = (1 - gap_oracle / gap_base) * 100 if gap_base > 0 else 0
+    ax.text(mid + text_mid_offset, (gap_base + gap_oracle) / 2,
+            f"Thrashing\n{base_pct:.0f}% above floor",
+            fontsize=8.5, fontweight="bold", color=ACCENT4, va="center",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#FFF0F0",
+                      edgecolor=ACCENT4, linewidth=0.7, alpha=0.9))
 
-ax2.set_xlabel("Request index (time \u2192)", fontsize=12)
-ax2.set_ylabel("HBM hit rate (%)", fontsize=12)
-ax2.set_ylim(0, 100)
-ax2.legend(fontsize=10, loc="upper right")
+    mid2 = int(mid * 0.55)
+    gap_tier2 = tiered[mid2]
+    gap_oracle2 = oracle[mid2]
+    ax.annotate("", xy=(mid2, gap_oracle2), xytext=(mid2, gap_tier2),
+                arrowprops=dict(arrowstyle="<->", color=ACCENT1, lw=1.8))
+    tier_pct = (1 - gap_oracle2 / gap_tier2) * 100 if gap_tier2 > 0 else 0
+    ax.text(mid2 - text_mid_offset, (gap_tier2 + gap_oracle2) / 2,
+            f"Residual\n{tier_pct:.0f}% above floor",
+            fontsize=8.5, fontweight="bold", color=ACCENT1, va="center",
+            ha="right",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#F0F4FF",
+                      edgecolor=ACCENT1, linewidth=0.7, alpha=0.9))
 
-plt.tight_layout()
+    ax.set_ylabel("Per-request TTFT (ms)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=8)
+    ax.legend(fontsize=8.5, loc="upper left")
+
+
+_plot_ttft(ax_7b, traces_7b, unlimited_7b,
+           "A100 + Llama-2-7B (MHA)  |  reload/recompute = 3.8×")
+_plot_ttft(ax_70b, traces_70b, unlimited_70b,
+           "A100 + Llama-2-70B (GQA)  |  reload/recompute = 61×")
+
+# Shared super-title
+fig.suptitle("TTFT Over Time: Thrashing Inflates Latency, PCIe Reload Recovers It\n"
+             "(8 concurrent sessions, 400-block HBM) — IO leverage grows with model size",
+             fontsize=13, fontweight="bold", y=0.995)
+
+# Phase labels: stick to the 7B axis top
+for ax in (ax_7b, ax_70b):
+    ymax = ax.get_ylim()[1]
+    ax.text(ramp_end / 2, ymax, "Ramp", ha="center", fontsize=8,
+            color=ACCENT2, fontweight="bold", va="top")
+    ax.text((ramp_end + drain_start) / 2, ymax, "Sustained Thrashing",
+            ha="center", fontsize=8, color=ACCENT4, fontweight="bold", va="top")
+    ax.text((drain_start + n) / 2, ymax, "Drain", ha="center", fontsize=8,
+            color=ACCENT6, fontweight="bold", va="top")
+
+# --- Bottom panel: HBM hit rate (shared — workload-only) ---
+ax_hit.fill_between(req_idx, 0, hit_smooth, alpha=0.2, color=ACCENT2, zorder=1)
+ax_hit.plot(req_idx, hit_smooth, linewidth=2.0, color=ACCENT2,
+            label="HBM token hit rate (%) — same workload for both hardware configs",
+            zorder=3)
+ax_hit.axvspan(0, ramp_end, alpha=0.06, color=ACCENT2, zorder=0)
+ax_hit.axvspan(ramp_end, drain_start, alpha=0.06, color=ACCENT4, zorder=0)
+ax_hit.axvspan(drain_start, n, alpha=0.06, color=ACCENT6, zorder=0)
+ax_hit.set_xlabel("Request index (time \u2192)", fontsize=12)
+ax_hit.set_ylabel("HBM hit rate (%)", fontsize=11)
+ax_hit.set_ylim(0, 100)
+ax_hit.legend(fontsize=9, loc="upper right")
+
 save(fig, "fig16_ttft_over_time.png")
 
 print(f"\nAll figures saved to {OUT}/")
