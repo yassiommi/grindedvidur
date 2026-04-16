@@ -91,10 +91,50 @@ H100_PCIE_FLOOR_MS = 0.020
 NVLINK_LATENCY_US = 5.0   # per message
 H100_HBM_EFF = 0.80       # effective fraction of peak used for analytical GEMMs
 
+# ── H100 FP16 Tensor Core peak (for compute-bound analytical estimates) ──
+H100_FP16_TFLOPS = 989.5
+H100_MFU = 0.50  # conservative model-FLOPs utilisation for GEMM
+
+LOCAL_EXPERTS_PER_GPU = NUM_ROUTED_EXPERTS // EP  # 32
+
+
 # Analytical MoE expert GEMM: 84 MB HBM read dominates at BS=1
 def analytical_moe_expert_gemm_ms(experts_on_gpu: float = 1.0) -> float:
     bytes_read = int(experts_on_gpu * EXPERT_WEIGHT_BYTES)
     return hbm_read_ms(bytes_read)
+
+
+def analytical_moe_expert_gemm_bs_ms(batch_size: int) -> float:
+    """Analytical expert GEMM for a batch of tokens (grouped-GEMM model).
+
+    With EP=8 and 8 experts per token, each GPU executes batch_size
+    expert activations. The number of *unique* experts touched out of
+    the 32 resident on this GPU follows:
+        E[unique] = 32 * (1 - (31/32)^batch_size)
+    Weight read = unique × 84 MB (each weight read once, grouped-GEMM).
+    Compute is negligible at moderate BS (AI ≈ BS, transition ≈ BS 715).
+    """
+    unique = LOCAL_EXPERTS_PER_GPU * (1 - (1 - 1 / LOCAL_EXPERTS_PER_GPU) ** batch_size)
+    bytes_read = int(unique * EXPERT_WEIGHT_BYTES)
+    # Also credit compute (tiny at small BS, starts mattering at very large BS)
+    flops = batch_size * 3 * 2 * HIDDEN_SIZE * EXPERT_INTERMEDIATE_SIZE
+    compute_ms = (flops / 1e9) / (H100_FP16_TFLOPS * 1024 * H100_MFU) * 1e3
+    mem_ms = hbm_read_ms(bytes_read)
+    return max(compute_ms, mem_ms)
+
+
+def analytical_gemm_ms(m: int, k: int, n: int) -> float:
+    """Analytical GEMM time: max(compute, memory).
+
+    At small m (BS=1) → memory-bound (read weight).
+    At large m → compute-bound (FLOPs dominate).
+    """
+    flops = 2.0 * m * k * n
+    weight_bytes = k * n * 2
+    act_bytes = (m * k + m * n) * 2
+    compute_ms = (flops / 1e9) / (H100_FP16_TFLOPS * 1024 * H100_MFU) * 1e3
+    mem_ms = hbm_read_ms(weight_bytes + act_bytes)
+    return max(compute_ms, mem_ms)
 
 
 def hbm_read_ms(size_bytes: int) -> float:

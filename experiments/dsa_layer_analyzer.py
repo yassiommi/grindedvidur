@@ -11,15 +11,23 @@ from typing import Dict
 from experiments.dsa_timing_model import (
     DSA_ATTENDED,
     EP,
+    EXPERT_INTERMEDIATE_SIZE,
     EXPERT_WEIGHT_BYTES,
+    H100_FP16_TFLOPS,
+    H100_MFU,
     HIDDEN_SIZE,
     INDEXER_K_BYTES_PER_TOKEN,
+    KV_LORA_RANK,
     KV_UP_OUT_DIM,
     MLA_KV_BYTES_PER_TOKEN,
     NUM_EXPERTS_PER_TOK,
     NUM_LAYERS,
+    Q_LORA_RANK,
+    Q_TOTAL_DIM,
     SHARED_EXPERT_WEIGHT_BYTES,
     ProfileTables,
+    analytical_gemm_ms,
+    analytical_moe_expert_gemm_bs_ms,
     analytical_moe_expert_gemm_ms,
     hbm_read_ms,
     io_read_ms,
@@ -285,4 +293,184 @@ def run_sweep(seq_lens, modes=("hbm", "offload")):
     for mode in modes:
         for sl in seq_lens:
             results[(mode, sl)] = analyze_layer(sl, mode, tables)
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Batch-size-aware analysis
+# ══════════════════════════════════════════════════════════════════════
+
+def analyze_layer_bs(
+    seq_len: int, mode: str, batch_size: int, tables: ProfileTables
+) -> Dict[str, object]:
+    """DSA decode one layer at arbitrary batch_size.
+
+    Key differences from analyze_layer (BS=1):
+    - Block A ops: profiled at num_tokens=batch_size, analytical fallback
+      for GEMM [BS, …] if profile is saturated/extrapolated.
+    - Block B IO: scales with batch_size (each sequence has its own
+      indexer K + KV to fetch). Indexer matmul also batched.
+    - Block C: kv_up_proj on BS*2560 tokens; attn_core reads BS× decompressed
+      KV; o_proj at [BS, 16384]×[16384, 7168].
+    - MoE: profiled at num_tokens=batch_size where available; expert GEMM
+      always analytical (grouped-GEMM with unique-expert scaling).
+    """
+    assert mode in ("hbm", "offload")
+    bs = batch_size
+
+    # ─── BLOCK A ─── Q projection for BS tokens ─────────────────────
+    q_down_ms, _ = profiled_or_analytical(
+        tables, "attn", bs, "mla_q_down_proj",
+        lambda: analytical_gemm_ms(bs, HIDDEN_SIZE, Q_LORA_RANK),
+    )
+    q_up_ms, _ = profiled_or_analytical(
+        tables, "attn", bs, "mla_q_up_proj",
+        lambda: analytical_gemm_ms(bs, Q_LORA_RANK, Q_TOTAL_DIM),
+    )
+    rope_ms, _ = profiled_or_analytical(
+        tables, "attn", bs, "mla_rope",
+        lambda: hbm_read_ms(bs * 128 * 64 * 2 * 2),
+    )
+    pre_norm_ms, _ = profiled_or_analytical(
+        tables, "attn", bs, "mla_block_norm",
+        lambda: hbm_read_ms(bs * HIDDEN_SIZE * 2 * 2),
+    )
+    block_a_ms = pre_norm_ms + q_down_ms + q_up_ms + rope_ms
+
+    # ─── BLOCK B ─── KV indexing for BS sequences ───────────────────
+    # Each sequence reads its own indexer K and fetches its own KV.
+    indexer_k_bytes = INDEXER_K_BYTES_PER_TOKEN * seq_len * bs
+    indexer_read_ms = io_read_ms(indexer_k_bytes, mode)
+
+    indexer_compute_ms = max(0.005, 0.005 * bs)  # batched kernel
+    topk_ms = max(seq_len / 1e6 * bs, 0.005)
+
+    fetch_kv_bytes = MLA_KV_BYTES_PER_TOKEN * DSA_ATTENDED * bs
+    fetch_kv_ms = io_read_ms(fetch_kv_bytes, mode)
+
+    block_b_ms = indexer_read_ms + indexer_compute_ms + topk_ms + fetch_kv_ms
+
+    # ─── BLOCK C ─── Attention + output ──────────────────────────────
+    # kv_up_proj: [BS*2560, 512] × [512, 32768]. Profile only goes to
+    # num_tokens=4096, so BS≥2 needs analytical.
+    kv_up_nt = bs * DSA_ATTENDED
+    kv_up_ms, _ = profiled_or_analytical(
+        tables, "attn", kv_up_nt, "mla_kv_up_proj",
+        lambda: analytical_gemm_ms(kv_up_nt, KV_LORA_RANK, KV_UP_OUT_DIM),
+    )
+
+    # Attn core: BS queries × 2560 KV each. BS× decompressed KV read.
+    decompressed_kv_bytes = bs * DSA_ATTENDED * KV_UP_OUT_DIM * 2
+    attn_core_ms = hbm_read_ms(decompressed_kv_bytes)
+
+    # o_proj: [BS, 16384] × [16384, 7168]
+    o_proj_ms, _ = profiled_or_analytical(
+        tables, "attn", bs, "mla_o_proj",
+        lambda: analytical_gemm_ms(bs, 16384, HIDDEN_SIZE),
+    )
+
+    residual_ms, _ = profiled_or_analytical(
+        tables, "attn", bs, "mla_block_residual",
+        lambda: hbm_read_ms(bs * HIDDEN_SIZE * 2 * 2),
+    )
+    block_c_ms = kv_up_ms + attn_core_ms + o_proj_ms + residual_ms
+
+    # ─── MoE BLOCK ──────────────────────────────────────────────────
+    moe_norm_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_block_norm",
+        lambda: hbm_read_ms(bs * HIDDEN_SIZE * 2 * 2),
+    )
+    router_gate_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_router_gate",
+        lambda: analytical_gemm_ms(bs, HIDDEN_SIZE, 256),
+    )
+    router_sm_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_router_softmax",
+        lambda: 0.005 + 0.001 * bs,
+    )
+    router_topk_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_router_topk",
+        lambda: max(0.005, 0.04 * bs),
+    )
+
+    dispatch_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_expert_dispatch",
+        lambda: nvlink_ms(NUM_EXPERTS_PER_TOK) + 0.001 * bs,
+    )
+    combine_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_expert_combine",
+        lambda: nvlink_ms(NUM_EXPERTS_PER_TOK) + 0.001 * bs,
+    )
+
+    # Expert GEMM: always analytical, grouped-GEMM with unique-expert scaling.
+    expert_gemm_ms = analytical_moe_expert_gemm_bs_ms(bs)
+
+    # Shared expert: profiled where available, analytical for large BS.
+    shared_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_shared_expert",
+        lambda: analytical_gemm_ms(bs, HIDDEN_SIZE, EXPERT_INTERMEDIATE_SIZE * 3),
+        inflation_guard_ms=3.0,
+    )
+    moe_residual_ms, _ = profiled_or_analytical(
+        tables, "mlp", bs, "moe_block_residual",
+        lambda: hbm_read_ms(bs * HIDDEN_SIZE * 2 * 2),
+    )
+
+    moe_total_ms = (
+        moe_norm_ms + router_gate_ms + router_sm_ms + router_topk_ms
+        + dispatch_ms + expert_gemm_ms + combine_ms
+        + shared_ms + moe_residual_ms
+    )
+
+    # ─── Totals ──────────────────────────────────────────────────────
+    parallel_ab_ms = max(block_a_ms, block_b_ms)
+    attention_total_ms = parallel_ab_ms + block_c_ms
+    layer_total_ms = attention_total_ms + moe_total_ms
+
+    # IO vs compute decomposition (for overlap analysis)
+    io_ms = indexer_read_ms + fetch_kv_ms
+    compute_ms = layer_total_ms - io_ms
+
+    # Pipelined model: if we could fully overlap layer N's IO with layer
+    # N-1's compute (double-buffering), the bottleneck per layer is
+    # max(compute, io) rather than compute + io.
+    pipelined_layer_ms = max(compute_ms, io_ms)
+
+    return {
+        "seq_len": seq_len,
+        "mode": mode,
+        "batch_size": bs,
+        # Blocks
+        "block_a_ms": block_a_ms,
+        "block_b_ms": block_b_ms,
+        "block_c_ms": block_c_ms,
+        "moe_total_ms": moe_total_ms,
+        # IO detail
+        "indexer_read_ms": indexer_read_ms,
+        "fetch_kv_ms": fetch_kv_ms,
+        "io_ms": io_ms,
+        "compute_ms": compute_ms,
+        # Totals
+        "parallel_ab_ms": parallel_ab_ms,
+        "attention_total_ms": attention_total_ms,
+        "layer_total_ms": layer_total_ms,
+        "all_layers_ms": layer_total_ms * NUM_LAYERS,
+        "tpot_ms": layer_total_ms * NUM_LAYERS / bs,
+        # Pipelined (overlap IO with previous layer compute)
+        "pipelined_layer_ms": pipelined_layer_ms,
+        "pipelined_all_layers_ms": pipelined_layer_ms * NUM_LAYERS,
+        "pipelined_tpot_ms": pipelined_layer_ms * NUM_LAYERS / bs,
+        # Expert detail
+        "expert_gemm_ms": expert_gemm_ms,
+    }
+
+
+def run_bs_sweep(seq_lens, batch_sizes, modes=("hbm", "offload")):
+    """Return dict: (mode, seq_len, batch_size) -> per-layer dict."""
+    tables = load_profiles()
+    results = {}
+    for mode in modes:
+        for sl in seq_lens:
+            for bs in batch_sizes:
+                results[(mode, sl, bs)] = analyze_layer_bs(sl, mode, bs, tables)
     return results
