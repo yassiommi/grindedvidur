@@ -637,7 +637,8 @@ img("fig15_pcie_kv_reload.png")
 caption("Figure 13: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
         "(reload costs more than recompute); PCIe Gen4 recovers 60% of wasted compute; CXL "
         "reaches 76%. Right \u2014 70B with GQA achieves 80% savings because prefill is expensive "
-        "but GQA\u2019s 8\u00d7 smaller KV makes PCIe reload 61\u00d7 cheaper than recomputing.")
+        "and GQA keeps the KV footprint small enough that PCIe reload is 61\u00d7 cheaper than "
+        "recomputing.")
 spacer()
 
 para(
@@ -656,12 +657,13 @@ para(
 )
 para(
     "For larger models the IO calculus shifts dramatically. Llama-2-70B with GQA has "
-    "8\u00d7 smaller KV per token than 7B (320 KB vs 512 KB, thanks to grouped queries) "
-    "but 10\u00d7 more expensive prefill. The reload-vs-recompute ratio jumps to 61\u00d7, "
-    "recovering 80% of thrashing waste. This is the IO perspective in full: the same "
-    "KV compression that reduces the IO wall during normal decode also enables IO-based "
-    "recovery from cache failures. The architecture\u2019s IO footprint determines not just "
-    "steady-state performance but also resilience to capacity failures."
+    "8\u00d7 fewer KV heads per layer than 7B MHA, but 2.5\u00d7 more layers, so the "
+    "per-token KV footprint only shrinks 1.6\u00d7 (320 KB vs 512 KB). Meanwhile prefill "
+    "is 10\u00d7 more expensive per token, so the reload-vs-recompute ratio jumps to "
+    "61\u00d7, recovering 80% of thrashing waste. This is the IO perspective in full: the "
+    "same GQA compression that reduces the IO wall during normal decode also enables "
+    "IO-based recovery from cache failures. The architecture\u2019s IO footprint determines "
+    "not just steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
 caption("Figure 14: Per-request TTFT over time for the 8-concurrent / 400-block "
