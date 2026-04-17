@@ -20,6 +20,8 @@ The "overlap" question is really about throughput: does offload's
 throughput curve catch up to HBM's when we batch? Answer below.
 """
 
+import argparse
+import json
 import os
 
 import matplotlib
@@ -339,7 +341,42 @@ def print_pipelined_throughput_table(results):
     print("-" * 105)
 
 
+def dump_json(results, path):
+    rows = []
+    for (mode, sl, bs), r in sorted(results.items()):
+        rows.append({
+            "mode": mode,
+            "seq_len": sl,
+            "batch_size": bs,
+            "layer_total_ms": r["layer_total_ms"],
+            "step_latency_ms": r["step_latency_ms"],
+            "throughput_tok_per_s": r["throughput_tok_per_s"],
+            "amortized_per_token_ms": r["amortized_per_token_ms"],
+            "pipelined_layer_ms": r["pipelined_layer_ms"],
+            "pipelined_step_latency_ms": r["pipelined_step_latency_ms"],
+            "pipelined_throughput_tok_per_s": r["pipelined_throughput_tok_per_s"],
+            "pipelined_amortized_per_token_ms": r["pipelined_amortized_per_token_ms"],
+            "io_ms": r["io_ms"],
+            "compute_ms": r["compute_ms"],
+            "block_a_ms": r["block_a_ms"],
+            "block_b_ms": r["block_b_ms"],
+            "block_c_ms": r["block_c_ms"],
+            "moe_total_ms": r["moe_total_ms"],
+            "expert_gemm_ms": r["expert_gemm_ms"],
+            "indexer_read_ms": r["indexer_read_ms"],
+            "fetch_kv_ms": r["fetch_kv_ms"],
+        })
+    with open(path, "w") as f:
+        json.dump(rows, f, indent=2)
+    print(f"JSON results written to {path}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="DSA batch-size sweep")
+    parser.add_argument("--json-out", type=str, default=None,
+                        help="Path to write JSON results")
+    args = parser.parse_args()
+
     ensure_dir()
     print("Running DSA batch-size sweep...")
     results = run_bs_sweep(SEQ_LENS, BATCH_SIZES, MODES)
@@ -362,6 +399,12 @@ def main():
     for f in sorted(os.listdir(FIG_DIR)):
         if any(k in f for k in ("bs", "gap", "throughput", "pipelined")):
             print(f"  {f}")
+
+    if args.json_out:
+        dump_json(results, args.json_out)
+    else:
+        default_path = os.path.join(FIG_DIR, "dsa_batch_sweep.json")
+        dump_json(results, default_path)
 
 
 if __name__ == "__main__":
