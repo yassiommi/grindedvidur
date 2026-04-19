@@ -810,6 +810,99 @@ plt.tight_layout()
 save(fig, "fig13_sparse_attention.png")
 
 # ================================================================
+# FIGURE 17: DSA Seq-Len Sweep — KV load time and cache breakdown
+# ================================================================
+import json as _json
+
+_dsa_path = os.path.join(REPO, "example_outputs", "experiments",
+                         "deepseek_dsa_seqlen_sweep", "dsa_vs_mla_results.json")
+with open(_dsa_path) as _f:
+    _dsa_data = _json.load(_f)
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+
+_seq_lens = np.array([r["seq_len"] for r in _dsa_data["mla_results"]])
+_mla_kv_ms = np.array([r["kv_load_ms"] for r in _dsa_data["mla_results"]])
+_dsa_kv_ms = np.array([r["kv_load_ms"] for r in _dsa_data["dsa_results"]])
+
+# Left: KV load time MLA vs DSA
+ax = axes[0]
+ax.plot(_seq_lens, _mla_kv_ms, "s-", color=ACCENT5, linewidth=2.5, markersize=7,
+        label="MLA (full context)", zorder=3)
+ax.plot(_seq_lens, _dsa_kv_ms, "o-", color=ACCENT6, linewidth=2.5, markersize=7,
+        label="DSA (indexer + top-2560)", zorder=3)
+ax.fill_between(_seq_lens, _dsa_kv_ms, _mla_kv_ms, alpha=0.12, color=ACCENT2)
+
+# Ratio annotation at the midpoint
+_mid = len(_seq_lens) // 2
+_ratio_mid = _mla_kv_ms[_mid] / _dsa_kv_ms[_mid]
+ax.text(_seq_lens[_mid], (_mla_kv_ms[_mid] + _dsa_kv_ms[_mid]) / 2,
+        f"{_ratio_mid:.1f}\u00d7 less IO",
+        fontsize=11, fontweight="bold", color=ACCENT2, ha="center",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0FFF0",
+                  edgecolor=ACCENT2, linewidth=0.8, alpha=0.9))
+
+ax.set_xscale("log", base=2)
+ax.set_yscale("log")
+ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+    lambda x, _: f"{x/1e6:.0f}M" if x >= 1e6 else f"{x/1e3:.0f}K"))
+ax.yaxis.set_major_formatter(ticker.FuncFormatter(
+    lambda x, _: f"{x/1000:.1f}s" if x >= 1000 else f"{x:.0f} ms"))
+ax.set_xlabel("Context Length (tokens)")
+ax.set_ylabel("KV Load Time per Decode Step (ms)")
+ax.set_title("Decode KV Load: DSA vs Full MLA", pad=10)
+ax.legend(fontsize=10)
+
+# Endpoint annotation
+ax.text(_seq_lens[-1], _mla_kv_ms[-1] * 1.15,
+        f"{_mla_kv_ms[-1]/1000:.1f}s", fontsize=9, fontweight="bold",
+        color=ACCENT5, ha="center", va="bottom")
+ax.text(_seq_lens[-1], _dsa_kv_ms[-1] * 0.82,
+        f"{_dsa_kv_ms[-1]/1000:.1f}s", fontsize=9, fontweight="bold",
+        color=ACCENT6, ha="center", va="top")
+
+# Right: Per-layer KV size breakdown (stacked)
+ax = axes[1]
+_mla_gb = np.array([r["kv_gb_total"] for r in _dsa_data["mla_results"]])
+_dsa_idx_gb = np.array([r["indexer_kv_bytes_per_layer"] for r in _dsa_data["dsa_results"]]) \
+              * _dsa_data["num_layers"] / 1e9
+_dsa_attn_gb = np.array([r["mla_kv_bytes_per_layer"] for r in _dsa_data["dsa_results"]]) \
+               * _dsa_data["num_layers"] / 1e9
+
+ax.fill_between(_seq_lens, 0, _dsa_attn_gb, alpha=0.7, color=ACCENT1,
+                label="DSA: attended MLA KV (2560 tokens, fixed)", zorder=3)
+ax.fill_between(_seq_lens, _dsa_attn_gb, _dsa_attn_gb + _dsa_idx_gb, alpha=0.7,
+                color=ACCENT6, label="DSA: indexer K (FP8, grows with seq_len)", zorder=3)
+ax.plot(_seq_lens, _mla_gb, "s-", color=ACCENT5, linewidth=2.5, markersize=7,
+        label="MLA: full KV (FP16)", zorder=4)
+
+ax.set_xscale("log", base=2)
+ax.set_yscale("log")
+ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+    lambda x, _: f"{x/1e6:.0f}M" if x >= 1e6 else f"{x/1e3:.0f}K"))
+ax.yaxis.set_major_formatter(ticker.FuncFormatter(
+    lambda x, _: f"{x:,.0f}" if x >= 1 else f"{x:.2f}"))
+ax.set_xlabel("Context Length (tokens)")
+ax.set_ylabel("Total KV Cache Size (GB)")
+ax.set_title("KV Cache Breakdown: Where the Bytes Go", pad=10)
+ax.legend(fontsize=8.5, loc="upper left")
+
+# Annotate the ratio at rightmost point
+ax.text(_seq_lens[-1], _mla_gb[-1] * 1.12,
+        f"{_mla_gb[-1]:.0f} GB", fontsize=9, fontweight="bold",
+        color=ACCENT5, ha="center", va="bottom")
+_dsa_total_gb = _dsa_idx_gb[-1] + _dsa_attn_gb[-1]
+ax.text(_seq_lens[-1], _dsa_total_gb * 0.80,
+        f"{_dsa_total_gb:.0f} GB\n({_mla_gb[-1]/_dsa_total_gb:.1f}\u00d7 smaller)",
+        fontsize=9, fontweight="bold", color=ACCENT6, ha="center", va="top")
+
+fig.suptitle("DeepSeek Sparse Attention: Scaling with Context Length  "
+             "(DeepSeek-V3, A100, TP=4, BS=1)",
+             fontsize=14, fontweight="bold", y=1.03)
+plt.tight_layout()
+save(fig, "fig17_dsa_seqlen_sweep.png")
+
+# ================================================================
 # FIGURE 14: Thrashing Phases — Utilization & Hit Rate over Time
 # ================================================================
 fig, ax = plt.subplots(figsize=(14, 5.5))

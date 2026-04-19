@@ -378,6 +378,44 @@ para(
     "from end-to-end GPU profiling."
 )
 
+heading("Scaling with Context Length: The Indexer K Bottleneck", 2)
+para(
+    "While the IO/Compute ratio comparison captures the regime shift at a fixed context length, "
+    "the more pressing question for long-context deployments is: how does DSA scale as context "
+    "grows from 128K to 10M tokens? We swept DeepSeek-V3 across 8 sequence lengths to answer this."
+)
+img("fig17_dsa_seqlen_sweep.png")
+caption("Figure 8: Left \u2014 KV load time per decode step: MLA (purple) vs DSA (teal). "
+        "Both grow linearly with context length, but DSA loads ~2.2\u00d7 less data at every "
+        "point. At 10M tokens, MLA requires 27.2s of IO per decode step; DSA requires 12.1s. "
+        "Right \u2014 DSA\u2019s KV cache broken into two components: the attended MLA KV "
+        "(2,560 tokens, fixed \u2014 blue) and the indexer K (FP8, grows with seq_len \u2014 teal). "
+        "The indexer dominates above ~32K tokens. At 10M context, 99.9% of DSA\u2019s IO is "
+        "spent reading the indexer, not the attended KV.")
+spacer()
+para(
+    "The 2.2\u00d7 reduction is a structural constant: DSA reads the indexer K at "
+    "512 bytes/token/layer (FP8) versus MLA\u2019s full 1,152 bytes/token/layer (FP16), "
+    "giving a theoretical ratio of 1,152 / 512 = 2.25\u00d7. The measured 2.2\u00d7 is "
+    "within 2% of this prediction."
+)
+para(
+    "A critical observation: DSA does not eliminate the linear scaling of IO with context. "
+    "The indexer K must be read for every token in the context on every decode step \u2014 "
+    "that is the cost of knowing which tokens to attend to. What DSA eliminates is the "
+    "quadratic-in-heads scaling of MHA/GQA: instead of reading KV for all heads times all "
+    "tokens, it reads a single FP8 index plus a fixed 2,560-token attended set. The "
+    "attended MLA KV component (blue in Figure 8, right) is constant at 2.81 MB/layer "
+    "regardless of context, while the indexer (teal) scales linearly."
+)
+para(
+    "At 10M tokens on A100 PCIe Gen4, even DSA\u2019s reduced IO (12.1s/step) dwarfs "
+    "compute (0.27s/step) by 45\u00d7. This confirms that for very long contexts, "
+    "even sparse attention remains firmly IO-bound \u2014 the bottleneck is the indexer "
+    "scan, not the attended computation. Future work on selective indexer quantization "
+    "or hierarchical indexing could reduce this further."
+)
+
 doc.add_page_break()
 
 # ══════════════════════════════════════════════════════════════
@@ -415,7 +453,7 @@ table(
 )
 spacer()
 img("fig04_engram_pareto.png")
-caption("Figure 8: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
+caption("Figure 9: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
         "Center \u2014 Engram is 21\u201331% faster. Right \u2014 Prefetch headroom: "
         "IO never stalls (9\u201364\u00d7 budget).")
 spacer()
@@ -425,7 +463,7 @@ para(
     "The Engram lookup adds negligible overhead (<0.1 ms per Engram layer) because the IO is "
     "fully hidden behind preceding layers\u2019 compute. The prefetch budget exceeds "
     "the DMA transfer by 9\u00d7 at layer 2 and 64\u00d7 at layer 15. Because both compute "
-    "and IO scale identically with batch size, these ratios are structural constants \u2014 "
+    "and DMA scale identically with batch size, these ratios are structural constants \u2014 "
     "they hold at any batch size."
 )
 para(
@@ -489,7 +527,7 @@ para(
     "the bottleneck shifts to compute, and further IO reduction has minimal effect."
 )
 img("fig05_turboquant_impact.png")
-caption("Figure 9: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
+caption("Figure 10: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
         "on IO-bound MHA, minimal change on already-compact GQA. Right \u2014 Access patterns: "
         "MHA reads everything; MLA reads 1.6%; TQ reads sparse discrete.")
 spacer()
@@ -528,7 +566,7 @@ table(
 )
 spacer()
 img("fig11_prefix_caching.png")
-caption("Figure 10: Left \u2014 Token hit rate scales linearly with sharing fraction. "
+caption("Figure 11: Left \u2014 Token hit rate scales linearly with sharing fraction. "
         "Right \u2014 Eviction pressure drops 17\u00d7 at 90% sharing.")
 spacer()
 para(
@@ -567,14 +605,14 @@ para(
     "concurrent sessions (2\u201312) and cache sizes (200\u20131,200 blocks)."
 )
 img("fig14_thrashing_phases.png")
-caption("Figure 11: Cache utilization (green) stays high throughout, but token hit rate (blue) "
+caption("Figure 12: Cache utilization (green) stays high throughout, but token hit rate (blue) "
         "collapses during sustained thrashing (Phase 2). The 65-percentage-point gap between "
         "utilization and hit rate is the monitoring blind spot.")
 spacer()
 
 heading("A Binary Cliff", 2)
 img("fig06_thrashing_cliff.png")
-caption("Figure 12: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
+caption("Figure 13: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
         "hit rate is nearly instantaneous. Right \u2014 Below the threshold: no penalty. "
         "Above it: immediate 5\u00d7 compute overhead, 81% wasted.")
 spacer()
@@ -634,7 +672,7 @@ para(
     "The reported tiered cost is the wall-clock max(IO, compute), not the sum."
 )
 img("fig15_pcie_kv_reload.png")
-caption("Figure 13: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
+caption("Figure 14: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
         "(reload costs more than recompute); PCIe Gen4 recovers 60% of wasted compute; CXL "
         "reaches 76%. Right \u2014 70B with GQA achieves 80% savings because prefill is expensive "
         "and GQA keeps the KV footprint small enough that PCIe reload is 61\u00d7 cheaper than "
@@ -666,7 +704,7 @@ para(
     "not just steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
-caption("Figure 14: Per-request TTFT over time for the 8-concurrent / 400-block "
+caption("Figure 15: Per-request TTFT over time for the 8-concurrent / 400-block "
         "configuration, with PCIe reload overlapped against residual recompute "
         "(wall-clock = max(IO, compute)). Both panels share the same workload; only "
         "the hardware/architecture differs. Left \u2014 A100 + Llama-2-7B (MHA): "
@@ -694,7 +732,7 @@ para(
 
 heading("Heterogeneous Agents Make It Worse", 2)
 img("fig07_utilization_lies_hetero.png")
-caption("Figure 15: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
+caption("Figure 16: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
         "Right \u2014 Agent mix at 800 blocks: short+long (21%) is worse than all-medium (56%).")
 spacer()
 
@@ -718,7 +756,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("9. The Full Compression Stack", 1)
 img("fig10_full_compression_stack.png")
-caption("Figure 16: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
+caption("Figure 17: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
         "Prefix Cache (1.9 GB effective at 1M context). The H100 80 GB line shows the "
         "single-GPU feasibility boundary.")
 spacer()
@@ -792,16 +830,6 @@ para(
 )
 
 spacer()
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-run = p.add_run(
-    "InferLens: High-Fidelity LLM Inference Simulator  \u00b7  "
-    "MSR-India Systems Group & Systems for AI Lab @ Georgia Tech  \u00b7  "
-    "MLSys\u201924  (arxiv.org/abs/2405.05465)"
-)
-run.font.size = Pt(9)
-run.font.color.rgb = RGBColor(0x95, 0x9D, 0xA5)
-run.italic = True
 
 # ── Save ──────────────────────────────────────────────────────
 doc.save(OUT)
