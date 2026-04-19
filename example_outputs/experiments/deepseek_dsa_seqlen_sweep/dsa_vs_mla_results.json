@@ -1,0 +1,191 @@
+{
+  "description": "DeepSeek-V3 DSA vs MLA: KV cache size and decode timing comparison",
+  "model": "deepseek-ai/DeepSeek-V3.2",
+  "device": "A100 (PCIe Gen4, 31.5 GB/s)",
+  "parallelism": "TP=4, EP=4",
+  "batch_size": 1,
+  "mla_config": {
+    "kv_bytes_per_token_per_layer": 1152,
+    "attention": "full (all seq_len tokens)"
+  },
+  "dsa_config": {
+    "indexer_k_bytes_per_token_per_layer": 512,
+    "mla_kv_bytes_per_token_per_layer": 1152,
+    "selected_tokens": 2048,
+    "sliding_window": 512,
+    "total_attended": 2560
+  },
+  "num_layers": 61,
+  "mla_results": [
+    {
+      "seq_len": 131072,
+      "method": "MLA",
+      "kv_load_ms": 340.40178571428567,
+      "compute_ms": 86.38878187837174,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 150994944,
+      "kv_gb_total": 8.578125
+    },
+    {
+      "seq_len": 262144,
+      "method": "MLA",
+      "kv_load_ms": 680.8035714285713,
+      "compute_ms": 91.6475637567435,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 301989888,
+      "kv_gb_total": 17.15625
+    },
+    {
+      "seq_len": 524288,
+      "method": "MLA",
+      "kv_load_ms": 1361.6071428571427,
+      "compute_ms": 102.165127513487,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 603979776,
+      "kv_gb_total": 34.3125
+    },
+    {
+      "seq_len": 1048576,
+      "method": "MLA",
+      "kv_load_ms": 2723.2142857142853,
+      "compute_ms": 123.20025502697402,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 1207959552,
+      "kv_gb_total": 68.625
+    },
+    {
+      "seq_len": 2097152,
+      "method": "MLA",
+      "kv_load_ms": 5446.428571428571,
+      "compute_ms": 165.270510053948,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 2415919104,
+      "kv_gb_total": 137.25
+    },
+    {
+      "seq_len": 4194304,
+      "method": "MLA",
+      "kv_load_ms": 10892.857142857141,
+      "compute_ms": 249.411020107896,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 4831838208,
+      "kv_gb_total": 274.5
+    },
+    {
+      "seq_len": 8388608,
+      "method": "MLA",
+      "kv_load_ms": 21785.714285714283,
+      "compute_ms": 417.692040215792,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 9663676416,
+      "kv_gb_total": 549.0
+    },
+    {
+      "seq_len": 10485760,
+      "method": "MLA",
+      "kv_load_ms": 27232.142857142855,
+      "compute_ms": 501.83255026974007,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 12079595520,
+      "kv_gb_total": 686.25
+    }
+  ],
+  "dsa_results": [
+    {
+      "seq_len": 131072,
+      "method": "DSA",
+      "kv_load_ms": 157.93815491691467,
+      "compute_ms": 86.61994697394938,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 70057984,
+      "kv_gb_total": 3.98004150390625,
+      "indexer_kv_bytes_per_layer": 67108864,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 262144,
+      "method": "DSA",
+      "kv_load_ms": 309.2278374565972,
+      "compute_ms": 88.95718336433684,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 137166848,
+      "kv_gb_total": 7.79254150390625,
+      "indexer_kv_bytes_per_layer": 134217728,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 524288,
+      "method": "DSA",
+      "kv_load_ms": 611.8072025359622,
+      "compute_ms": 93.63165614511173,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 271384576,
+      "kv_gb_total": 15.41754150390625,
+      "indexer_kv_bytes_per_layer": 268435456,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 1048576,
+      "method": "DSA",
+      "kv_load_ms": 1216.9659326946924,
+      "compute_ms": 102.9806017066615,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 539820032,
+      "kv_gb_total": 30.66754150390625,
+      "indexer_kv_bytes_per_layer": 536870912,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 2097152,
+      "method": "DSA",
+      "kv_load_ms": 2427.2833930121524,
+      "compute_ms": 121.67849282976105,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 1076690944,
+      "kv_gb_total": 61.16754150390625,
+      "indexer_kv_bytes_per_layer": 1073741824,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 4194304,
+      "method": "DSA",
+      "kv_load_ms": 4847.918313647073,
+      "compute_ms": 159.07427507596017,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 2150432768,
+      "kv_gb_total": 122.16754150390625,
+      "indexer_kv_bytes_per_layer": 2147483648,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 8388608,
+      "method": "DSA",
+      "kv_load_ms": 9689.188154916914,
+      "compute_ms": 233.86583956835835,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 4297916416,
+      "kv_gb_total": 244.16754150390625,
+      "indexer_kv_bytes_per_layer": 4294967296,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    },
+    {
+      "seq_len": 10485760,
+      "method": "DSA",
+      "kv_load_ms": 12109.823075551834,
+      "compute_ms": 271.26162181455754,
+      "comm_ms": 18.3,
+      "kv_bytes_per_layer": 5371658240,
+      "kv_gb_total": 305.16754150390625,
+      "indexer_kv_bytes_per_layer": 5368709120,
+      "mla_kv_bytes_per_layer": 2949120,
+      "attended_tokens": 2560
+    }
+  ]
+}

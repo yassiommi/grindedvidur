@@ -5,3 +5,4 @@ class ExecutionTimePredictorType(BaseIntEnum):
     DUMMY = 1
     RANDOM_FORREST = 2
     LINEAR_REGRESSION = 3
+    SPARSE_PROFILED = 4

@@ -4,6 +4,9 @@ from vidur.execution_time_predictor.linear_regression_execution_time_predictor i
 from vidur.execution_time_predictor.random_forrest_execution_time_predictor import (
     RandomForrestExecutionTimePredictor,
 )
+from vidur.execution_time_predictor.sparse_profiled_execution_time_predictor import (
+    SparseProfiledExecutionTimePredictor,
+)
 from vidur.types import ExecutionTimePredictorType
 from vidur.utils.base_registry import BaseRegistry
 
@@ -19,4 +22,7 @@ ExecutionTimePredictorRegistry.register(
 )
 ExecutionTimePredictorRegistry.register(
     ExecutionTimePredictorType.LINEAR_REGRESSION, LinearRegressionExecutionTimePredictor
+)
+ExecutionTimePredictorRegistry.register(
+    ExecutionTimePredictorType.SPARSE_PROFILED, SparseProfiledExecutionTimePredictor
 )

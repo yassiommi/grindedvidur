@@ -231,7 +231,7 @@ This reveals a fundamental property of PDD: **faster GPUs don't help overlap bec
 ## Reproduction
 
 ```bash
-python3 run_pdd_experiment.py
+python3 experiments/run_pdd_experiment.py
 ```
 
-Figures and raw data are saved to `example_outputs/experiments/pdd_analysis/`.
+Figures and raw data are saved to `../example_outputs/experiments/pdd_analysis/`.

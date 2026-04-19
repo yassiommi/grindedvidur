@@ -34,7 +34,8 @@ NUM_LAYERS = 61
 # Sweep values: 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 61
 SWEEP_VALUES = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 61]
 
-OUT_DIR = "example_outputs/experiments/ncpumoe_sweep"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(_ROOT, "example_outputs", "experiments", "ncpumoe_sweep")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -58,21 +59,22 @@ def run_simulation(n_cpu_moe: int) -> dict:
     print(f"  CMD: {' '.join(cmd)}")
     print(f"{'='*60}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=_ROOT)
     if result.returncode != 0:
         print(f"  ERROR: {result.stderr[-500:]}")
         return None
 
     # Find the output directory (most recent)
+    sim_out = os.path.join(_ROOT, "simulator_output")
     output_dirs = sorted(
-        [d for d in os.listdir("simulator_output") if d.startswith("2026")],
+        [d for d in os.listdir(sim_out) if d.startswith("20")],
         reverse=True,
     )
     if not output_dirs:
         print("  ERROR: No output directory found")
         return None
 
-    sim_dir = os.path.join("simulator_output", output_dirs[0])
+    sim_dir = os.path.join(sim_out, output_dirs[0])
 
     # Parse layer timings
     layer_csv = os.path.join(sim_dir, "layer_timings.csv")

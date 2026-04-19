@@ -712,6 +712,40 @@ class RandomForrestExecutionTimePredictorConfig(BaseExecutionTimePredictorConfig
 
 
 @dataclass
+class SparseProfiledExecutionTimePredictorConfig(BaseExecutionTimePredictorConfig):
+    """Config for sparse-profiled predictor using empirical MoE/MLA data.
+
+    Uses profiling CSVs (mlp.csv, attention.csv, io.csv) from the
+    sparse profiler to replace analytical estimates.
+    Falls back to analytical when profiling data is unavailable.
+    """
+    sparse_profiling_dir: str = field(
+        default="./data/profiling/compute/{DEVICE}/{MODEL_DIR}",
+        metadata={
+            "help": "Directory containing sparse profiling CSVs "
+                    "(mlp.csv, attention.csv, io.csv). "
+                    "Supports {DEVICE}, {MODEL}, and {MODEL_DIR} placeholders."
+        },
+    )
+    num_estimators: List[int] = field(
+        default_factory=lambda: [250, 500, 750],
+        metadata={"help": "Number of estimators for random forest."},
+    )
+    max_depth: List[int] = field(
+        default_factory=lambda: [8, 16, 32],
+        metadata={"help": "Maximum depth for random forest."},
+    )
+    min_samples_split: List[int] = field(
+        default_factory=lambda: [2, 5, 10],
+        metadata={"help": "Minimum samples split for random forest."},
+    )
+
+    @staticmethod
+    def get_type():
+        return ExecutionTimePredictorType.SPARSE_PROFILED
+
+
+@dataclass
 class ClusterConfig:
     num_replicas: int = field(
         default=1,

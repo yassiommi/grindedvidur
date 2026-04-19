@@ -253,7 +253,7 @@ For models where VRAM is tight but not critically short, dynamic transfer may am
 ```bash
 # Full sweep (runs 13 simulations)
 cd /home/user/grindedvidur
-python run_ncpumoe_experiment.py
+python experiments/run_ncpumoe_experiment.py
 
 # Single run with N=10 CPU-offloaded layers
 python -m vidur.main \

@@ -11,13 +11,14 @@ import sys
 import pandas as pd
 import shutil
 
-RESULTS_DIR = "example_outputs/experiments"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(_ROOT, "example_outputs", "experiments")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ── helpers ──────────────────────────────────────────────────────────
 def patch_pcie_bw(bw: float):
     """Monkey-patch A100 PCIe bandwidth in device_sku_config.py."""
-    path = "vidur/config/device_sku_config.py"
+    path = os.path.join(_ROOT, "vidur/config/device_sku_config.py")
     with open(path) as f:
         src = f.read()
     # Replace the A100 pcie line
@@ -37,7 +38,7 @@ def patch_pcie_bw(bw: float):
 
 def restore_pcie_bw():
     """Restore A100 PCIe bandwidth to Gen4 default."""
-    path = "vidur/config/device_sku_config.py"
+    path = os.path.join(_ROOT, "vidur/config/device_sku_config.py")
     with open(path) as f:
         src = f.read()
     import re
@@ -56,18 +57,19 @@ def run_sim(args: list, label: str) -> str:
     print(f"  RUNNING: {label}")
     print(f"  CMD: {' '.join(cmd)}")
     print(f"{'='*60}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=_ROOT)
     # Find output dir from logs
     for line in result.stderr.split('\n') + result.stdout.split('\n'):
         if 'layer_timings.csv' in line or 'request_metrics' in line:
             # extract path
             for part in line.split():
                 if 'simulator_output/' in part:
-                    return os.path.dirname(part)
+                    return os.path.join(_ROOT, os.path.dirname(part))
     # fallback: find most recent simulator_output dir
-    dirs = sorted([d for d in os.listdir('simulator_output') if d.startswith('20')])
+    sim_out = os.path.join(_ROOT, 'simulator_output')
+    dirs = sorted([d for d in os.listdir(sim_out) if d.startswith('20')])
     if dirs:
-        return os.path.join('simulator_output', dirs[-1])
+        return os.path.join(sim_out, dirs[-1])
     raise RuntimeError(f"Simulation failed:\nSTDOUT: {result.stdout[-500:]}\nSTDERR: {result.stderr[-500:]}")
 
 

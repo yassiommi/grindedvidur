@@ -5,7 +5,7 @@ import sys
 import os
 
 # Add to path
-sys.path.insert(0, '/home/user/grindedvidur')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vidur.config import (
     SimulationConfig,

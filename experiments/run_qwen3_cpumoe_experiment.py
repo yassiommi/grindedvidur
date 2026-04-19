@@ -101,7 +101,8 @@ DYNAMIC_DEFICIT_LAYER_MS = max(PCIE_ACTIVE_XFER_MS, GPU_LAYER_MS)
 N_CPU_MOE_VALUES = [0, 5, 10, 15, 20, 25, 30, 37, 40, 48]
 VRAM_LEVELS_GB = [24, 32, 40, 48, 64, 80]
 
-OUT_DIR = "example_outputs/experiments/qwen3_cpumoe"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = os.path.join(_ROOT, "example_outputs", "experiments", "qwen3_cpumoe")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -188,22 +189,23 @@ def run_simulator_sweep():
         print(f"{'='*60}")
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=_ROOT)
             if result.returncode != 0:
                 err = result.stderr[-500:] if result.stderr else "unknown"
                 print(f"  ERROR: {err}")
                 sim_results.append({"n_cpu_moe": n, "sim_status": "error"})
                 continue
 
+            sim_out = os.path.join(_ROOT, "simulator_output")
             output_dirs = sorted(
-                [d for d in os.listdir("simulator_output") if d.startswith("2026")],
+                [d for d in os.listdir(sim_out) if d.startswith("20")],
                 reverse=True,
             )
             if not output_dirs:
                 sim_results.append({"n_cpu_moe": n, "sim_status": "no_output"})
                 continue
 
-            sim_dir = os.path.join("simulator_output", output_dirs[0])
+            sim_dir = os.path.join(sim_out, output_dirs[0])
 
             req_csv = os.path.join(sim_dir, "request_metrics.csv")
             e2e_times = []

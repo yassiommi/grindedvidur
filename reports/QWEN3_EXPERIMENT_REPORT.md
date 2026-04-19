@@ -285,10 +285,10 @@ For DeepSeek-V3, active expert data is 672 MB/layer at FP16, taking 26.7 ms over
 
 ```bash
 cd /home/user/grindedvidur
-python run_qwen3_cpumoe_experiment.py
+python experiments/run_qwen3_cpumoe_experiment.py
 ```
 
-Results are saved to `example_outputs/experiments/qwen3_cpumoe/`.
+Results are saved to `../example_outputs/experiments/qwen3_cpumoe/`.
 
 ## Appendix: Generated Figures
 
