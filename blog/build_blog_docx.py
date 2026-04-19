@@ -416,6 +416,89 @@ para(
     "or hierarchical indexing could reduce this further."
 )
 
+heading("What Happens When the KV Cache Doesn\u2019t Fit in HBM?", 2)
+para(
+    "The seq_len sweep above assumed all KV data \u2014 indexer K plus attended MLA KV \u2014 "
+    "resides in GPU HBM. But on a single H100 with ~20 GB free after model weights, the "
+    "combined KV cache exceeds VRAM at ~512K tokens (50 GB for a single sequence). Beyond "
+    "that, the KV must be offloaded to host DRAM and fetched over PCIe each decode step."
+)
+para(
+    "We modeled both modes on H100 SXM: HBM at 1,384 GB/s (effective) versus PCIe at "
+    "51.5 GB/s. The per-layer decode pipeline has three blocks: Block A (Q projections, "
+    "0.079 ms constant), Block B (indexer K read + top-k select, grows with seq_len), and "
+    "Block C + MoE (attention on 2,560 selected tokens + expert FFN, 0.701 ms constant). "
+    "Blocks A and B run in parallel as max(A, B), then C and MoE run sequentially."
+)
+img("fig18_dsa_offload_penalty.png")
+caption("Figure 9: Left \u2014 TPOT vs. context length for HBM (blue) and offload (red). "
+        "At 4K the gap is negligible (1.03\u00d7); at 1M it reaches 5.4\u00d7 (130 ms \u2192 "
+        "703 ms). Right \u2014 Per-layer stacked breakdown: the green constant floor "
+        "(attention + MoE, 0.70 ms) is identical in both modes. Only the indexer K read "
+        "(blue = HBM, red = PCIe) changes. At 1M context, the indexer read is 0.36 ms on "
+        "HBM vs. 9.7 ms on PCIe \u2014 the entire 5.4\u00d7 TPOT gap comes from this single "
+        "IO operation.")
+spacer()
+para(
+    "The result is cleanly structural: DSA\u2019s only seq_len-dependent term is the indexer "
+    "K read (512 bytes/token, FP8). Everything else \u2014 the attended MLA KV gather (2,560 "
+    "tokens, constant), attention core, MoE \u2014 is fixed. So the HBM-vs-offload gap is "
+    "set entirely by the ratio of HBM to PCIe bandwidth on a single data structure."
+)
+table(
+    ["Context", "TPOT (HBM)", "TPOT (offload)", "Slowdown"],
+    [
+        ["4K", "47.5 ms", "48.9 ms", "1.03\u00d7"],
+        ["32K", "47.5 ms", "66.8 ms", "1.41\u00d7"],
+        ["128K", "54.7 ms", "128.3 ms", "2.35\u00d7"],
+        ["512K", "87.0 ms", "374.4 ms", "4.31\u00d7"],
+        ["1M", "130.0 ms", "702.5 ms", "5.41\u00d7"],
+    ]
+)
+spacer()
+para(
+    "Below ~32K context, HBM mode is actually compute-bound: the indexer K read finishes "
+    "within the 0.015 ms HBM floor and Block B stays below Block A\u2019s 0.079 ms. The "
+    "entire attention path is bounded by Block C + MoE. This is why HBM TPOT is flat at "
+    "47.5 ms for both 4K and 32K \u2014 the indexer is too small to matter."
+)
+
+heading("Does Batching Rescue Offloading?", 2)
+para(
+    "A natural hypothesis: batching multiple sequences increases compute per step (larger "
+    "GEMMs), potentially hiding the PCIe IO behind longer compute windows. We swept batch "
+    "sizes from 1 to 256 across three context lengths to test this."
+)
+img("fig19_dsa_batch_throughput.png")
+caption("Figure 10: Left \u2014 Aggregate throughput vs. batch size. HBM throughput (solid) "
+        "continues climbing; offload throughput (dashed) saturates early. At 128K, offload "
+        "locks at 10.7 tok/s regardless of batch size. At 1M, it flatlines at 1.5 tok/s. "
+        "Right \u2014 With IO/compute overlap (pipelining), offload matches HBM at 4K "
+        "context (lines overlap), but at 128K+ pipelining only hides the smaller compute "
+        "behind the larger IO \u2014 throughput remains flat.")
+spacer()
+para(
+    "Batching does not rescue offloaded DSA at long context. The PCIe indexer K read "
+    "scales as BS \u00d7 seq_len \u00d7 512 B / 51.5 GB/s, and once this exceeds compute "
+    "time, doubling the batch doubles both IO and compute equally \u2014 throughput "
+    "plateaus. At 128K context, offload throughput saturates at 10.7 tok/s regardless "
+    "of batch size, while HBM continues scaling to 53.5 tok/s (5\u00d7 higher)."
+)
+para(
+    "With IO/compute pipelining (double-buffering the indexer K fetch behind the prior "
+    "layer\u2019s compute), offload throughput at \u22644K context matches HBM exactly \u2014 "
+    "the PCIe transfer is fully hidden. But at \u2265128K, pipelining only hides the smaller "
+    "compute (0.84 ms/layer at BS=1) behind the much larger IO (1.4 ms/layer), so "
+    "the throughput ceiling is set by PCIe bandwidth alone: 1000 / (61 \u00d7 indexer_io_ms), "
+    "independent of batch size."
+)
+para(
+    "A practical mitigation: keep the indexer K cache on HBM (only 512 B/token, FP8) and "
+    "offload only the larger MLA KV (1,152 B/token). This eliminates the dominant PCIe "
+    "term, leaving only the 2,560-token attended KV gather (2.88 MB per layer, constant in "
+    "seq_len) on the PCIe path \u2014 which completes in ~0.06 ms at the PCIe floor."
+)
+
 doc.add_page_break()
 
 # ══════════════════════════════════════════════════════════════
@@ -453,7 +536,7 @@ table(
 )
 spacer()
 img("fig04_engram_pareto.png")
-caption("Figure 9: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
+caption("Figure 11: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
         "Center \u2014 Engram is 21\u201331% faster. Right \u2014 Prefetch headroom: "
         "IO never stalls (9\u201364\u00d7 budget).")
 spacer()
@@ -527,7 +610,7 @@ para(
     "the bottleneck shifts to compute, and further IO reduction has minimal effect."
 )
 img("fig05_turboquant_impact.png")
-caption("Figure 10: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
+caption("Figure 12: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
         "on IO-bound MHA, minimal change on already-compact GQA. Right \u2014 Access patterns: "
         "MHA reads everything; MLA reads 1.6%; TQ reads sparse discrete.")
 spacer()
@@ -566,7 +649,7 @@ table(
 )
 spacer()
 img("fig11_prefix_caching.png")
-caption("Figure 11: Left \u2014 Token hit rate scales linearly with sharing fraction. "
+caption("Figure 13: Left \u2014 Token hit rate scales linearly with sharing fraction. "
         "Right \u2014 Eviction pressure drops 17\u00d7 at 90% sharing.")
 spacer()
 para(
@@ -605,14 +688,14 @@ para(
     "concurrent sessions (2\u201312) and cache sizes (200\u20131,200 blocks)."
 )
 img("fig14_thrashing_phases.png")
-caption("Figure 12: Cache utilization (green) stays high throughout, but token hit rate (blue) "
+caption("Figure 14: Cache utilization (green) stays high throughout, but token hit rate (blue) "
         "collapses during sustained thrashing (Phase 2). The 65-percentage-point gap between "
         "utilization and hit rate is the monitoring blind spot.")
 spacer()
 
 heading("A Binary Cliff", 2)
 img("fig06_thrashing_cliff.png")
-caption("Figure 13: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
+caption("Figure 15: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
         "hit rate is nearly instantaneous. Right \u2014 Below the threshold: no penalty. "
         "Above it: immediate 5\u00d7 compute overhead, 81% wasted.")
 spacer()
@@ -672,7 +755,7 @@ para(
     "The reported tiered cost is the wall-clock max(IO, compute), not the sum."
 )
 img("fig15_pcie_kv_reload.png")
-caption("Figure 14: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
+caption("Figure 16: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
         "(reload costs more than recompute); PCIe Gen4 recovers 60% of wasted compute; CXL "
         "reaches 76%. Right \u2014 70B with GQA achieves 80% savings because prefill is expensive "
         "and GQA keeps the KV footprint small enough that PCIe reload is 61\u00d7 cheaper than "
@@ -704,7 +787,7 @@ para(
     "not just steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
-caption("Figure 15: Per-request TTFT over time for the 8-concurrent / 400-block "
+caption("Figure 17: Per-request TTFT over time for the 8-concurrent / 400-block "
         "configuration, with PCIe reload overlapped against residual recompute "
         "(wall-clock = max(IO, compute)). Both panels share the same workload; only "
         "the hardware/architecture differs. Left \u2014 A100 + Llama-2-7B (MHA): "
@@ -732,7 +815,7 @@ para(
 
 heading("Heterogeneous Agents Make It Worse", 2)
 img("fig07_utilization_lies_hetero.png")
-caption("Figure 16: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
+caption("Figure 18: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
         "Right \u2014 Agent mix at 800 blocks: short+long (21%) is worse than all-medium (56%).")
 spacer()
 
@@ -756,7 +839,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("9. The Full Compression Stack", 1)
 img("fig10_full_compression_stack.png")
-caption("Figure 17: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
+caption("Figure 19: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
         "Prefix Cache (1.9 GB effective at 1M context). The H100 80 GB line shows the "
         "single-GPU feasibility boundary.")
 spacer()

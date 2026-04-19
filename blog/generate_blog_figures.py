@@ -903,6 +903,180 @@ plt.tight_layout()
 save(fig, "fig17_dsa_seqlen_sweep.png")
 
 # ================================================================
+# FIGURE 18: DSA Offload Penalty — HBM vs PCIe TPOT + block breakdown
+# ================================================================
+# Data from REPORT_DSA.md Section 2 & 4 (H100 SXM, BS=1)
+fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+
+_sl = np.array([4096, 32768, 131072, 524288, 1048576])
+_tpot_hbm = np.array([47.5, 47.5, 54.7, 87.0, 130.0])
+_tpot_off = np.array([48.9, 66.8, 128.3, 374.4, 702.5])
+
+# Left: TPOT vs seq_len
+ax = axes[0]
+ax.plot(_sl, _tpot_hbm, "s-", color=ACCENT1, linewidth=2.5, markersize=8,
+        label="HBM (all KV in GPU memory)", zorder=3)
+ax.plot(_sl, _tpot_off, "o-", color=ACCENT4, linewidth=2.5, markersize=8,
+        label="Offload (KV on CPU, PCIe fetch)", zorder=3)
+ax.fill_between(_sl, _tpot_hbm, _tpot_off, alpha=0.10, color=ACCENT4)
+
+# Slowdown annotations at key points
+for i, s in enumerate(_sl):
+    ratio = _tpot_off[i] / _tpot_hbm[i]
+    if ratio > 1.1:
+        ax.text(s, _tpot_off[i] * 1.10,
+                f"{ratio:.1f}\u00d7", fontsize=9, fontweight="bold",
+                color=ACCENT4, ha="center", va="bottom")
+
+ax.set_xscale("log", base=2)
+ax.set_yscale("log")
+ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+    lambda x, _: f"{x/1e6:.0f}M" if x >= 1e6 else f"{x/1e3:.0f}K"))
+ax.yaxis.set_major_formatter(ticker.FuncFormatter(
+    lambda x, _: f"{x:.0f} ms"))
+ax.set_xlabel("Context Length (tokens)")
+ax.set_ylabel("TPOT (ms)")
+ax.set_title("TPOT: HBM vs. Offload  (H100, BS=1)", pad=10)
+ax.legend(fontsize=9.5)
+
+# Right: Per-layer block breakdown at 4K, 128K, 1M (both modes)
+ax = axes[1]
+_sel_sl = [4096, 131072, 1048576]
+_sel_labels = ["4K", "128K", "1M"]
+# From report: max(A,B), C, MoE for each (seq_len, mode)
+_block_c = 0.386   # constant
+_block_moe = 0.315  # constant
+_maxAB_hbm = [0.079, 0.196, 1.430]
+_maxAB_off = [0.101, 1.403, 10.816]
+
+x = np.arange(len(_sel_sl))
+w = 0.32
+
+# HBM bars (stacked)
+ax.bar(x - w/2, [_block_c + _block_moe]*3, w, color=ACCENT2, edgecolor="white",
+       linewidth=1.2, zorder=3, label="Attn + MoE (constant)")
+ax.bar(x - w/2, _maxAB_hbm, w, bottom=[_block_c + _block_moe]*3,
+       color=ACCENT1, edgecolor="white", linewidth=1.2, zorder=3,
+       label="Indexer K read (HBM)")
+# Offload bars (stacked)
+ax.bar(x + w/2, [_block_c + _block_moe]*3, w, color=ACCENT2, edgecolor="white",
+       linewidth=1.2, zorder=3, alpha=0.5)
+ax.bar(x + w/2, _maxAB_off, w, bottom=[_block_c + _block_moe]*3,
+       color=ACCENT4, edgecolor="white", linewidth=1.2, zorder=3,
+       label="Indexer K read (PCIe)")
+
+# Value labels on the indexer portion
+for i in range(len(_sel_sl)):
+    base = _block_c + _block_moe
+    for val, xoff, clr in [(_maxAB_hbm[i], -w/2, ACCENT1),
+                            (_maxAB_off[i], w/2, ACCENT4)]:
+        total = base + val
+        ax.text(x[i] + xoff, total + 0.15,
+                f"{val:.2f}" if val < 1 else f"{val:.1f}",
+                ha="center", fontsize=8.5, fontweight="bold", color=clr)
+
+# Mode labels
+ax.text(x[0] - w/2, -0.6, "HBM", ha="center", fontsize=8, color=ACCENT1,
+        fontweight="bold")
+ax.text(x[0] + w/2, -0.6, "PCIe", ha="center", fontsize=8, color=ACCENT4,
+        fontweight="bold")
+
+ax.set_xticks(x)
+ax.set_xticklabels(_sel_labels, fontsize=11)
+ax.set_xlabel("Context Length")
+ax.set_ylabel("Per-Layer Time (ms)")
+ax.set_title("Per-Layer Breakdown: Only the Indexer K Grows", pad=10)
+ax.legend(fontsize=8.5, loc="upper left")
+
+fig.suptitle("DSA Offload Penalty: The Indexer K Read Is the Bottleneck  "
+             "(DeepSeek-V3, H100 SXM, BS=1)",
+             fontsize=14, fontweight="bold", y=1.03)
+plt.tight_layout()
+save(fig, "fig18_dsa_offload_penalty.png")
+
+# ================================================================
+# FIGURE 19: DSA Batch Throughput — batching doesn't rescue offload
+# ================================================================
+_batch_path = os.path.join(REPO, "reports", "figures", "dsa_batch_sweep.json")
+with open(_batch_path) as _f:
+    _batch_data = _json.load(_f)
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 5.5))
+
+_sweep_sls = [4096, 131072, 1048576]
+_sweep_labels = ["4K", "128K", "1M"]
+_sweep_colors = [ACCENT6, ACCENT3, ACCENT5]
+_sweep_bs = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+# Left: raw throughput vs BS
+ax = axes[0]
+for sl, label, clr in zip(_sweep_sls, _sweep_labels, _sweep_colors):
+    for mode, ls, alpha in [("hbm", "-", 1.0), ("offload", "--", 0.7)]:
+        entries = sorted(
+            [d for d in _batch_data if d["mode"] == mode and d["seq_len"] == sl],
+            key=lambda d: d["batch_size"])
+        bs_vals = [e["batch_size"] for e in entries]
+        tput = [e["throughput_tok_per_s"] for e in entries]
+        suffix = " (HBM)" if mode == "hbm" else " (offload)"
+        ax.plot(bs_vals, tput, f"o{ls}", color=clr, linewidth=2.0, markersize=5,
+                alpha=alpha, label=f"{label}{suffix}", zorder=3)
+
+ax.set_xscale("log", base=2)
+ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{int(x)}"))
+ax.set_xlabel("Batch Size")
+ax.set_ylabel("Throughput (tok/s)")
+ax.set_title("Throughput vs. Batch Size", pad=10)
+ax.legend(fontsize=7.5, ncol=2, loc="upper left")
+
+# Annotate offload saturation
+ax.annotate("Offload saturates\nat 10.7 tok/s",
+            xy=(256, 10.7), xytext=(64, 25),
+            fontsize=9, fontweight="bold", color=ACCENT3,
+            arrowprops=dict(arrowstyle="->", color=ACCENT3, lw=1.5),
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF8F0",
+                      edgecolor=ACCENT3, linewidth=0.8, alpha=0.9))
+ax.annotate("1.5 tok/s\n(flat)",
+            xy=(256, 1.5), xytext=(64, 5),
+            fontsize=9, fontweight="bold", color=ACCENT5,
+            arrowprops=dict(arrowstyle="->", color=ACCENT5, lw=1.5),
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#F5F0FF",
+                      edgecolor=ACCENT5, linewidth=0.8, alpha=0.9))
+
+# Right: pipelined throughput — shows convergence at 4K only
+ax = axes[1]
+for sl, label, clr in zip(_sweep_sls, _sweep_labels, _sweep_colors):
+    for mode, ls, alpha in [("hbm", "-", 1.0), ("offload", "--", 0.7)]:
+        entries = sorted(
+            [d for d in _batch_data if d["mode"] == mode and d["seq_len"] == sl],
+            key=lambda d: d["batch_size"])
+        bs_vals = [e["batch_size"] for e in entries]
+        ptput = [e["pipelined_throughput_tok_per_s"] for e in entries]
+        suffix = " (HBM)" if mode == "hbm" else " (offload)"
+        ax.plot(bs_vals, ptput, f"o{ls}", color=clr, linewidth=2.0, markersize=5,
+                alpha=alpha, label=f"{label}{suffix}", zorder=3)
+
+ax.set_xscale("log", base=2)
+ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{int(x)}"))
+ax.set_xlabel("Batch Size")
+ax.set_ylabel("Pipelined Throughput (tok/s)")
+ax.set_title("With IO/Compute Overlap (Pipelining)", pad=10)
+ax.legend(fontsize=7.5, ncol=2, loc="upper left")
+
+# Annotate the convergence at 4K
+ax.annotate("4K: offload matches\nHBM with pipelining",
+            xy=(8, 64.8), xytext=(32, 95),
+            fontsize=9, fontweight="bold", color=ACCENT2,
+            arrowprops=dict(arrowstyle="->", color=ACCENT2, lw=1.5),
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#F0FFF0",
+                      edgecolor=ACCENT2, linewidth=0.8, alpha=0.9))
+
+fig.suptitle("Does Batching Rescue Offloaded DSA?  "
+             "(DeepSeek-V3, H100 SXM, HBM vs. PCIe)",
+             fontsize=14, fontweight="bold", y=1.03)
+plt.tight_layout()
+save(fig, "fig19_dsa_batch_throughput.png")
+
+# ================================================================
 # FIGURE 14: Thrashing Phases — Utilization & Hit Rate over Time
 # ================================================================
 fig, ax = plt.subplots(figsize=(14, 5.5))
