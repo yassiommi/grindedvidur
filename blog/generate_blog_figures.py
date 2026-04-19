@@ -1110,5 +1110,161 @@ ax_hit.legend(fontsize=9, loc="upper right")
 
 save(fig, "fig16_ttft_over_time.png")
 
+# ================================================================
+# FIGURE 17: MoE Expert Weight IO — DeepSeek-V3 offloading cliff
+#            + Qwen3-Coder-Next CPU-resident vs PCIe crossover
+# ================================================================
+
+# --- Data from NCPUMOE_REPORT and QWEN3_EXPERIMENT_REPORT ---
+ncpu_n    = [0,  5,  10,  15,  20,  25,  30,  35,  40,  45,  50,  55,  61]
+ncpu_e2e  = [62, 367, 685, 1003, 1320, 1638, 1956, 2273, 2591, 2909, 3227, 3544, 3926]  # seconds
+ncpu_mem  = [n * 2.59 for n in ncpu_n]  # GB saved per GPU
+
+qw_vram  = [24,   32,   40,   48,   64,   80]
+qw_dyn   = [19.7, 21.1, 23.2, 25.3, 31.5, 40.5]  # dynamic transfer TPS
+cpu_n37_tps = 28.6  # CPU-resident N=37 (fixed)
+
+fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+# --- Left: DeepSeek-V3 n_cpu_moe sweep ---
+color_latency = ACCENT4
+color_mem     = ACCENT1
+ax_mem = ax_l.twinx()
+
+bars = ax_mem.bar(ncpu_n, ncpu_mem, width=3.0, alpha=0.25, color=color_mem,
+                  zorder=1, label="GPU memory freed (GB/GPU)")
+ax_l.plot(ncpu_n, ncpu_e2e, linewidth=2.2, color=color_latency, marker="o",
+          markersize=5, zorder=3, label="Mean E2E latency (s)")
+
+ax_l.axhline(ncpu_e2e[0], linestyle="--", linewidth=1.2, color=GRAY, zorder=2)
+ax_l.text(30, ncpu_e2e[0] + 60, "All-GPU baseline (62 s)", fontsize=9,
+          color=GRAY, va="bottom")
+
+# Annotate a few points
+for i, (n, e) in enumerate(zip(ncpu_n, ncpu_e2e)):
+    if n in (0, 5, 30, 61):
+        pct = round((e - ncpu_e2e[0]) / ncpu_e2e[0] * 100)
+        ax_l.annotate(f"N={n}\n+{pct}%" if n > 0 else "baseline",
+                      xy=(n, e), xytext=(n + 3, e + 100),
+                      fontsize=8, color=color_latency, fontweight="bold",
+                      arrowprops=dict(arrowstyle="-", color=color_latency,
+                                      lw=0.8, alpha=0.6))
+
+ax_l.set_xlabel("CPU-offloaded MoE layers (n_cpu_moe)", fontsize=11)
+ax_l.set_ylabel("E2E latency (s)", fontsize=11, color=color_latency)
+ax_l.tick_params(axis="y", labelcolor=color_latency)
+ax_mem.set_ylabel("GPU memory freed per GPU (GB)", fontsize=11, color=color_mem)
+ax_mem.tick_params(axis="y", labelcolor=color_mem)
+ax_l.set_title("DeepSeek-V3: CPU Offloading Cost\n"
+               "(A100, PCIe Gen4, 64.7× HBM/PCIe gap — each layer +104 ms/pass)",
+               fontsize=11, fontweight="bold", pad=8)
+lines_l, labs_l = ax_l.get_legend_handles_labels()
+lines_m, labs_m = ax_mem.get_legend_handles_labels()
+ax_l.legend(lines_l + lines_m, labs_l + labs_m, fontsize=9, loc="upper left")
+
+# --- Right: Qwen3-Coder-Next CPU-resident vs Dynamic Transfer ---
+vram_smooth = np.linspace(24, 80, 200)
+# Dynamic transfer: TPS grows linearly from 7 (approx) deficit, fit from data
+import numpy.polynomial.polynomial as poly
+coeffs = poly.polyfit(qw_vram, qw_dyn, 1)
+dyn_smooth = poly.polyval(vram_smooth, coeffs)
+
+ax_r.plot(vram_smooth, dyn_smooth, linewidth=2.2, color=ACCENT3,
+          label="Dynamic Transfer (GPU PCIe reload)", zorder=3)
+ax_r.scatter(qw_vram, qw_dyn, s=60, color=ACCENT3, zorder=4)
+ax_r.axhline(cpu_n37_tps, linewidth=2.2, linestyle="--", color=ACCENT1,
+             label=f"CPU-Resident N=37 ({cpu_n37_tps} TPS)", zorder=3)
+
+# Crossover
+crossover_vram = 58.0
+crossover_tps  = 28.9
+ax_r.axvline(crossover_vram, linestyle=":", linewidth=1.5, color=GRAY, zorder=2)
+ax_r.scatter([crossover_vram], [crossover_tps], s=120, color=ACCENT5,
+             zorder=5, label=f"Crossover @ {crossover_vram} GB VRAM")
+ax_r.annotate(f"Crossover\n{crossover_vram} GB VRAM",
+              xy=(crossover_vram, crossover_tps),
+              xytext=(crossover_vram - 22, crossover_tps + 4),
+              fontsize=9, color=ACCENT5, fontweight="bold",
+              arrowprops=dict(arrowstyle="->", color=ACCENT5, lw=1.2))
+
+# Region labels
+ax_r.fill_between(vram_smooth, cpu_n37_tps, dyn_smooth,
+                  where=dyn_smooth < cpu_n37_tps, alpha=0.08, color=ACCENT1)
+ax_r.fill_between(vram_smooth, cpu_n37_tps, dyn_smooth,
+                  where=dyn_smooth >= cpu_n37_tps, alpha=0.08, color=ACCENT3)
+ax_r.text(35, 22, "CPU-Resident wins\n(PCIe too slow)", fontsize=9,
+          color=ACCENT1, fontweight="bold", ha="center")
+ax_r.text(72, 36, "Dynamic\nwins", fontsize=9,
+          color=ACCENT3, fontweight="bold", ha="center")
+
+ax_r.set_xlabel("Available GPU VRAM (GB)", fontsize=11)
+ax_r.set_ylabel("Tokens per second (TPS)", fontsize=11)
+ax_r.set_title("Qwen3-Coder-Next 80B-A3B: CPU-Resident vs PCIe Transfer\n"
+               "(30 MB active expert weights/layer — 7.9× less than DeepSeek-V3)",
+               fontsize=11, fontweight="bold", pad=8)
+ax_r.legend(fontsize=9, loc="upper left")
+ax_r.set_xlim(22, 82)
+
+fig.suptitle("MoE Expert Weight IO: When PCIe Becomes the Compute Wall\n"
+             "Same bandwidth that limits KV reload also governs expert weight streaming",
+             fontsize=12, fontweight="bold", y=1.01)
+plt.tight_layout()
+save(fig, "fig17_moe_expert_offloading.png")
+
+# ================================================================
+# FIGURE 18: Heterogeneous agents — unlimited cache overhead bar chart
+#            Data: Section 10.6 of THRASHING_REPORT, 800-block cache
+# ================================================================
+
+mixes    = ["all_short", "high_var", "all_medium", "mixed_3way", "short+long", "all_long"]
+overhead = [1.00,        2.76,       3.79,          7.64,         10.63,        10.85]
+tput_pct = [100,         36,         26,            13,           9,            9]
+labels   = ["Short\n(100%)", "High-var\n(100%)", "Medium\n(100%)",
+            "Mixed\n3-way", "Short +\nLong", "Long\n(100%)"]
+# colour by severity: green → yellow → red
+bar_colors = [ACCENT2, ACCENT2, ACCENT3, ACCENT4, ACCENT4, ACCENT4]
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
+
+x = np.arange(len(mixes))
+b1 = ax1.bar(x, overhead, color=bar_colors, width=0.6, alpha=0.85, zorder=3)
+ax1.axhline(1.0, linestyle="--", linewidth=1.2, color=GRAY, zorder=2,
+            label="Oracle floor (1.0× = no waste)")
+for bar, val in zip(b1, overhead):
+    ax1.text(bar.get_x() + bar.get_width()/2, val + 0.15,
+             f"{val:.2f}×", ha="center", va="bottom", fontsize=9,
+             fontweight="bold", color=TEXT_CLR)
+ax1.set_xticks(x)
+ax1.set_xticklabels(labels, fontsize=10)
+ax1.set_ylabel("Compute overhead vs oracle (×)", fontsize=11)
+ax1.set_title("Compute Overhead by Agent Mix\n(8 concurrent sessions, 800-block HBM, vs unlimited cache)",
+              fontsize=11, fontweight="bold", pad=8)
+ax1.set_ylim(0, 13)
+ax1.legend(fontsize=9)
+ax1.yaxis.set_minor_locator(ticker.MultipleLocator(1))
+ax1.grid(axis="y", color=GRID_CLR, zorder=0)
+
+b2 = ax2.bar(x, tput_pct, color=bar_colors, width=0.6, alpha=0.85, zorder=3)
+ax2.axhline(100, linestyle="--", linewidth=1.2, color=GRAY, zorder=2,
+            label="Unlimited-cache throughput (100%)")
+for bar, val in zip(b2, tput_pct):
+    ax2.text(bar.get_x() + bar.get_width()/2, val + 1.0,
+             f"{val}%", ha="center", va="bottom", fontsize=9,
+             fontweight="bold", color=TEXT_CLR)
+ax2.set_xticks(x)
+ax2.set_xticklabels(labels, fontsize=10)
+ax2.set_ylabel("Effective throughput vs oracle (%)", fontsize=11)
+ax2.set_title("Effective Throughput by Agent Mix\n(same config — 100% = what unlimited cache would deliver)",
+              fontsize=11, fontweight="bold", pad=8)
+ax2.set_ylim(0, 120)
+ax2.legend(fontsize=9)
+ax2.grid(axis="y", color=GRID_CLR, zorder=0)
+
+fig.suptitle("Heterogeneous Thrashing Cost: Long Agents Dominate Cache Pressure\n"
+             "Short agents pay nothing; any long-agent presence dominates the mix",
+             fontsize=12, fontweight="bold", y=1.01)
+plt.tight_layout()
+save(fig, "fig18_hetero_unlimited_cost.png")
+
 print(f"\nAll figures saved to {OUT}/")
 print("Done!")

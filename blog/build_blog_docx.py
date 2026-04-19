@@ -175,7 +175,10 @@ para("\u2022  \u00a7 3. The Compression Ladder: MHA \u2192 GQA \u2192 MLA \u2014
      "each generation of attention shrinks the per-token KV footprint, and what that does "
      "to prefill-decode disaggregation.")
 para("\u2022  \u00a7 4. DeepSeek Sparse Attention \u2014 push compression past the representation "
-     "layer into the access pattern itself: not every token needs to be read every step.")
+     "layer into the access pattern itself: not every token needs to be read every step. "
+     "Then zoom out to the expert weights: the same PCIe bus that limits KV reload also "
+     "governs expert streaming, and the math is brutal for large MoE (64.7\u00d7 HBM/PCIe "
+     "gap, +492% latency per 5 offloaded layers) but inverts for small-expert models.")
 para("\u2022  \u00a7 5. Engram: Conditional Memory \u2014 make the KV cache content-addressable so "
      "decode IO becomes O(1) in context length instead of O(n).")
 para("\u2022  \u00a7 6. TurboQuant \u2014 simulate 3-bit KV quantization across every architecture "
@@ -376,6 +379,52 @@ para(
     "not KV IO, as the emerging bottleneck for sparse MoE models at moderate context lengths. "
     "The simulator decomposes these contributions cleanly, which would be difficult to isolate "
     "from end-to-end GPU profiling."
+)
+
+heading("Expert Weight IO: MoE\u2019s Second IO Wall", 2)
+para(
+    "Sparse attention compresses the KV access pattern, but MoE models have a second IO "
+    "bottleneck: the expert weights themselves. When VRAM cannot hold all expert weights, "
+    "layers must be offloaded to CPU memory and reloaded on demand. The PCIe bus governs "
+    "this transfer \u2014 the same bandwidth that limits KV cache reload now limits expert weight "
+    "streaming."
+)
+para(
+    "For DeepSeek-V3 (671B, 256 experts, EP=8 on A100 DGX), each GPU must hold 32 local "
+    "expert weight sets per layer. At FP16, that is 2.59 GB per layer per GPU. Loading over "
+    "PCIe Gen4 takes 104 ms per layer per forward pass \u2014 vs 1.6 ms from HBM, a 64.7\u00d7 "
+    "bandwidth gap. Offloading even 5 layers increases end-to-end latency by 492%. Offloading "
+    "all 61 layers increases it by 6,230%. The degradation is exactly linear: every offloaded "
+    "layer adds a fixed 104 ms because there is no amortization, caching, or overlap that "
+    "reduces the marginal cost."
+)
+para(
+    "The model-size dependency is the mirror image of the KV reload result. For Qwen3-Coder-Next "
+    "(80B-A3B, 512 experts, 10 active per token), each layer\u2019s active expert weights are "
+    "only 30 MB \u2014 22\u00d7 less than DeepSeek-V3. At this size, the CPU DRAM path (30 MB "
+    "at 200 GB/s = 0.15 ms) beats the PCIe path (30 MB at 25.2 GB/s = 1.16 ms) by 7.9\u00d7. "
+    "CPU-resident expert computation is faster than PCIe streaming because the expert FFN "
+    "itself is compute-light. When VRAM is below 58 GB, CPU-resident wins (28.6 TPS vs "
+    "20.8 TPS for dynamic PCIe transfer). Above 58 GB, enough layers stay in VRAM that "
+    "PCIe transfers for the deficit layers become the smaller penalty."
+)
+img("fig17_moe_expert_offloading.png")
+caption("Figure 17: Left \u2014 DeepSeek-V3: E2E latency grows linearly with n_cpu_moe. "
+        "Even N=5 offloaded layers causes a 492% latency increase because each layer adds "
+        "104 ms per forward pass over PCIe Gen4 (64.7\u00d7 slower than HBM). Blue bars show "
+        "GPU memory freed \u2014 the only tradeoff for paying this cost. "
+        "Right \u2014 Qwen3-Coder-Next: the crossover between CPU-resident and PCIe dynamic "
+        "transfer. Below 58 GB VRAM, CPU-resident wins because 30 MB active expert weights "
+        "are faster to compute locally than to transfer over PCIe. Above 58 GB, enough layers "
+        "fit in VRAM that dynamic transfer wins.")
+spacer()
+para(
+    "The IO perspective unifies both results: the PCIe bus is a shared resource whose "
+    "cost-per-byte is constant. What changes is the bytes-per-layer on one side and the "
+    "compute-per-forward-pass on the other. DeepSeek-V3\u2019s 2.59 GB/layer expert footprint "
+    "is simply too large for PCIe to serve economically at inference frequencies. Qwen3\u2019s "
+    "30 MB/layer footprint flips the equation. The simulator identifies this regime boundary "
+    "without requiring hardware runs at each point."
 )
 
 doc.add_page_break()
@@ -711,6 +760,53 @@ para(
     "set \u00d7 its concurrent count, not the average across types."
 )
 
+heading("The Compute Cost by Agent Type", 2)
+para(
+    "Comparing each agent mix against an oracle unlimited cache makes the cost structure stark. "
+    "We ran every mix twice \u2014 once with the 800-block HBM, once with an unlimited cache "
+    "\u2014 and measured compute overhead (ratio of prefill compute performed to prefill compute "
+    "strictly needed):"
+)
+img("fig18_hetero_unlimited_cost.png")
+caption("Figure 18: Left \u2014 Compute overhead vs oracle by agent mix at 800-block HBM. "
+        "Short agents: no overhead (1.0\u00d7). Any long-agent presence pushes overhead to "
+        "10\u00d7+. Right \u2014 Effective throughput as a percentage of unlimited-cache capacity. "
+        "A pool with 100% long agents delivers only 9% of the throughput it could achieve "
+        "with sufficient cache, wasting 91% of GPU compute on redundant prefill.")
+spacer()
+para(
+    "Long agents never recover regardless of cache size. Even at 1,200 blocks, all_long wastes "
+    "90% of prefill compute because their maximum context (469 blocks \u00d7 8 concurrent = "
+    "3,752 blocks) exceeds all tested cache sizes. Every step re-triggers massive evictions. "
+    "Short agents pay nothing: their working set (39 blocks \u00d7 8 = 312 blocks) comfortably "
+    "fits in 400 blocks. High-variance agents sit in the middle (2.76\u00d7, 36% throughput) "
+    "with bursty eviction episodes but no sustained thrashing. The short+long mix (10.63\u00d7) "
+    "is nearly identical to all_long \u2014 long agents\u2019 3,752-block working set completely "
+    "governs cache pressure regardless of how many short agents share the pool."
+)
+
+heading("Capacity Planning: The Break-Even Rule", 2)
+para(
+    "The binary nature of the thrashing cliff gives a simple provisioning rule. Combining the "
+    "phase-boundary finding (Finding 11) and the agent-type cost analysis:"
+)
+table(
+    ["Agent type", "Max blocks/session", "8 concurrent requires", "Safe cache size"],
+    [
+        ["short (4 steps)", "39 blocks", "312 blocks", "~400 blocks"],
+        ["medium (12 steps)", "169 blocks", "1,352 blocks", "~1,400 blocks"],
+        ["long (24 steps)", "469 blocks", "3,752 blocks", "~4,000 blocks"],
+        ["high_var (10 steps, CV=0.9)", "~200 blocks (mean)", "~1,600 blocks", "~2,000 blocks"],
+    ]
+)
+spacer()
+para(
+    "For mixed pools, dimension against the largest agent type present. A pool with even "
+    "25% long agents requires the same cache as 100% long agents. Under-sizing by even one "
+    "session worth of blocks pushes the entire pool over the cliff into the 81\u201391% "
+    "compute-waste regime, with no intermediate penalty level."
+)
+
 doc.add_page_break()
 
 # ══════════════════════════════════════════════════════════════
@@ -784,24 +880,35 @@ para(
     "Each GPU generation makes KV IO relatively more of the bottleneck.",
     bold=False
 )
+para(
+    "8. The thrashing cliff is a hard phase boundary: either 0% wasted or 81\u201391% wasted, "
+    "no intermediate regime. Long agents (24 steps, 7,500-token max context) waste 91% of "
+    "prefill compute even at 1,200-block caches. Incremental cache increases only help if "
+    "they push the system below the thrashing threshold entirely.",
+    bold=False
+)
+para(
+    "9. Heterogeneous pools are dominated by the worst agent type. "
+    "Any long-agent presence drives compute overhead to 10\u00d7+ regardless of how many "
+    "short agents share the pool. Cache must be provisioned for the largest type\u2019s "
+    "full working set \u00d7 its concurrent count \u2014 not the average.",
+    bold=False
+)
+para(
+    "10. Expert weight IO is the second IO wall in sparse MoE. "
+    "For DeepSeek-V3, each CPU-offloaded layer adds 104 ms per forward pass (64.7\u00d7 "
+    "slower than HBM). The per-layer cost is constant and purely additive \u2014 no "
+    "amortization. For smaller-expert models (Qwen3-Coder-Next, 30 MB/layer), CPU-resident "
+    "computation beats PCIe streaming when VRAM < 58 GB because CPU DRAM (200 GB/s) "
+    "outpaces PCIe (25.2 GB/s) at these data volumes.",
+    bold=False
+)
 spacer()
 para(
     "The simulator runs without GPUs and can be extended with new techniques by "
     "specifying their IO and compute characteristics \u2014 no hardware required.",
     italic=True
 )
-
-spacer()
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-run = p.add_run(
-    "InferLens: High-Fidelity LLM Inference Simulator  \u00b7  "
-    "MSR-India Systems Group & Systems for AI Lab @ Georgia Tech  \u00b7  "
-    "MLSys\u201924  (arxiv.org/abs/2405.05465)"
-)
-run.font.size = Pt(9)
-run.font.color.rgb = RGBColor(0x95, 0x9D, 0xA5)
-run.italic = True
 
 # ── Save ──────────────────────────────────────────────────────
 doc.save(OUT)
