@@ -203,6 +203,7 @@ class PddReplicaScheduler(BaseReplicaScheduler):
         Args:
             batch: Completed batch
         """
+        self._insert_completed_into_prefix_cache(batch)
         for request in batch.requests:
             if request.completed:
                 self.free(request.id)

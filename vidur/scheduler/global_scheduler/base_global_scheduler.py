@@ -43,6 +43,10 @@ class BaseGlobalScheduler(ABC):
     def add_request(self, request: Request) -> None:
         self._request_queue.append(request)
 
+    @property
+    def replica_schedulers(self):
+        return self._replica_schedulers.values()
+
     def get_replica_scheduler(self, replica_id: int):
         return self._replica_schedulers[replica_id]
 

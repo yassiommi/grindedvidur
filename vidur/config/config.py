@@ -253,6 +253,46 @@ class TraceRequestGeneratorConfig(BaseRequestGeneratorConfig):
 
 
 @dataclass
+class PrefixCacheConfig:
+    """Configuration for prefix-aware KV cache with radix tree (SGLang-style).
+
+    When enabled, requests sharing common token prefixes can reuse cached
+    KV blocks, reducing redundant prefill computation. The cache uses LRU
+    eviction on leaf nodes of a radix tree.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable prefix-aware KV cache with radix tree."},
+    )
+    max_blocks_fraction: float = field(
+        default=0.2,
+        metadata={
+            "help": "Fraction of total KV cache blocks reserved for prefix caching. "
+            "These blocks are used to retain completed requests' KV state for reuse."
+        },
+    )
+    num_shared_prefixes: int = field(
+        default=5,
+        metadata={
+            "help": "Number of distinct shared prefix groups for synthetic workloads. "
+            "Requests within a group share a common system prompt prefix."
+        },
+    )
+    shared_prefix_length_fraction: float = field(
+        default=0.3,
+        metadata={
+            "help": "Fraction of prefill tokens that form the shared prefix. "
+            "E.g., 0.3 means 30%% of prefill tokens are from a shared system prompt."
+        },
+    )
+    seed: int = field(
+        default=42,
+        metadata={"help": "Random seed for synthetic prefix assignment."},
+    )
+
+
+@dataclass
 class BaseReplicaSchedulerConfig(BasePolyConfig):
     batch_size_cap: int = field(
         default=128,
@@ -269,6 +309,10 @@ class BaseReplicaSchedulerConfig(BasePolyConfig):
     num_blocks: Optional[int] = field(
         default=None,
         metadata={"help": "Number of blocks."},
+    )
+    prefix_cache_config: PrefixCacheConfig = field(
+        default_factory=PrefixCacheConfig,
+        metadata={"help": "Prefix cache configuration."},
     )
 
 

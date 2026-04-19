@@ -59,6 +59,7 @@ class SarathiReplicaScheduler(BaseReplicaScheduler):
 
     def on_batch_end(self, batch: Batch) -> None:
         self._num_running_batches -= 1
+        self._insert_completed_into_prefix_cache(batch)
 
         for request in batch.requests:
             if request.completed:
@@ -74,8 +75,10 @@ class SarathiReplicaScheduler(BaseReplicaScheduler):
         if request.is_prefill_complete:
             return 1
 
+        # Account for prefix cache hits: only process uncached tokens
+        remaining_prefill = request.num_prefill_tokens - request.num_processed_tokens
         next_num_tokens = min(
-            request.num_prefill_tokens - request.num_processed_tokens,
+            remaining_prefill,
             self._config.chunk_size - num_batch_tokens,
         )
 

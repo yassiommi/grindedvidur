@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 from vidur.entities.base_entity import BaseEntity
 from vidur.entities.kv_cache_metadata import KvCacheMetadata
@@ -33,6 +33,7 @@ class Request(BaseEntity):
         num_prefill_tokens: int,
         num_decode_tokens: int,
         num_processed_tokens: int = 0,
+        token_ids: Optional[Tuple[int, ...]] = None,
     ):
         self._id = Request.generate_id()
         self._arrived_at = arrived_at
@@ -59,6 +60,13 @@ class Request(BaseEntity):
         self._is_prefill_complete = False
 
         self._num_restarts = 0
+
+        # Token IDs for prefix cache matching (None = prefix caching disabled)
+        self._token_ids: Optional[Tuple[int, ...]] = token_ids
+
+        # Prefix cache tracking
+        self._prefix_cache_hit_tokens: int = 0  # tokens found in cache
+        self._original_prefill_tokens: int = num_prefill_tokens  # before cache reduction
 
         # KV cache metadata for PDD (Prefill-Decode Disaggregation)
         self._kv_cache_metadata: Optional[KvCacheMetadata] = None
@@ -205,6 +213,39 @@ class Request(BaseEntity):
     @property
     def has_started_decode(self) -> bool:
         return self._num_processed_tokens > self._num_prefill_tokens + 1
+
+    @property
+    def token_ids(self) -> Optional[Tuple[int, ...]]:
+        return self._token_ids
+
+    @property
+    def prefix_cache_hit_tokens(self) -> int:
+        return self._prefix_cache_hit_tokens
+
+    @property
+    def original_prefill_tokens(self) -> int:
+        return self._original_prefill_tokens
+
+    @property
+    def prefix_cache_hit_ratio(self) -> float:
+        if self._original_prefill_tokens == 0:
+            return 0.0
+        return self._prefix_cache_hit_tokens / self._original_prefill_tokens
+
+    def apply_prefix_cache_hit(self, num_cached_tokens: int) -> None:
+        """Reduce prefill tokens based on prefix cache hit.
+
+        The cached tokens don't need to be re-prefilled, so we reduce the
+        effective prefill token count. The original count is preserved for metrics.
+
+        Args:
+            num_cached_tokens: Number of prefix tokens found in cache.
+        """
+        if num_cached_tokens <= 0:
+            return
+        num_cached_tokens = min(num_cached_tokens, self._num_prefill_tokens)
+        self._prefix_cache_hit_tokens = num_cached_tokens
+        self._num_processed_tokens = num_cached_tokens
 
     @property
     def kv_cache_metadata(self) -> Optional[KvCacheMetadata]:
@@ -359,6 +400,10 @@ class Request(BaseEntity):
             "latest_iteration_completed_at": self._latest_iteration_completed_at,
             "num_restarts": self._num_restarts,
         }
+        if self._prefix_cache_hit_tokens > 0:
+            result["prefix_cache_hit_tokens"] = self._prefix_cache_hit_tokens
+            result["original_prefill_tokens"] = self._original_prefill_tokens
+            result["prefix_cache_hit_ratio"] = self.prefix_cache_hit_ratio
         if self._kv_cache_metadata is not None:
             result["kv_cache_bytes"] = self._kv_cache_metadata.cache_bytes
             result["kv_transfer_time_ms"] = self._kv_cache_metadata.transfer_time_ms
