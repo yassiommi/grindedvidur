@@ -174,10 +174,13 @@ para("\u2022  \u00a7 2. Establishing the IO Wall \u2014 decompose decode latency
 para("\u2022  \u00a7 3. The Compression Ladder: MHA \u2192 GQA \u2192 MLA \u2014 trace how "
      "each generation of attention shrinks the per-token KV footprint, and what that does "
      "to prefill-decode disaggregation.")
-para("\u2022  \u00a7 4. DeepSeek Sparse Attention \u2014 push compression past the representation "
-     "layer into the access pattern itself: not every token needs to be read every step.")
-para("\u2022  \u00a7 5. Engram: Conditional Memory \u2014 make the KV cache content-addressable so "
-     "decode IO becomes O(1) in context length instead of O(n).")
+para("\u2022  \u00a7 4. DeepSeek Sparse Attention \u2014 push compression into the access pattern "
+     "itself (only 2,560 tokens attended per layer), then ask what happens when even that "
+     "reduced KV doesn\u2019t fit in HBM and must be fetched over PCIe \u2014 and whether "
+     "batching helps.")
+para("\u2022  \u00a7 5. Engram: Conditional Memory \u2014 replace a fraction of MoE experts with a "
+     "deterministic hash-based lookup table, making that component\u2019s IO O(1) in table "
+     "size and fully prefetchable, freeing HBM for KV cache.")
 para("\u2022  \u00a7 6. TurboQuant \u2014 simulate 3-bit KV quantization across every architecture "
      "in one sweep, and cross-validate against Google\u2019s published numbers.")
 para("\u2022  \u00a7 7. Prefix Caching \u2014 what happens when workloads share structure and "
@@ -787,22 +790,15 @@ para(
     "not just steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
-caption("Figure 17: Per-request TTFT over time for the 8-concurrent / 400-block "
-        "configuration, with PCIe reload overlapped against residual recompute "
-        "(wall-clock = max(IO, compute)). Both panels share the same workload; only "
-        "the hardware/architecture differs. Left \u2014 A100 + Llama-2-7B (MHA): "
-        "reload-vs-recompute ratio is 3.8\u00d7, baseline thrashes to ~120 ms, tiered "
-        "drops to ~25 ms, oracle floor ~17 ms \u2014 a residual ~29% above floor. "
-        "Right \u2014 A100 + Llama-2-70B (GQA): reload-vs-recompute ratio jumps to 61\u00d7, "
-        "baseline thrashes to ~900\u20131,200 ms, and the tiered line lands exactly on the "
-        "oracle (~171 ms) \u2014 residual 0%. The larger the model, the more aggressively "
-        "IO hides behind the compute that was going to happen anyway. Bottom \u2014 HBM "
-        "hit rate is identical across the two panels because it is a workload-only "
-        "property; the same collapse in hit rate produces wildly different baseline "
-        "TTFTs because the compute cost of a miss scales with model size, while the "
-        "tiered-reload cost scales only with the KV footprint. This is the IO "
-        "perspective in full: the same GQA compression that shrinks the steady-state "
-        "IO wall also makes cache-miss recovery asymptotically free.")
+caption("Figure 17: Per-request TTFT over time (8 concurrent sessions, 400-block HBM, "
+        "PCIe reload overlapped with residual recompute). Left \u2014 A100 + Llama-2-7B "
+        "(MHA): tiered cache drops TTFT from ~120 ms to ~25 ms; ~29% residual above the "
+        "oracle floor remains because the reload/recompute ratio is only 3.8\u00d7. "
+        "Right \u2014 A100 + Llama-2-70B (GQA): tiered TTFT lands exactly on the oracle "
+        "floor (0% residual) because the 61\u00d7 reload/recompute ratio means PCIe IO is "
+        "always hidden behind compute. Bottom \u2014 HBM hit rate is identical across both "
+        "panels; the model architecture alone determines how much of that collapse can "
+        "be recovered.")
 spacer()
 
 heading("Utilization Masks the Problem", 2)
@@ -903,6 +899,15 @@ para(
     "7. Faster GPUs widen the IO gap. "
     "H100\u2019s 3.2\u00d7 compute improvement outpaces its 2\u00d7 bandwidth improvement. "
     "Each GPU generation makes KV IO relatively more of the bottleneck.",
+    bold=False
+)
+para(
+    "8. Batching cannot rescue PCIe-offloaded sparse attention at long context. "
+    "DSA\u2019s indexer K read scales as O(BS \u00d7 seq_len), so doubling batch size doubles "
+    "both IO and compute equally \u2014 throughput plateaus. At \u2265128K context, offload "
+    "throughput locks at a PCIe-determined ceiling (10.7 tok/s at 128K, 1.5 tok/s at 1M) "
+    "regardless of batch size or IO/compute pipelining. The mitigation: keep the indexer K "
+    "(512 B/token, FP8) on HBM and offload only the MLA KV.",
     bold=False
 )
 spacer()
