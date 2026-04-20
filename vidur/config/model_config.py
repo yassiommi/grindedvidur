@@ -561,3 +561,94 @@ class Mixtral8x7BModelConfig(BaseModelConfig):
     @classmethod
     def get_profiling_name(cls) -> str:
         return "meta-llama/Llama-2-7b-hf"
+
+
+@dataclass
+class GenericModelConfig(BaseModelConfig):
+    """Model config loaded from a YAML file.
+
+    Use --replica_config_model_config_yaml <path> instead of
+    --replica_config_model_name to run any custom architecture without
+    adding Python code.  See data/custom_models/ for example YAML files.
+    """
+    generic_name: str = ""
+    profiling_model_name: str = ""
+
+    # All required BaseModelConfig fields given sensible defaults so the
+    # dataclass can be declared; from_dict() overrides them from YAML.
+    num_layers: int = 32
+    num_q_heads: int = 32
+    num_kv_heads: int = 32
+    embedding_dim: int = 4096
+    mlp_hidden_dim: int = 11008
+    max_position_embeddings: int = 4096
+    use_gated_mlp: bool = False
+    use_bias: bool = False
+    use_qkv_bias: bool = False
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = False
+    vocab_size: int = 32000
+
+    @staticmethod
+    def get_name() -> str:
+        # Sentinel — never matched by create_from_name(); the YAML path
+        # bypasses that lookup entirely.
+        return "__generic__"
+
+    def get_profiling_config(self) -> "BaseModelConfig":
+        # Instance method intentionally shadows the parent classmethod so
+        # predictors calling self._model_config.get_profiling_config() get
+        # the right fallback config for this specific instance.
+        if self.profiling_model_name:
+            return BaseModelConfig.create_from_name(self.profiling_model_name)
+        return self
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> "GenericModelConfig":
+        import yaml
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "GenericModelConfig":
+        act = data.get("activation", "silu")
+        nrm = data.get("norm", "rms_norm")
+        if isinstance(act, str):
+            act = ActivationType[act.upper()]
+        if isinstance(nrm, str):
+            nrm = NormType[nrm.upper()]
+        return cls(
+            generic_name=data.get("name", ""),
+            profiling_model_name=data.get("profiling_model", ""),
+            num_layers=data["num_layers"],
+            num_q_heads=data["num_q_heads"],
+            num_kv_heads=data["num_kv_heads"],
+            embedding_dim=data["embedding_dim"],
+            mlp_hidden_dim=data["mlp_hidden_dim"],
+            max_position_embeddings=data.get("max_position_embeddings", 4096),
+            use_gated_mlp=data.get("use_gated_mlp", False),
+            use_bias=data.get("use_bias", False),
+            use_qkv_bias=data.get("use_qkv_bias", False),
+            activation=act,
+            norm=nrm,
+            post_attn_norm=data.get("post_attn_norm", False),
+            vocab_size=data.get("vocab_size", 32000),
+            is_neox_style=data.get("is_neox_style", True),
+            rope_theta=data.get("rope_theta"),
+            rope_scaling=data.get("rope_scaling"),
+            partial_rotary_factor=data.get("partial_rotary_factor", 1.0),
+            no_tensor_parallel=data.get("no_tensor_parallel", False),
+            is_moe=data.get("is_moe", False),
+            num_routed_experts=data.get("num_routed_experts", 1),
+            num_experts_per_tok=data.get("num_experts_per_tok", 1),
+            num_shared_experts=data.get("num_shared_experts", 0),
+            moe_intermediate_size=data.get("moe_intermediate_size"),
+            attention_type=data.get("attention_type", "MHA"),
+            kv_lora_rank=data.get("kv_lora_rank"),
+            q_lora_rank=data.get("q_lora_rank"),
+            qk_nope_head_dim=data.get("qk_nope_head_dim"),
+            qk_rope_head_dim=data.get("qk_rope_head_dim"),
+            v_head_dim=data.get("v_head_dim"),
+        )

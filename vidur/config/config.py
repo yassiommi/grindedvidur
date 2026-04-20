@@ -8,7 +8,7 @@ from typing import List, Optional
 from vidur.config.base_poly_config import BasePolyConfig
 from vidur.config.device_sku_config import BaseDeviceSKUConfig
 from vidur.config.flat_dataclass import create_flat_dataclass
-from vidur.config.model_config import BaseModelConfig
+from vidur.config.model_config import BaseModelConfig, GenericModelConfig
 from vidur.config.node_sku_config import BaseNodeSKUConfig
 from vidur.config.utils import dataclass_to_dict
 from vidur.logger import init_logger
@@ -555,12 +555,25 @@ class ReplicaConfig:
                     "2 for FP16/BF16, 1 for FP8 (E4M3/E5M2)."
         },
     )
+    model_config_yaml: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a YAML file defining a custom model architecture. "
+                    "When set, overrides model_name for architecture lookup. "
+                    "See data/custom_models/ for examples."
+        },
+    )
 
     def __post_init__(self):
         self.world_size = self.num_pipeline_stages * self.tensor_parallel_size
-        self.model_config: BaseModelConfig = BaseModelConfig.create_from_name(
-            self.model_name
-        )
+        if self.model_config_yaml:
+            self.model_config: BaseModelConfig = GenericModelConfig.from_yaml(
+                self.model_config_yaml
+            )
+        else:
+            self.model_config: BaseModelConfig = BaseModelConfig.create_from_name(
+                self.model_name
+            )
         self.device_config: BaseDeviceSKUConfig = (
             BaseDeviceSKUConfig.create_from_type_string(self.device)
         )

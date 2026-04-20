@@ -1,0 +1,36 @@
+# Example: custom 13B dense model with GQA
+#
+# Usage:
+#   python -m vidur.main \
+#     --replica_config_device a100 \
+#     --replica_config_model_config_yaml data/custom_models/example_dense_13b.yaml \
+#     ...
+#
+# profiling_model: which registered model's profiling CSVs to use for
+#   attention/MLP timing.  Must match a model that has profiling data
+#   on the chosen device (see data/profiling/compute/<device>/).
+#   Use the architecturally closest model you have data for.
+
+name: "myorg/custom-llama-13b"
+profiling_model: "meta-llama/Llama-2-7b-hf"
+
+# ── Architecture ──────────────────────────────────────────────────────────────
+num_layers: 40
+num_q_heads: 40
+num_kv_heads: 8          # GQA: fewer KV heads than Q heads
+embedding_dim: 5120
+mlp_hidden_dim: 13824
+max_position_embeddings: 4096
+vocab_size: 32000
+
+# ── MLP / norm style ──────────────────────────────────────────────────────────
+use_gated_mlp: true      # SwiGLU / gated MLP
+use_bias: false
+use_qkv_bias: false
+activation: silu         # silu | gelu
+norm: rms_norm           # rms_norm | layer_norm
+post_attn_norm: false
+
+# ── Positional encoding ───────────────────────────────────────────────────────
+rope_theta: 10000.0
+# rope_scaling: null     # uncomment and set dict for dynamic/linear RoPE scaling

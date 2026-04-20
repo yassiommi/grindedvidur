@@ -1,0 +1,46 @@
+# Example: custom model with MLA (Multi-head Latent Attention)
+# as used in DeepSeek-V3.  MLA compresses KV via a low-rank projection,
+# drastically reducing KV cache size vs standard MHA/GQA.
+#
+# Usage:
+#   python -m vidur.main \
+#     --replica_config_device a100 \
+#     --replica_config_model_config_yaml data/custom_models/example_mla_model.yaml \
+#     --execution_time_predictor_config_type moe \
+#     ...
+
+name: "myorg/custom-mla-moe-7b"
+profiling_model: "meta-llama/Meta-Llama-3-8B"
+
+# ── Architecture ──────────────────────────────────────────────────────────────
+num_layers: 28
+num_q_heads: 16
+num_kv_heads: 16         # MLA ignores this for cache sizing; uses kv_lora_rank
+embedding_dim: 2048
+mlp_hidden_dim: 8192
+max_position_embeddings: 131072
+vocab_size: 128256
+
+use_gated_mlp: true
+use_bias: false
+use_qkv_bias: false
+activation: silu
+norm: rms_norm
+post_attn_norm: true
+
+rope_theta: 1000000.0
+
+# ── MLA attention ─────────────────────────────────────────────────────────────
+attention_type: MLA      # MHA | GQA | MLA
+kv_lora_rank: 512        # compressed KV dimension
+q_lora_rank: 1536        # compressed Q dimension (null to disable Q compression)
+qk_nope_head_dim: 128    # head dim for non-RoPE Q/K
+qk_rope_head_dim: 64     # head dim for RoPE Q/K
+v_head_dim: 128          # value head dim
+
+# ── MoE (optional — remove section for dense MLA model) ──────────────────────
+is_moe: true
+num_routed_experts: 64
+num_experts_per_tok: 6
+num_shared_experts: 2
+moe_intermediate_size: 1408
