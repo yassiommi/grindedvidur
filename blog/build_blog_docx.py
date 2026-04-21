@@ -240,6 +240,9 @@ para(
     "where 39.7% of batches are actually compute-bound. But even MLA does not eliminate the wall; "
     "it only pushes it further out."
 )
+img("fig03a_io_fraction_comparison.png")
+caption("Figure 2: Per-layer IO fraction. Llama-2-7B (MHA) spends 58% of layer time on KV cache IO; DeepSeek-V3 (MLA) spends only 24%, achieving near-balance.")
+spacer()
 
 heading("Can IO Overlap with Compute?", 2)
 para(
@@ -248,7 +251,7 @@ para(
     "\u2014 three independent GPU streams (compute, memory, communication) that can overlap."
 )
 img("fig09_three_stream_scheduling.png")
-caption("Figure 2: Sequential IO (top) vs. GPU-initiated prefetch (bottom). IO overlaps with "
+caption("Figure 3: Sequential IO (top) vs. GPU-initiated prefetch (bottom). IO overlaps with "
         "compute, but savings are capped by min(compute_time, next_kv_load_time).")
 spacer()
 para(
@@ -267,10 +270,8 @@ para(
     "token stays fixed. As context grows, IO grows but compute does not, eventually tipping the "
     "balance. For DeepSeek-V3 with MLA, the crossover (IO = compute) occurs at ~38,480 tokens."
 )
-img("fig03_io_compute_shift.png")
-caption("Figure 3: Left/Center \u2014 Per-layer time breakdown: Llama-2-7B spends 58% of its "
-        "layer time on KV cache IO vs. only 24% for DeepSeek-V3 with MLA. "
-        "Right \u2014 KV load time scales with context length; crossover at ~38K tokens.")
+img("fig03b_context_length_crossover.png")
+caption("Figure 4: KV load time per layer scales linearly with context length (log-log). The crossover where IO exceeds compute occurs at ~38K tokens for DeepSeek-V3 with MLA.")
 spacer()
 
 heading("Why Prefill Is Different", 2)
@@ -289,7 +290,7 @@ para(
     "from KV compression is confined entirely to decode, where KV cache IO dominates."
 )
 img("fig12_prefill_vs_decode.png")
-caption("Figure 4: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
+caption("Figure 5: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
         "Decode (right) is dominated by KV cache IO, loading previously computed KV for every past token.")
 spacer()
 doc.add_page_break()
@@ -322,7 +323,7 @@ para(
     "of the architecture, not empirical findings."
 )
 img("fig02_kv_cache_size_landscape.png")
-caption("Figure 5: Left \u2014 KV bytes per token per layer (log scale). "
+caption("Figure 6: Left \u2014 KV bytes per token per layer (log scale). "
         "Right \u2014 Total KV at 1M context; only MLA-based configs fit a single H100.")
 spacer()
 
@@ -333,7 +334,7 @@ para(
     "changes the calculus:"
 )
 img("fig08_pdd_transfer_dominance.png")
-caption("Figure 6: KV transfer / decode compute ratio in PDD. MHA: 64.7\u00d7 \u2014 the transfer "
+caption("Figure 7: KV transfer / decode compute ratio in PDD. MHA: 64.7\u00d7 \u2014 the transfer "
         "is two orders of magnitude above compute. MLA: 1.8\u00d7 \u2014 PDD becomes practical.")
 spacer()
 para(
@@ -355,7 +356,7 @@ para(
     "over a compressed representation yields a doubly-reduced IO footprint."
 )
 img("fig13_sparse_attention.png")
-caption("Figure 7: Left \u2014 IO/Compute ratio drops from 4.94\u00d7 (MHA) to 1.47\u00d7 "
+caption("Figure 8: Left \u2014 IO/Compute ratio drops from 4.94\u00d7 (MHA) to 1.47\u00d7 "
         "(MLA+sparse). Right \u2014 Component breakdown showing KV IO collapses "
         "while communication emerges as the new bottleneck.")
 spacer()
@@ -385,7 +386,7 @@ para(
     "grows from 128K to 10M tokens? We swept DeepSeek-V3 across 8 sequence lengths to answer this."
 )
 img("fig17_dsa_seqlen_sweep.png")
-caption("Figure 8: Left \u2014 KV load time per decode step: MLA (purple) vs DSA (teal). "
+caption("Figure 9: Left \u2014 KV load time per decode step: MLA (purple) vs DSA (teal). "
         "Both grow linearly with context length, but DSA loads ~2.2\u00d7 less data at every "
         "point. At 10M tokens, MLA requires 27.2s of IO per decode step; DSA requires 12.1s. "
         "Right \u2014 DSA\u2019s KV cache broken into two components: the attended MLA KV "
@@ -431,7 +432,7 @@ para(
     "Blocks A and B run in parallel as max(A, B), then C and MoE run sequentially."
 )
 img("fig18_dsa_offload_penalty.png")
-caption("Figure 9: Left \u2014 TPOT vs. context length for HBM (blue) and offload (red). "
+caption("Figure 10: Left \u2014 TPOT vs. context length for HBM (blue) and offload (red). "
         "At 4K the gap is negligible (1.03\u00d7); at 1M it reaches 5.4\u00d7 (130 ms \u2192 "
         "703 ms). Right \u2014 Per-layer stacked breakdown: the green constant floor "
         "(attention + MoE, 0.70 ms) is identical in both modes. Only the indexer K read "
@@ -470,7 +471,7 @@ para(
     "sizes from 1 to 256 across three context lengths to test this."
 )
 img("fig19_dsa_batch_throughput.png")
-caption("Figure 10: Left \u2014 Aggregate throughput vs. batch size. HBM throughput (solid) "
+caption("Figure 11: Left \u2014 Aggregate throughput vs. batch size. HBM throughput (solid) "
         "continues climbing; offload throughput (dashed) saturates early. At 128K, offload "
         "locks at 10.7 tok/s regardless of batch size. At 1M, it flatlines at 1.5 tok/s. "
         "Right \u2014 With IO/compute overlap (pipelining), offload matches HBM at 4K "
@@ -536,7 +537,7 @@ table(
 )
 spacer()
 img("fig04_engram_pareto.png")
-caption("Figure 11: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
+caption("Figure 12: Left \u2014 Validation loss U-curve; optimum at \u03c1\u22480.74. "
         "Center \u2014 Engram is 21\u201331% faster. Right \u2014 Prefetch headroom: "
         "IO never stalls (9\u201364\u00d7 budget).")
 spacer()
@@ -610,7 +611,7 @@ para(
     "the bottleneck shifts to compute, and further IO reduction has minimal effect."
 )
 img("fig05_turboquant_impact.png")
-caption("Figure 12: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
+caption("Figure 13: Left \u2014 TPOT by architecture: TurboQuant delivers 5.3\u00d7 improvement "
         "on IO-bound MHA, minimal change on already-compact GQA. Right \u2014 Access patterns: "
         "MHA reads everything; MLA reads 1.6%; TQ reads sparse discrete.")
 spacer()
@@ -649,7 +650,7 @@ table(
 )
 spacer()
 img("fig11_prefix_caching.png")
-caption("Figure 13: Left \u2014 Token hit rate scales linearly with sharing fraction. "
+caption("Figure 14: Left \u2014 Token hit rate scales linearly with sharing fraction. "
         "Right \u2014 Eviction pressure drops 17\u00d7 at 90% sharing.")
 spacer()
 para(
@@ -688,14 +689,14 @@ para(
     "concurrent sessions (2\u201312) and cache sizes (200\u20131,200 blocks)."
 )
 img("fig14_thrashing_phases.png")
-caption("Figure 14: Cache utilization (green) stays high throughout, but token hit rate (blue) "
+caption("Figure 15: Cache utilization (green) stays high throughout, but token hit rate (blue) "
         "collapses during sustained thrashing (Phase 2). The 65-percentage-point gap between "
         "utilization and hit rate is the monitoring blind spot.")
 spacer()
 
 heading("A Binary Cliff", 2)
 img("fig06_thrashing_cliff.png")
-caption("Figure 15: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
+caption("Figure 16: Left \u2014 Thrashing boundary heatmap. The transition from ~80% to ~20% "
         "hit rate is nearly instantaneous. Right \u2014 Below the threshold: no penalty. "
         "Above it: immediate 5\u00d7 compute overhead, 81% wasted.")
 spacer()
@@ -755,7 +756,7 @@ para(
     "The reported tiered cost is the wall-clock max(IO, compute), not the sum."
 )
 img("fig15_pcie_kv_reload.png")
-caption("Figure 16: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
+caption("Figure 17: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is too slow for 7B "
         "(reload costs more than recompute); PCIe Gen4 recovers 60% of wasted compute; CXL "
         "reaches 76%. Right \u2014 70B with GQA achieves 80% savings because prefill is expensive "
         "and GQA keeps the KV footprint small enough that PCIe reload is 61\u00d7 cheaper than "
@@ -787,7 +788,7 @@ para(
     "not just steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
-caption("Figure 17: Per-request TTFT over time (8 concurrent sessions, 400-block HBM, "
+caption("Figure 18: Per-request TTFT over time (8 concurrent sessions, 400-block HBM, "
         "PCIe reload overlapped with residual recompute). Left \u2014 A100 + Llama-2-7B "
         "(MHA): tiered cache drops TTFT from ~120 ms to ~25 ms; ~29% residual above the "
         "oracle floor remains because the reload/recompute ratio is only 3.8\u00d7. "
@@ -808,7 +809,7 @@ para(
 
 heading("Heterogeneous Agents Make It Worse", 2)
 img("fig07_utilization_lies_hetero.png")
-caption("Figure 18: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
+caption("Figure 19: Left \u2014 Utilization stays high (~83%) while hit rate collapses to 18%. "
         "Right \u2014 Agent mix at 800 blocks: short+long (21%) is worse than all-medium (56%).")
 spacer()
 
@@ -832,7 +833,7 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("9. The Full Compression Stack", 1)
 img("fig10_full_compression_stack.png")
-caption("Figure 19: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
+caption("Figure 20: Each technique compounds. MHA FP16 (2,560 GB) \u2192 MLA + TurboQuant + "
         "Prefix Cache (1.9 GB effective at 1M context). The H100 80 GB line shows the "
         "single-GPU feasibility boundary.")
 spacer()

@@ -171,12 +171,10 @@ plt.tight_layout()
 save(fig, "fig02_kv_cache_size_landscape.png")
 
 # ================================================================
-# FIGURE 3: The IO/Compute Shift — MHA vs MLA
+# FIGURE 3a: IO Fraction Comparison — MHA vs MLA (stacked bars)
 # ================================================================
-fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
-# 3a & 3b: Stacked bars showing IO vs Compute vs Comm per model
-# Using the same per-layer data from Fig 1
 models_data = [
     ("Llama-2-7B\n(MHA)", {
         "KV Cache IO": 1.583, "Compute": 0.462 + 0.681, "Comm": 0.0
@@ -204,7 +202,6 @@ for ax_idx, (name, data, annotation, ann_color) in enumerate(models_data):
     io_frac = data["KV Cache IO"] / total * 100
     ax.text(0, bottom + 0.08, f"Total: {total:.2f} ms\nIO = {io_frac:.0f}% of time",
             ha="center", va="bottom", fontsize=9, fontweight="bold")
-    # Annotation about batch IO-boundedness
     ax.text(0.5, 0.95, annotation, transform=ax.transAxes, ha="center", va="top",
             fontsize=10, fontweight="bold", color=ann_color,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF5F5" if ann_color == ACCENT4 else "#FFF8F0",
@@ -215,7 +212,6 @@ for ax_idx, (name, data, annotation, ann_color) in enumerate(models_data):
     ax.set_xticks([])
     ax.set_ylim(0, max(total * 1.35, 2.0))
 
-# Add a shared legend
 handles = [
     mpatches.Patch(facecolor=ACCENT1, label="KV Cache IO"),
     mpatches.Patch(facecolor=ACCENT2, label="Compute (Attn + MLP/MoE)"),
@@ -223,8 +219,16 @@ handles = [
 ]
 axes[0].legend(handles=handles, fontsize=8, loc="upper right")
 
-# 3c: Context length drives IO (batch=32, DeepSeek-V3 MLA)
-ax = axes[2]
+fig.suptitle("IO Fraction: MHA is 100% IO-bound, MLA is Balanced",
+             fontsize=14, fontweight="bold", y=1.03)
+plt.tight_layout()
+save(fig, "fig03a_io_fraction_comparison.png")
+
+# ================================================================
+# FIGURE 3b: Context Length Drives IO (crossover plot)
+# ================================================================
+fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
 ctx = np.array([1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072])
 kv_per_tok = 1152  # MLA bytes
 hbm_bw = 2.0e12    # A100 SXM HBM bandwidth (~2 TB/s)
@@ -232,7 +236,6 @@ bs = 32
 kv_ms = kv_per_tok * ctx * bs / hbm_bw * 1e3
 ax.plot(ctx, kv_ms, "-o", linewidth=2.5, markersize=5, color=ACCENT1, zorder=3,
         label=f"KV load (batch={bs})")
-# Total per-layer compute: 0.208 (attn) + 0.494 (MoE) = 0.702 ms
 compute_ms = 0.702
 ax.axhline(y=compute_ms, color=ACCENT2, linestyle="--", linewidth=2,
            label=f"Compute ({compute_ms:.2f} ms)")
@@ -243,15 +246,14 @@ ax.fill_between(ctx, kv_ms, compute_ms, where=kv_ms > compute_ms,
                 alpha=0.08, color=ACCENT4)
 ax.set_xlabel("Context Length (tokens)")
 ax.set_ylabel("Time per Layer (ms)")
-ax.set_title("Context Length Drives IO\n(DeepSeek-V3, batch=32)", pad=10)
+ax.set_title("Context Length Drives IO (DeepSeek-V3, batch=32)", pad=10,
+             fontsize=14, fontweight="bold")
 ax.set_xscale("log", base=2)
 ax.set_yscale("log")
 ax.legend(fontsize=9, loc="upper left")
 
-fig.suptitle("The IO / Compute Shift: MHA is 100% IO-bound, MLA is Balanced",
-             fontsize=14, fontweight="bold", y=1.03)
 plt.tight_layout()
-save(fig, "fig03_io_compute_shift.png")
+save(fig, "fig03b_context_length_crossover.png")
 
 # ================================================================
 # FIGURE 4: Engram — Pareto improvement + prefetch
