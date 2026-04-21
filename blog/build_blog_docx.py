@@ -201,11 +201,16 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("2. Establishing the IO Wall", 1)
 para(
-    "The central claim of this post is that optimizing LLM inference is, at its core, an IO "
-    "problem. During decode, each new token loads the entire KV cache for every past token but "
-    "performs only a constant amount of arithmetic per byte \u2014 arithmetic intensity is O(1). "
-    "That single fact makes decode inherently memory-bandwidth-bound, regardless of model size "
-    "or GPU generation. Everything that follows in \u00a7\u00a73\u20135 is an attempt to reduce "
+    "LLM inference has two distinct phases. Prefill processes the entire input prompt in one "
+    "forward pass, building the KV cache from scratch \u2014 it is compute-bound. Decode then "
+    "generates one token at a time, loading the cached KV for every past token on each step "
+    "\u2014 and that is where the IO problem lives."
+)
+para(
+    "During decode, each new token loads the entire KV cache for every past token but performs "
+    "only a constant amount of arithmetic per byte \u2014 arithmetic intensity is O(1). That "
+    "single fact makes decode inherently memory-bandwidth-bound, regardless of model size or "
+    "GPU generation. Everything that follows in \u00a7\u00a73\u20135 is an attempt to reduce "
     "the bytes that must travel across that bandwidth."
 )
 para(
