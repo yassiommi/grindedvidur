@@ -128,7 +128,7 @@ doc.add_page_break()
 heading("1. InferLens: A Flexible LLM Inference Simulator", 1)
 para(
     "Studying LLM inference performance is expensive. Profiling a single model configuration "
-    "on a single GPU SKU at a single batch size requires dedicated hardware, careful benchmarking, "
+    "on a single GPU at a single batch size requires dedicated hardware, careful benchmarking, "
     "and hours of wall-clock time. Sweeping across architectures (dense vs. MoE), attention "
     "mechanisms (MHA, GQA, MLA), hardware generations (A100, H100), interconnects (PCIe Gen3\u2013Gen5, "
     "NVLink), and workload patterns (static chat, agentic tool-use) quickly becomes intractable."
@@ -201,9 +201,17 @@ doc.add_page_break()
 # ══════════════════════════════════════════════════════════════
 heading("2. Establishing the IO Wall", 1)
 para(
-    "Our first experiment decomposes decode latency at the per-layer level for two representative "
-    "architectures: Llama-2-7B (dense transformer, MHA) and DeepSeek-V3 (MoE, MLA). Both run on "
-    "simulated A100 GPUs with PCIe Gen4."
+    "The central claim of this post is that optimizing LLM inference is, at its core, an IO "
+    "problem. During decode, each new token loads the entire KV cache for every past token but "
+    "performs only a constant amount of arithmetic per byte \u2014 arithmetic intensity is O(1). "
+    "That single fact makes decode inherently memory-bandwidth-bound, regardless of model size "
+    "or GPU generation. Everything that follows in \u00a7\u00a73\u20135 is an attempt to reduce "
+    "the bytes that must travel across that bandwidth."
+)
+para(
+    "We begin by decomposing decode latency at the per-layer level for two representative "
+    "architectures: Llama-2-7B (dense MHA) and DeepSeek-V3 (MoE + MLA), both on simulated "
+    "A100 GPUs with PCIe Gen4."
 )
 
 heading("Per-Layer Timing Breakdown", 2)
@@ -226,75 +234,64 @@ caption("Figure 1: Per-layer decode timing. Llama-2-7B is dominated by KV cache 
 spacer()
 
 para(
-    "The result is unambiguous: Llama-2-7B is IO-bound in 100% of decode batches. The GPU spends "
-    "nearly 5\u00d7 more time loading KV cache data than computing with it. DeepSeek-V3, using MLA "
-    "compression, brings this ratio to 1.47\u00d7 \u2014 a qualitatively different regime where "
-    "39.7% of batches are actually compute-bound."
-)
-para(
-    "This result is expected from first principles: during decode, each token generation loads "
-    "the KV cache for all past tokens but computes only for the single new token. The arithmetic "
-    "intensity is O(1) \u2014 a constant number of FLOPs per byte loaded \u2014 making decode "
-    "inherently memory-bandwidth-bound regardless of model size or GPU generation."
+    "The numbers confirm the O(1) argument: Llama-2-7B is IO-bound in 100% of decode batches, "
+    "spending nearly 5\u00d7 more time loading KV data than computing with it. DeepSeek-V3, "
+    "using MLA compression, brings the ratio to 1.47\u00d7 \u2014 a qualitatively different regime "
+    "where 39.7% of batches are actually compute-bound. But even MLA does not eliminate the wall; "
+    "it only pushes it further out."
 )
 
-heading("Prefill Is Always Compute-Bound", 2)
+heading("Can IO Overlap with Compute?", 2)
 para(
-    "An important contrast: while decode is IO-bound, prefill is always compute-bound \u2014 "
-    "regardless of context length, model size, or prefix sharing fraction. During prefill, the "
-    "model processes the entire input prompt in a single forward pass, performing large GEMMs "
-    "(QKV projection, attention output, MLP/MoE) over all input tokens to generate the KV cache "
-    "from scratch. There is no KV cache to load \u2014 it is being computed for the first time."
-)
-para(
-    "The simulator\u2019s Gantt charts confirm this: prefill layers show only compute bars "
-    "(attention and MLP) with zero IO bars. This also explains why TurboQuant\u2019s KV compression "
-    "has no effect on TTFT (time to first token): prefill does not load KV from cache, so "
-    "compressing it saves nothing during that phase. The speedup is confined entirely to decode, "
-    "where KV cache IO dominates."
-)
-img("fig12_prefill_vs_decode.png")
-caption("Figure 2: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
-        "Decode (right) is dominated by KV cache IO, loading previously computed KV for every past token.")
-spacer()
-
-heading("The Three-Stream Hardware Model", 2)
-para(
-    "The simulator models three independent GPU execution streams: compute, IO (memory "
-    "transfers), and communication. KV cache prefetching overlaps the next layer\u2019s "
-    "IO load with the current layer\u2019s compute. But savings are bounded by "
-    "min(compute_time, next_kv_load_time) \u2014 when IO \u226b compute, the compute window "
-    "is too short to hide much."
+    "A natural question: can we hide the IO behind compute by prefetching the next layer\u2019s "
+    "KV cache while the current layer is still computing? The simulator models exactly this "
+    "\u2014 three independent GPU streams (compute, memory, communication) that can overlap."
 )
 img("fig09_three_stream_scheduling.png")
-caption("Figure 3: Sequential IO (top) vs. GPU-initiated prefetch (bottom). IO overlaps with "
-        "compute, but savings are capped by compute time.")
+caption("Figure 2: Sequential IO (top) vs. GPU-initiated prefetch (bottom). IO overlaps with "
+        "compute, but savings are capped by min(compute_time, next_kv_load_time).")
 spacer()
 para(
-    "A critical implication: in dense architectures, decode IO can never be fully covered by "
-    "compute. Prefetch savings are bounded by min(compute_time, next_kv_load_time). For MHA, "
-    "where the IO/Compute ratio is 4.94\u00d7, the compute window is roughly one-fifth the "
-    "duration of the next KV load \u2014 at most ~20% of the IO can be hidden behind compute. "
-    "The remaining ~80% is exposed latency that no scheduling trick can eliminate. The only "
-    "remedy is reducing the bytes themselves (via architectural compression or quantization)."
+    "The overlap is bounded by min(compute_time, next_kv_load_time). For Llama-2-7B, where "
+    "IO/Compute = 4.94\u00d7, the compute window is roughly one-fifth the duration of the next "
+    "KV load \u2014 at most ~20% of the IO can be hidden. The remaining ~80% is exposed latency "
+    "that no scheduling trick can eliminate. The only remedy is reducing the bytes themselves."
 )
 
 heading("Context Length, Not Batch Size, Drives IO", 2)
 para(
     "We swept batch sizes from 16 to 512 for DeepSeek-V3 and found the IO/Compute ratio "
     "constant at 1.34\u00d7 across every batch size. This is expected: doubling the batch doubles "
-    "both the total KV bytes loaded (IO) and the total FLOPs computed, so the ratio cancels. "
-    "What does change the ratio is context length: longer contexts mean more KV bytes per "
-    "request, but the MLP compute per token (which dominates at short contexts) stays fixed. "
-    "As context grows, IO grows while MLP compute does not, eventually tipping the balance. "
-    "For DeepSeek-V3 with MLA, the crossover (IO = compute) occurs at ~38,480 tokens."
+    "both KV bytes loaded and FLOPs computed, so the ratio cancels. What does change the ratio "
+    "is context length: longer contexts mean more KV bytes per request, while MLP compute per "
+    "token stays fixed. As context grows, IO grows but compute does not, eventually tipping the "
+    "balance. For DeepSeek-V3 with MLA, the crossover (IO = compute) occurs at ~38,480 tokens."
 )
 img("fig03_io_compute_shift.png")
-caption("Figure 4: Left/Center \u2014 Per-layer time breakdown: Llama-2-7B spends 58% of its "
+caption("Figure 3: Left/Center \u2014 Per-layer time breakdown: Llama-2-7B spends 58% of its "
         "layer time on KV cache IO vs. only 24% for DeepSeek-V3 with MLA. "
         "Right \u2014 KV load time scales with context length; crossover at ~38K tokens.")
 spacer()
 
+heading("Why Prefill Is Different", 2)
+para(
+    "An important contrast: while decode is IO-bound, prefill is always compute-bound. During "
+    "prefill the model processes the entire input prompt in a single forward pass, performing "
+    "large GEMMs (QKV projection, attention, MLP/MoE) over all input tokens to generate the KV "
+    "cache from scratch. There is no KV cache to load \u2014 it is being computed for the first "
+    "time. The arithmetic intensity is high (proportional to seq_len), placing prefill squarely "
+    "in the compute-bound regime."
+)
+para(
+    "Since prefill is compute-bound, techniques that reduce KV cache size \u2014 including "
+    "TurboQuant\u2019s 3-bit quantization \u2014 do not improve TTFT (time to first token). "
+    "The bottleneck during prefill is the computation itself, not any IO transfer. The speedup "
+    "from KV compression is confined entirely to decode, where KV cache IO dominates."
+)
+img("fig12_prefill_vs_decode.png")
+caption("Figure 4: Prefill (left) performs only compute \u2014 GEMMs over input tokens to generate KV. "
+        "Decode (right) is dominated by KV cache IO, loading previously computed KV for every past token.")
+spacer()
 doc.add_page_break()
 
 # ══════════════════════════════════════════════════════════════
