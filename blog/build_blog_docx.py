@@ -239,11 +239,13 @@ caption("Figure 1: Per-layer decode timing. Llama-2-7B is dominated by KV cache 
 spacer()
 
 para(
-    "The numbers confirm the O(1) argument: Llama-2-7B is IO-bound in 100% of decode batches, "
-    "spending nearly 5\u00d7 more time loading KV data than computing with it. DeepSeek-V3, "
-    "using MLA compression, brings the ratio to 1.47\u00d7 \u2014 a qualitatively different regime "
-    "where 39.7% of batches are actually compute-bound. But even MLA does not eliminate the wall; "
-    "it only pushes it further out."
+    "The numbers confirm the O(1) argument: Llama-2-7B is IO-bound in every decode batch, "
+    "spending nearly 5\u00d7 more time loading KV data than computing with it. DeepSeek-V3 with "
+    "MLA compression brings the median ratio to 1.47\u00d7 \u2014 but the picture is not uniform. "
+    "Short-context batches (below ~38K tokens) are actually compute-bound because there is "
+    "so little KV to load; long-context batches are deeply IO-bound. Across the simulator\u2019s "
+    "mixed-length workload, 60% of batches land on the IO side. MLA does not eliminate the "
+    "wall \u2014 it pushes the crossover further out."
 )
 img("fig03a_io_fraction_comparison.png")
 caption("Figure 2: Per-layer IO fraction. Llama-2-7B (MHA) spends 58% of layer time on KV cache IO; DeepSeek-V3 (MLA) spends only 24%, achieving near-balance.")
@@ -268,12 +270,13 @@ para(
 
 heading("Context Length, Not Batch Size, Drives IO", 2)
 para(
-    "We swept batch sizes from 16 to 512 for DeepSeek-V3 and found the IO/Compute ratio "
-    "constant at 1.34\u00d7 across every batch size. This is expected: doubling the batch doubles "
-    "both KV bytes loaded and FLOPs computed, so the ratio cancels. What does change the ratio "
-    "is context length: longer contexts mean more KV bytes per request, while MLP compute per "
-    "token stays fixed. As context grows, IO grows but compute does not, eventually tipping the "
-    "balance. For DeepSeek-V3 with MLA, the crossover (IO = compute) occurs at ~38,480 tokens."
+    "Batch size does not affect the IO/Compute balance. We swept batch sizes from 16 to 512 "
+    "for DeepSeek-V3 and found the per-layer IO/Compute ratio unchanged at every batch size. "
+    "This is expected: doubling the batch doubles both KV bytes loaded and FLOPs computed, so "
+    "the ratio cancels. What does change the ratio is context length: longer contexts mean more "
+    "KV bytes per request, while MLP compute per token stays fixed. As context grows, IO grows "
+    "but compute does not. For DeepSeek-V3 with MLA, the crossover where IO first exceeds "
+    "compute occurs at ~38,480 tokens."
 )
 img("fig03b_context_length_crossover.png")
 caption("Figure 4: KV load time per layer scales linearly with context length (log-log). The crossover where IO exceeds compute occurs at ~38K tokens for DeepSeek-V3 with MLA.")
@@ -769,7 +772,7 @@ caption("Figure 17: Left \u2014 Savings scale with tier-2 IO bandwidth. NVMe is 
 spacer()
 
 para(
-    "In the worst thrashing configuration (8 concurrent, 400-block HBM), the DRAM tier "
+    "In the worst thrashing configuration (8 concurrent, 6,400-token HBM cache), the DRAM tier "
     "catches 62.6% of tokens that would have been recomputed. With the PCIe DMA overlapped "
     "against the residual recompute, total prefill wall-time drops from 71.9 s to 19.4 s \u2014 "
     "a 73% reduction. The average per-request TTFT falls from 92.2 ms to 24.8 ms, within "
@@ -793,7 +796,7 @@ para(
     "not just steady-state performance but also resilience to capacity failures."
 )
 img("fig16_ttft_over_time.png")
-caption("Figure 18: Per-request TTFT over time (8 concurrent sessions, 400-block HBM, "
+caption("Figure 18: Per-request TTFT over time (8 concurrent sessions, 6,400-token HBM cache, "
         "PCIe reload overlapped with residual recompute). Left \u2014 A100 + Llama-2-7B "
         "(MHA): tiered cache drops TTFT from ~120 ms to ~25 ms; ~29% residual above the "
         "oracle floor remains because the reload/recompute ratio is only 3.8\u00d7. "
@@ -806,7 +809,7 @@ spacer()
 
 heading("Utilization Masks the Problem", 2)
 para(
-    "The most operationally dangerous finding: during severe thrashing (12 concurrent, 400 blocks), "
+    "The most operationally dangerous finding: during severe thrashing (12 concurrent, 6,400-token cache), "
     "cache utilization is ~83% while token hit rate is ~18%. A monitoring system that only tracks "
     "utilization would report the cache as healthy. The diagnostic triad is: high utilization + "
     "high eviction rate + low hit rate = thrashing."
