@@ -1,7 +1,7 @@
 # DeepSeek-V4-Pro Simulation Report
 
 **Date:** 2026-04-28  
-**Framework:** Vidur (InferLens) — discrete-event LLM inference simulator  
+**Framework:** InferLens — discrete-event LLM inference simulator  
 **Branch:** `claude/deepseek-v4-integration-2O1Or`
 
 ---
@@ -109,13 +109,13 @@ V4's FLOPs per decode step at 1M context are **200× lower than V3** because wit
 
 ---
 
-## 4. Vidur Discrete-Event Simulation
+## 4. InferLens Discrete-Event Simulation
 
 *Conditions: 500 synthetic requests, 512 prefill + 256 decode tokens, QPS=3.0, sarathi scheduler, TP=4 on A100, linear-regression execution-time predictor*
 
-This simulation exercises Vidur's full scheduling stack: request batching, queuing, KV cache block management, and throughput under load.
+This simulation exercises InferLens's full scheduling stack: request batching, queuing, KV cache block management, and throughput under load.
 
-![Vidur simulation comparison](plots/7_vidur_sim_comparison.png)
+![InferLens simulation comparison](plots/7_vidur_sim_comparison.png)
 
 ### 4.1 Results
 
@@ -191,7 +191,7 @@ The `SparseProfiledExecutionTimePredictor` will automatically load `attention.cs
 
 ## 6. Summary
 
-| | Analytical (1M ctx) | Vidur Event-Sim (512 ctx) |
+| | Analytical (1M ctx) | InferLens Event-Sim (512 ctx) |
 |---|---|---|
 | V4-Pro vs V3 KV cache | **4.2× smaller** | same direction |
 | V4-Pro vs V3 decode speed | **4.2× faster** | 1.67× slower (short-ctx compute dominates) |

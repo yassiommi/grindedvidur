@@ -1,4 +1,4 @@
-# Layer-Level Timing Simulation for LLM Inference: Integrating Vidur and InferSim
+# Layer-Level Timing Simulation for LLM Inference: Integrating InferLens and InferSim
 
 ## A Framework for Hardware-Conditioned, Per-Layer Performance Modeling with GPU-Initiated KV Cache Prefetching
 
@@ -8,7 +8,7 @@
 
 1. [Introduction](#1-introduction)
 2. [Framework Architecture](#2-framework-architecture)
-   - 2.1 [Vidur: Event-Driven LLM Inference Simulator](#21-vidur-event-driven-llm-inference-simulator)
+   - 2.1 [InferLens: Event-Driven LLM Inference Simulator](#21-vidur-event-driven-llm-inference-simulator)
    - 2.2 [InferSim: Hardware-Aware Compute Modeling](#22-infersim-hardware-aware-compute-modeling)
    - 2.3 [Integration: How the Frameworks Connect](#23-integration-how-the-frameworks-connect)
 3. [Operation Modeling and Hardware Conditioning](#3-operation-modeling-and-hardware-conditioning)
@@ -31,7 +31,7 @@ Modern LLM inference systems face a fundamental tension between compute throughp
 
 To study these dynamics at the **per-layer level**, we developed an extended simulation framework that integrates two complementary systems:
 
-- **Vidur** (extended): An event-driven LLM inference simulator with production-grade batch scheduling, pipeline parallelism, and profiling-based execution time prediction. We extended it with layer-level timing, GPU-initiated KV cache prefetching, and first-principles MoE compute modeling.
+- **InferLens** (extended): An event-driven LLM inference simulator with production-grade batch scheduling, pipeline parallelism, and profiling-based execution time prediction. We extended it with layer-level timing, GPU-initiated KV cache prefetching, and first-principles MoE compute modeling.
 
 - **InferSim**: A hardware-aware inference simulator that models operations at the kernel level using FLOPs-based throughput estimation with empirical Model FLOPs Utilization (MFU) benchmarks. It provides the analytical backbone for MoE expert timing, communication bandwidth models, and KV cache sizing.
 
@@ -42,27 +42,27 @@ The integrated framework enables us to:
 4. Analyze why sparse MoE models have fundamentally different bottleneck characteristics than dense models
 
 ![Architecture](../report_figures/fig1_architecture.png)
-*Figure 1: Framework architecture showing the integration of Vidur (event-driven scheduling and profiling) with InferSim (hardware-aware FLOPs and bandwidth modeling).*
+*Figure 1: Framework architecture showing the integration of InferLens (event-driven scheduling and profiling) with InferSim (hardware-aware FLOPs and bandwidth modeling).*
 
 ---
 
 ## 2. Framework Architecture
 
-### 2.1 Vidur: Event-Driven LLM Inference Simulator
+### 2.1 InferLens: Event-Driven LLM Inference Simulator
 
-Vidur organizes inference simulation in a three-level hierarchy:
+InferLens organizes inference simulation in a three-level hierarchy:
 
 **Cluster > Replica > Pipeline Stage**
 
 Each **Replica** represents a complete model copy distributed across GPUs. A replica is partitioned into **Pipeline Stages** for pipeline parallelism, and each stage may span multiple GPUs via **Tensor Parallelism** (TP). The simulator uses an event-driven execution model with a priority queue, processing events like batch arrivals, stage completions, and request completions.
 
-**Batch Scheduling (vLLM-style):** Vidur implements the vLLM scheduling algorithm, which greedily fills batches subject to:
+**Batch Scheduling (vLLM-style):** InferLens implements the vLLM scheduling algorithm, which greedily fills batches subject to:
 - Block-based KV cache memory allocation (with watermark-based preemption)
 - Maximum tokens per batch (`max_tokens_in_batch`)
 - Batch size cap (`batch_size_cap`)
 - Request priority (prefill vs. decode phase separation)
 
-**Execution Time Prediction:** For each batch processed at a pipeline stage, Vidur computes execution times using one of two predictors:
+**Execution Time Prediction:** For each batch processed at a pipeline stage, InferLens computes execution times using one of two predictors:
 - **SklearnExecutionTimePredictor**: Trains regression models on real GPU kernel profiling data (attention, MLP projections, norms, etc.) indexed by batch size, sequence length, and device type
 - **MoEExecutionTimePredictor**: Extends the sklearn predictor with analytical FLOPs-based timing for MoE operations, following InferSim's methodology
 
@@ -102,7 +102,7 @@ InferSim provides five key modeling components:
 
 The integration follows a **profiling + analytical delta** pattern:
 
-1. **Dense model operations** (attention projections, norms, activations) use Vidur's sklearn-trained predictors on real GPU profiling data
+1. **Dense model operations** (attention projections, norms, activations) use InferLens's sklearn-trained predictors on real GPU profiling data
 2. **MoE-specific operations** (routing, expert compute, weight loading) use InferSim's FLOPs-based approach with empirical MFU values
 3. **KV cache I/O** uses bandwidth-based modeling from both frameworks
 4. **Communication** uses InferSim's bandwidth-delay models for NVLink and RDMA
@@ -473,7 +473,7 @@ For DeepSeek-V3 with TP=8, all-reduce communication contributes 0.307 ms per lay
 ### 8.4 Framework Availability
 
 The integrated framework is available in two repositories:
-- **Vidur (extended)**: Event-driven simulator with layer timing, KV prefetch, and MoE support
+- **InferLens (extended)**: Event-driven simulator with layer timing, KV prefetch, and MoE support
 - **InferSim**: Hardware-aware compute and bandwidth modeling
 
 Both support configurable hardware specifications, model architectures, and parallelism strategies, enabling exploration of the inference performance design space.

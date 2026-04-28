@@ -1,6 +1,6 @@
 # Layer-Level Timing, GPU Prefetching, and MoE/Sparse Model Support
 
-This document describes the extensions to Vidur that add (1) per-layer execution time breakdowns with GPU-initiated KV cache prefetching, and (2) support for Mixture-of-Experts (MoE) and sparse attention models including DeepSeek-V3.
+This document describes the extensions to InferLens that add (1) per-layer execution time breakdowns with GPU-initiated KV cache prefetching, and (2) support for Mixture-of-Experts (MoE) and sparse attention models including DeepSeek-V3.
 
 ## Table of Contents
 
@@ -67,7 +67,7 @@ where:
 Expert weight loading (MoE) uses HBM bandwidth instead, since expert weights are already in GPU memory:
 - `expert_load_time = expert_params * local_experts / (HBM_bandwidth * 0.80)`
 
-Vidur's sklearn-based predictor trains on real GPU kernel traces, so `attention_decode_execution_time` already implicitly includes KV cache loading from the profiled kernel's wall-clock time. The PCIe-based `kv_load_time` is used for:
+InferLens's sklearn-based predictor trains on real GPU kernel traces, so `attention_decode_execution_time` already implicitly includes KV cache loading from the profiled kernel's wall-clock time. The PCIe-based `kv_load_time` is used for:
 - Populating `LayerExecutionTime.kv_cache_load_time` in the per-layer Gantt visualization
 - Computing KV prefetch overlap savings: `overlap = min(current_compute, next_kv_load)`
 
@@ -481,8 +481,8 @@ InferSim provides the analytical framework for MoE timing and KV I/O estimation:
 
 - **FLOPs calculation**: `2*M*N*K` per GEMM, with separate counts for routed and shared experts
 - **MFU (Model FLOPS Utilization)**: Empirical measurements from GPU kernel benchmarks (DeepGEMM, FlashAttention-3, FlashInfer)
-- **KV cache I/O modeling**: `kv_load_time = kv_bytes / PCIe_bandwidth`. The KV cache for the next layer is transferred from host memory over PCIe. Vidur uses PCIe bandwidth from `device_sku_config` (with 80% efficiency) for the per-layer Gantt visualization and prefetch savings, while keeping its sklearn-profiled base time for the overall model_time.
+- **KV cache I/O modeling**: `kv_load_time = kv_bytes / PCIe_bandwidth`. The KV cache for the next layer is transferred from host memory over PCIe. InferLens uses PCIe bandwidth from `device_sku_config` (with 80% efficiency) for the per-layer Gantt visualization and prefetch savings, while keeping its sklearn-profiled base time for the overall model_time.
 - **Expert weight I/O**: `load_time = expert_params * local_experts / HBM_bandwidth`, using HBM bandwidth since expert weights reside in GPU memory. Captures whether expert layers are compute-bound or I/O-bound via `max(compute, load)`.
 - **Communication**: Bandwidth-delay model for NVLink and RDMA, with DeepEP-specific dispatch/combine patterns
 
-Vidur's `MoEExecutionTimePredictor` implements the MoE calculations, and `base_execution_time_predictor` implements the PCIe-based KV cache load estimation, allowing Vidur's event-driven simulation to model MoE inference and KV prefetching at scale.
+InferLens's `MoEExecutionTimePredictor` implements the MoE calculations, and `base_execution_time_predictor` implements the PCIe-based KV cache load estimation, allowing InferLens's event-driven simulation to model MoE inference and KV prefetching at scale.

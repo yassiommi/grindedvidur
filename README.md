@@ -1,6 +1,6 @@
-# Vidur: LLM Inference System Simulator
+# InferLens: LLM Inference System Simulator
 
-Vidur is a high-fidelity and extensible LLM inference system simulator. It can help you with:
+InferLens is a high-fidelity and extensible LLM inference system simulator. It can help you with:
 
 1. Study the system performance of models under different workloads and configurations.
 
@@ -128,7 +128,7 @@ python -m vidur.main -h
 ## Simulator Output
 
 * The metrics will be logged to wandb directly and a copy will be stored in the `simulator_output/<TIMESTAMP>` directory. __A description of all the logged metrics can be found [here](docs/metrics.md).__
-* Vidur exports chrome traces of each simulation. The trace can be found in the `simulator_output` directory. The trace can be opened by navigating to `chrome://tracing/` or `edge://tracing/` and loading the trace.
+* InferLens exports chrome traces of each simulation. The trace can be found in the `simulator_output` directory. The trace can be opened by navigating to `chrome://tracing/` or `edge://tracing/` and loading the trace.
 
     ![Chrome Trace](./assets/chrome_trace.png)
 
