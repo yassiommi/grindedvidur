@@ -29,6 +29,7 @@ from tqdm import tqdm
 from vidur.config.model_config import BaseModelConfig
 from vidur.profiling.sparse.sparse_mlp_wrapper import SparseMlpWrapper
 from vidur.profiling.sparse.mla_attention_wrapper import MLAAttentionWrapper
+from vidur.profiling.sparse.csa_hca_attention_wrapper import CSAHCAAttentionWrapper
 from vidur.profiling.sparse.io_profiler import IOProfiler
 from vidur.profiling.utils import ProfileMethod, get_num_tokens_to_profile
 
@@ -70,6 +71,22 @@ SPARSE_MODEL_CONFIGS = {
         "num_shared_experts": 1,
         "shared_expert_intermediate_size": 1408,
         "has_mla": False,
+    },
+    "deepseek-ai/DeepSeek-V4-Pro": {
+        "hidden_size": 8192,
+        "num_routed_experts": 384,
+        "num_experts_per_tok": 6,
+        "expert_intermediate_size": 2048,
+        "num_shared_experts": 1,
+        "shared_expert_intermediate_size": 2048,
+        "has_mla": False,
+        "has_hybrid_csa_hca": True,
+        "num_heads": 16,
+        "head_dim": 512,
+        "csa_chunk_size": 64,
+        "csa_top_k": 16,
+        "hca_chunk_size": 1024,
+        "n_hc": 4,
     },
     "deepseek-ai/Engram-27B": {
         "hidden_size": 2560,
@@ -170,6 +187,7 @@ def get_model_config(model_name: str) -> dict:
             "num_shared_experts": mc.num_shared_experts,
             "shared_expert_intermediate_size": mc.expert_intermediate_size,
             "has_mla": mc.attention_type == "MLA",
+            "has_hybrid_csa_hca": mc.attention_type == "HYBRID_CSA_HCA",
         }
         if config["has_mla"]:
             config.update({
@@ -179,6 +197,15 @@ def get_model_config(model_name: str) -> dict:
                 "qk_nope_head_dim": mc.qk_nope_head_dim,
                 "qk_rope_head_dim": mc.qk_rope_head_dim,
                 "v_head_dim": mc.v_head_dim,
+            })
+        if config["has_hybrid_csa_hca"]:
+            config.update({
+                "num_heads": mc.num_q_heads,
+                "head_dim": mc.embedding_dim // mc.num_q_heads,
+                "csa_chunk_size": getattr(mc, 'csa_chunk_size', 64) or 64,
+                "csa_top_k": getattr(mc, 'csa_top_k', 16) or 16,
+                "hca_chunk_size": getattr(mc, 'hca_chunk_size', 1024) or 1024,
+                "n_hc": getattr(mc, 'n_hc', 4),
             })
         return config
     except Exception as e:
@@ -291,6 +318,75 @@ def profile_mla_attention(
                 qk_nope_head_dim=config["qk_nope_head_dim"],
                 qk_rope_head_dim=config["qk_rope_head_dim"],
                 v_head_dim=config["v_head_dim"],
+                profile_method=args.profile_method,
+                output_dir=args.output_dir,
+            )
+            for _ in range(args.num_gpus)
+        ]
+
+        promises = []
+        for i, num_tokens in enumerate(num_tokens_list):
+            worker_id = i % args.num_gpus
+            promise = wrappers[worker_id].profile.remote(num_tokens)
+            promises.append(promise)
+
+            if len(promises) >= args.num_gpus:
+                results = ray.get(promises)
+                all_results.extend(results)
+                promises = []
+                pbar.update(len(results))
+
+        if promises:
+            results = ray.get(promises)
+            all_results.extend(results)
+            pbar.update(len(results))
+
+    df = pd.DataFrame(all_results)
+    df = (
+        pd.json_normalize(df["time_stats"])
+        .add_prefix("time_stats.")
+        .join(df.drop(columns=["time_stats"]))
+    )
+    return df
+
+
+def profile_hybrid_attention(
+    args: argparse.Namespace,
+    model_name: str,
+    config: dict,
+    num_tokens_list: List[int],
+    pbar: Any,
+) -> pd.DataFrame:
+    """Profile CSA/HCA hybrid attention projections across token counts."""
+    all_results = []
+
+    if args.disable_ray:
+        wrapper = CSAHCAAttentionWrapper(
+            hidden_size=config["hidden_size"],
+            num_heads=config["num_heads"],
+            head_dim=config["head_dim"],
+            csa_chunk_size=config["csa_chunk_size"],
+            csa_top_k=config["csa_top_k"],
+            hca_chunk_size=config["hca_chunk_size"],
+            n_hc=config.get("n_hc", 4),
+            profile_method=args.profile_method,
+            output_dir=args.output_dir,
+        )
+        for num_tokens in num_tokens_list:
+            result = wrapper.profile(num_tokens)
+            all_results.append(result)
+            pbar.update(1)
+    else:
+        wrapper_actor = ray.remote(num_cpus=1, num_gpus=1)(CSAHCAAttentionWrapper)
+        wrappers = [
+            wrapper_actor.remote(
+                hidden_size=config["hidden_size"],
+                num_heads=config["num_heads"],
+                head_dim=config["head_dim"],
+                csa_chunk_size=config["csa_chunk_size"],
+                csa_top_k=config["csa_top_k"],
+                hca_chunk_size=config["hca_chunk_size"],
+                n_hc=config.get("n_hc", 4),
                 profile_method=args.profile_method,
                 output_dir=args.output_dir,
             )
@@ -436,7 +532,7 @@ def main():
             moe_df.to_csv(f"{model_dir}/sparse_mlp.csv", index=False)
             print(f"  Saved: {model_dir}/sparse_mlp.csv ({len(moe_df)} rows)")
 
-        # 2. MLA attention profiling (only for models with MLA)
+        # 2. Attention profiling (MLA or CSA/HCA hybrid)
         if not args.skip_mla and config.get("has_mla"):
             print(f"\n[2/3] Profiling MLA attention ({len(num_tokens_to_profile)} token counts)...")
             if not args.disable_ray:
@@ -447,6 +543,16 @@ def main():
             pbar.close()
             mla_df.to_csv(f"{model_dir}/mla_attention.csv", index=False)
             print(f"  Saved: {model_dir}/mla_attention.csv ({len(mla_df)} rows)")
+        elif not args.skip_mla and config.get("has_hybrid_csa_hca"):
+            print(f"\n[2/3] Profiling CSA/HCA hybrid attention ({len(num_tokens_to_profile)} token counts)...")
+            if not args.disable_ray:
+                ray.init(ignore_reinit_error=True)
+
+            pbar = tqdm(total=len(num_tokens_to_profile), desc="CSA/HCA Attention")
+            hybrid_df = profile_hybrid_attention(args, model_name, config, num_tokens_to_profile, pbar)
+            pbar.close()
+            hybrid_df.to_csv(f"{model_dir}/attention.csv", index=False)
+            print(f"  Saved: {model_dir}/attention.csv ({len(hybrid_df)} rows)")
         elif not args.skip_mla:
             print(f"\n[2/3] Skipping MLA (model uses standard GQA attention)")
 

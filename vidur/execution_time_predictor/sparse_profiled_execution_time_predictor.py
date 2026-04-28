@@ -141,10 +141,17 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
         else:
             logger.info(f"No MoE MLP profiling CSV found in {sparse_dir}, using analytical")
 
-        if mla_path:
-            self._load_mla_attention(mla_path)
+        attn_type = getattr(self._model_config, 'attention_type', 'MHA')
+        if attn_type == 'HYBRID_CSA_HCA':
+            if mla_path:
+                self._load_hybrid_attention(mla_path)
+            else:
+                logger.info(f"No CSA/HCA attention profiling CSV found in {sparse_dir}, using analytical")
         else:
-            logger.info(f"No MLA attention profiling CSV found in {sparse_dir}, using analytical")
+            if mla_path:
+                self._load_mla_attention(mla_path)
+            else:
+                logger.info(f"No MLA attention profiling CSV found in {sparse_dir}, using analytical")
 
         if io_path:
             self._load_io_bandwidth(io_path)
@@ -233,6 +240,48 @@ class SparseProfiledExecutionTimePredictor(MoEExecutionTimePredictor):
 
         logger.info(
             f"  MLA profiled: {len(predictions)} token counts, "
+            f"max={self._sparse_mla_max_tokens}"
+        )
+
+    def _load_hybrid_attention(self, path: str):
+        """Load CSA/HCA hybrid attention profiling data."""
+        df = pd.read_csv(path)
+        logger.info(f"Loaded CSA/HCA hybrid attention profiling: {len(df)} rows from {path}")
+
+        predictions = {}
+
+        for _, row in df.iterrows():
+            nt = int(row["num_tokens"])
+
+            # CSA projections: chunk compression + sparse selector
+            csa_proj_ms = (
+                row.get("time_stats.csa_chunk_proj.median", 0)
+                + row.get("time_stats.csa_sparse_selector.median", 0)
+            )
+
+            # HCA projections: heavy chunk compression
+            hca_proj_ms = row.get("time_stats.hca_chunk_proj.median", 0)
+
+            # Output projections (average of CSA and HCA layers)
+            post_proj_ms = (
+                row.get("time_stats.csa_o_proj.median", 0)
+                + row.get("time_stats.hca_o_proj.median", 0)
+            ) / 2.0
+
+            # RoPE (applied on compressed representations)
+            rope_ms = row.get("time_stats.hybrid_rope.median", 0)
+
+            predictions[nt] = {
+                "pre_proj_ms": (csa_proj_ms + hca_proj_ms) / 2.0,
+                "post_proj_ms": post_proj_ms,
+                "rope_ms": rope_ms,
+            }
+
+        self._sparse_mla_predictions = predictions
+        self._sparse_mla_max_tokens = max(predictions.keys()) if predictions else 0
+
+        logger.info(
+            f"  CSA/HCA profiled: {len(predictions)} token counts, "
             f"max={self._sparse_mla_max_tokens}"
         )
 

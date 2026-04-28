@@ -37,12 +37,18 @@ class BaseModelConfig(BaseFixedConfig):
     moe_intermediate_size: Optional[int] = None  # None means use mlp_hidden_dim
 
     # MLA (Multi-head Latent Attention) fields for DeepSeek
-    attention_type: str = "MHA"  # "MHA", "GQA", or "MLA"
+    attention_type: str = "MHA"  # "MHA", "GQA", "MLA", or "HYBRID_CSA_HCA"
     kv_lora_rank: Optional[int] = None
     q_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
+
+    # CSA/HCA Hybrid Attention fields (DeepSeek-V4)
+    csa_chunk_size: Optional[int] = None   # CSA compression chunk size
+    csa_top_k: Optional[int] = None        # CSA sparse selector k
+    hca_chunk_size: Optional[int] = None   # HCA heavy compression chunk size
+    n_hc: int = 1                          # mHC stream width (1 = standard residual)
 
     @property
     def expert_intermediate_size(self) -> int:
@@ -309,6 +315,60 @@ class DeepSeekV3ModelConfig(BaseModelConfig):
     @staticmethod
     def get_name():
         return "deepseek-ai/DeepSeek-V3"
+
+    @classmethod
+    def get_profiling_name(cls) -> str:
+        return "meta-llama/Meta-Llama-3-70B"
+
+
+@dataclass
+class DeepSeekV4ProModelConfig(BaseModelConfig):
+    """DeepSeek-V4-Pro: 1.6T/49B MoE with Hybrid CSA+HCA attention and mHC residuals.
+
+    Key innovations vs V3:
+    - Hybrid attention (CSA + HCA interleaved) replaces MLA → 10% KV cache at 1M ctx
+    - 384 routed experts, 6/token (vs 256, 8/token in V3)
+    - mHC hyper-connections (n_hc=4) replace standard residuals
+    - 1M token native context (vs 128K in V3)
+
+    NOTE: num_layers, embedding_dim, num_q_heads are estimated from public info.
+    Verify against the hyperparameter table in the DeepSeek V4 technical report PDF.
+    Head dim=512 is confirmed; 16 heads × 512 = 8192 embedding_dim (estimate).
+    """
+    num_layers: int = 61              # estimate; verify from PDF
+    num_q_heads: int = 16             # head_dim=512 → 16×512=8192; verify from PDF
+    num_kv_heads: int = 16
+    embedding_dim: int = 8192         # estimate; verify from PDF
+    mlp_hidden_dim: int = 18432       # dense layers; estimate from V3 scale
+    max_position_embeddings: int = 1_000_000
+    use_gated_mlp: bool = True
+    use_bias: bool = False
+    use_qkv_bias: bool = False
+    activation: ActivationType = ActivationType.SILU
+    norm: NormType = NormType.RMS_NORM
+    post_attn_norm: bool = True
+    vocab_size: int = 129280
+    rope_theta: Optional[float] = 10000
+
+    # MoE: 384 routed, 6 active, 1 shared
+    is_moe: bool = True
+    num_routed_experts: int = 384
+    num_experts_per_tok: int = 6
+    num_shared_experts: int = 1
+    moe_intermediate_size: int = 2048  # estimate; verify from PDF
+
+    # Hybrid CSA+HCA attention (replaces MLA)
+    attention_type: str = "HYBRID_CSA_HCA"
+    csa_chunk_size: int = 64
+    csa_top_k: int = 16
+    hca_chunk_size: int = 1024
+
+    # mHC hyper-connections
+    n_hc: int = 4
+
+    @staticmethod
+    def get_name():
+        return "deepseek-ai/DeepSeek-V4-Pro"
 
     @classmethod
     def get_profiling_name(cls) -> str:
@@ -651,4 +711,8 @@ class GenericModelConfig(BaseModelConfig):
             qk_nope_head_dim=data.get("qk_nope_head_dim"),
             qk_rope_head_dim=data.get("qk_rope_head_dim"),
             v_head_dim=data.get("v_head_dim"),
+            csa_chunk_size=data.get("csa_chunk_size"),
+            csa_top_k=data.get("csa_top_k"),
+            hca_chunk_size=data.get("hca_chunk_size"),
+            n_hc=data.get("n_hc", 1),
         )

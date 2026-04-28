@@ -55,6 +55,7 @@ class BaseExecutionTimePredictor(ABC):
         Following InferSim's kvcache/kvcache.py:
         - MHA/GQA: 2 * num_kv_heads * head_dim * bytes_per_element
         - MLA: (kv_lora_rank + qk_rope_head_dim) * bytes_per_element
+        - HYBRID_CSA_HCA: averaged compression factor across interleaved CSA/HCA layers
         """
         mc = self._model_config
         bytes_per_element = 2  # FP16/BF16
@@ -62,6 +63,16 @@ class BaseExecutionTimePredictor(ABC):
         attn_type = getattr(mc, 'attention_type', 'MHA')
         if attn_type == 'MLA' and getattr(mc, 'kv_lora_rank', None):
             return (mc.kv_lora_rank + mc.qk_rope_head_dim) * bytes_per_element
+
+        if attn_type == 'HYBRID_CSA_HCA':
+            # CSA layers: effective KV per token ≈ 1/csa_chunk_size of MHA
+            # HCA layers: effective KV per token ≈ 1/hca_chunk_size of MHA
+            # Layers alternate CSA/HCA → use average compression factor
+            csa_factor = 1.0 / (getattr(mc, 'csa_chunk_size', None) or 64)
+            hca_factor = 1.0 / (getattr(mc, 'hca_chunk_size', None) or 1024)
+            avg_factor = (csa_factor + hca_factor) / 2.0
+            head_dim = mc.embedding_dim // mc.num_q_heads
+            return avg_factor * 2 * mc.num_kv_heads * head_dim * bytes_per_element
 
         # MHA / GQA
         head_dim = mc.embedding_dim // mc.num_q_heads
