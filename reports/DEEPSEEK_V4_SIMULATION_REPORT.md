@@ -49,7 +49,13 @@ KV cache bytes **per token per layer** (FP16):
 | DeepSeek-V3 | MLA | 1152 | 0.28× |
 | **DeepSeek-V4-Pro** | **CSA+HCA avg** | **272** | **0.066×** |
 
-V4-Pro's KV cache per token is **4.2× smaller than V3** and **15× smaller than standard MHA**. This directly translates to longer sustainable context and reduced memory bandwidth pressure during decode.
+V4-Pro's KV cache per token is **4.2× smaller than V3** and **15× smaller than standard MHA**.
+
+![KV cache bytes per token per layer](plots/6_kv_bytes_per_token.png)
+
+![KV cache size vs context length](plots/3_kv_cache_size.png)
+
+![V4-Pro KV cache compression ratio over V3](plots/8_kv_ratio.png)
 
 ---
 
@@ -57,7 +63,9 @@ V4-Pro's KV cache per token is **4.2× smaller than V3** and **15× smaller than
 
 *Conditions: batch=1, 1 decode token, TP=8, A100, MFU=0.45*
 
-### 3.1 At short context (512–4K tokens)
+### 3.1 Decode latency vs context length
+
+![Decode latency vs context length](plots/1_decode_latency.png)
 
 At short context the KV cache bandwidth advantage is small; V4 is slower due to larger model dimensions.
 
@@ -66,9 +74,7 @@ At short context the KV cache bandwidth advantage is small; V4 is slower due to 
 | 1,024 | 0.007 | 0.013 | 0.026 |
 | 4,096 | 0.007 | 0.027 | 0.103 |
 
-### 3.2 At long context (64K–1M tokens)
-
-The KV cache bandwidth becomes the bottleneck; CSA/HCA compression dominates.
+The KV cache bandwidth becomes the bottleneck at long context; CSA/HCA compression dominates.
 
 | Context | V4-Pro (ms) | V3 (ms) | Llama-3-70B (ms) | V4 vs V3 |
 |---|---|---|---|---|
@@ -77,11 +83,21 @@ The KV cache bandwidth becomes the bottleneck; CSA/HCA compression dominates.
 | 524,288 | 0.667 | 2.823 | 13.165 | **4.2× faster** |
 | **1,000,000** | **1.271** | **5.385** | **25.110** | **4.2× faster** |
 
-At 1M tokens, V4-Pro achieves **786 tokens/s** vs V3's **186 tokens/s** decode throughput — a **4.2× improvement**.
+### 3.2 Decode throughput
 
-The 4.2× ratio equals exactly the KV cache compression ratio (1152 / 272), confirming the simulation is memory-bandwidth-bound at long context, as expected for decode.
+![Decode throughput vs context length](plots/2_decode_throughput.png)
 
-### 3.3 FLOPs comparison at 1M context
+At 1M tokens, V4-Pro achieves **786 tokens/s** vs V3's **186 tokens/s** — a **4.2× improvement**. The ratio equals exactly the KV cache compression ratio (1152 / 272), confirming the simulation is memory-bandwidth-bound at long context, as expected for decode.
+
+### 3.3 Speedup over V3 by context length
+
+![V4-Pro speedup over V3 by context](plots/4_speedup_vs_context.png)
+
+V4-Pro breaks even with V3 at approximately **16K–65K tokens** and scales linearly with compression thereafter.
+
+### 3.4 FLOPs per decode step
+
+![FLOPs per decode step vs context length](plots/5_flops_per_step.png)
 
 | Model | FLOPs (B) at 1M ctx | vs V3 |
 |---|---|---|
@@ -89,7 +105,7 @@ The 4.2× ratio equals exactly the KV cache compression ratio (1152 / 272), conf
 | DeepSeek-V3 | 5,007 | 1.0× |
 | DeepSeek-V4-Pro | 24 | **0.005×** |
 
-V4's FLOPs per decode step at 1M context are **200× lower than V3** — because with CSA/HCA compression, the attention computation scales with seq_len/chunk_size not seq_len.
+V4's FLOPs per decode step at 1M context are **200× lower than V3** because with CSA/HCA compression, attention computation scales with seq_len/chunk_size rather than seq_len directly.
 
 ---
 
@@ -98,6 +114,8 @@ V4's FLOPs per decode step at 1M context are **200× lower than V3** — because
 *Conditions: 500 synthetic requests, 512 prefill + 256 decode tokens, QPS=3.0, sarathi scheduler, TP=4 on A100, linear-regression execution-time predictor*
 
 This simulation exercises Vidur's full scheduling stack: request batching, queuing, KV cache block management, and throughput under load.
+
+![Vidur simulation comparison](plots/7_vidur_sim_comparison.png)
 
 ### 4.1 Results
 
@@ -128,17 +146,17 @@ Based on the analytical model, V4-Pro becomes faster than V3 at approximately **
 
 ---
 
-## 5. Answering: Can you use GPU profiling data later?
+## 5. Using GPU Profiling Data
 
 **Yes — that is exactly what the `sparse_profiled` predictor is designed for.**
 
-### What's implemented now
+### Current mode
 
 The simulation runs in **analytical fallback mode**: execution time is estimated from FLOPs formulas scaled against Llama-3-70B profiling CSVs. The CSA/HCA attention timing uses the same MLA projection structure from those CSVs.
 
-### What you do when you have a GPU
+### When you have a GPU
 
-**Step 1: Profile the model on your GPU**
+**Step 1: Profile the model**
 ```bash
 python -m vidur.profiling.sparse.main \
     --models deepseek-ai/DeepSeek-V4-Pro \
@@ -147,12 +165,7 @@ python -m vidur.profiling.sparse.main \
     --disable_ray
 ```
 
-This runs `CSAHCAAttentionWrapper` and `SparseMlpWrapper` on the GPU, measuring real CUDA latencies for:
-- CSA chunk projection (`csa_chunk_proj`, `csa_sparse_selector`)
-- HCA heavy compression (`hca_chunk_proj`)
-- Output projections and mHC residuals
-- MoE routing, expert GEMM, shared expert
-- IO bandwidth (HBM and PCIe)
+This runs `CSAHCAAttentionWrapper` and `SparseMlpWrapper` on the GPU, measuring real CUDA latencies for CSA chunk projection, HCA heavy compression, mHC residuals, MoE routing and expert GEMM, and IO bandwidth (HBM + PCIe).
 
 **Step 2: Run simulation with profiled data**
 ```bash
@@ -165,20 +178,14 @@ python -m vidur.main \
     ...
 ```
 
-The `SparseProfiledExecutionTimePredictor` will:
-1. Load `attention.csv` → use real CSA/HCA projection timings via `_load_hybrid_attention()`
-2. Load `mlp.csv` → use real MoE routing and expert GEMM timings
-3. Load `io.csv` → use real HBM/PCIe bandwidth for KV cache transfers
-4. Fall back to analytical estimates for any missing component
+The `SparseProfiledExecutionTimePredictor` will automatically load `attention.csv` (CSA/HCA timings via `_load_hybrid_attention()`), `mlp.csv` (MoE timings), and `io.csv` (bandwidth), falling back to analytical estimates for any missing file.
 
-### Accuracy improvement with profiled data
+### Accuracy improvement
 
 | Predictor | Timing accuracy | Notes |
 |---|---|---|
 | `linear_regression` (current) | ~5–10% MAPE for dense ops; MoE analytical | Uses Llama-3-70B profiling, scaled to V4 dimensions |
 | `sparse_profiled` (with GPU data) | ~2–5% MAPE | Real V4 CUDA timings for every attention and MoE operation |
-
-The profiled mode captures effects that the analytical model misses: actual FlashAttention kernel efficiency for CSA/HCA patterns, memory access patterns in grouped GEMM, and mHC multi-stream residual overhead.
 
 ---
 
@@ -186,8 +193,8 @@ The profiled mode captures effects that the analytical model misses: actual Flas
 
 | | Analytical (1M ctx) | Vidur Event-Sim (512 ctx) |
 |---|---|---|
-| V4-Pro vs V3 KV cache | **4.2× smaller** | Same direction |
+| V4-Pro vs V3 KV cache | **4.2× smaller** | same direction |
 | V4-Pro vs V3 decode speed | **4.2× faster** | 1.67× slower (short-ctx compute dominates) |
 | V4-Pro vs V3 FLOPs | **200× lower** at 1M ctx | N/A |
 
-**Key takeaway:** DeepSeek-V4-Pro's CSA/HCA hybrid attention is purpose-built for **long-context efficiency**, not short-context speed. At the 512-token scale typical of current benchmarks, V4 is slower because it carries a larger model (1.6T vs 671B). The gains activate above ~16K tokens and become dramatic at 1M tokens, where V4 achieves **4.2× higher throughput** and **200× lower attention FLOPs** than V3. This matches the paper's headline claim of 27% V3-equivalent FLOPs at 1M context.
+**Key takeaway:** DeepSeek-V4-Pro's CSA/HCA hybrid attention is purpose-built for **long-context efficiency**. At the 512-token scale of current benchmarks, V4 is slower because it carries a larger model (1.6T vs 671B). The gains activate above ~16K tokens and become dramatic at 1M tokens, where V4 achieves **4.2× higher decode throughput** and **200× lower attention FLOPs** than V3 — consistent with the paper's headline claim of 27% V3-equivalent compute at 1M context.
