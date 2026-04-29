@@ -50,6 +50,12 @@ class BaseModelConfig(BaseFixedConfig):
     hca_chunk_size: Optional[int] = None   # HCA heavy compression chunk size
     n_hc: int = 1                          # mHC stream width (1 = standard residual)
 
+    # SWA (Sliding Window Attention) fields (DeepSeek-V4)
+    n_swa_layers: int = 0                  # number of SWA layers (0 = none)
+    n_csa_layers: Optional[int] = None     # explicit CSA layer count (None = (n_layers - n_swa) // 2)
+    n_hca_layers: Optional[int] = None     # explicit HCA layer count (None = n_layers - n_swa - n_csa)
+    swa_window_size: Optional[int] = None  # SWA window in tokens
+
     @property
     def expert_intermediate_size(self) -> int:
         """FFN hidden dim used for expert layers."""
@@ -357,11 +363,17 @@ class DeepSeekV4ProModelConfig(BaseModelConfig):
     num_shared_experts: int = 1
     moe_intermediate_size: int = 2048  # estimate; verify from PDF
 
-    # Hybrid CSA+HCA attention (replaces MLA)
+    # Hybrid CSA+HCA+SWA attention (replaces MLA)
     attention_type: str = "HYBRID_CSA_HCA"
     csa_chunk_size: int = 64
     csa_top_k: int = 16
     hca_chunk_size: int = 1024
+
+    # SWA: 8 layers use sliding-window attention (local context)
+    n_swa_layers: int = 8
+    n_csa_layers: int = 28   # of the remaining 53 non-SWA layers
+    n_hca_layers: int = 25   # remaining layers
+    swa_window_size: int = 4096
 
     # mHC hyper-connections
     n_hc: int = 4
@@ -715,4 +727,8 @@ class GenericModelConfig(BaseModelConfig):
             csa_top_k=data.get("csa_top_k"),
             hca_chunk_size=data.get("hca_chunk_size"),
             n_hc=data.get("n_hc", 1),
+            n_swa_layers=data.get("n_swa_layers", 0),
+            n_csa_layers=data.get("n_csa_layers"),
+            n_hca_layers=data.get("n_hca_layers"),
+            swa_window_size=data.get("swa_window_size"),
         )
