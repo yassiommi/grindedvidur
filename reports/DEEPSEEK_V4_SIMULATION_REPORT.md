@@ -210,84 +210,186 @@ The `SparseProfiledExecutionTimePredictor` will automatically load `attention.cs
 
 ## 6. SWA KV Cache: Storage and Latency Analysis
 
-V4-Pro's inference engine manages **four heterogeneous KV entry types** in a single request:
+### 6.0 Implementation Design
 
-| Entry type | Where stored | Size per token | Notes |
+The analysis is implemented in `experiments/run_deepseek_v4_swa_kv_analysis.py`, which uses
+**InferLens components exclusively** — no hardcoded model parameters:
+
+```python
+from vidur.config.device_sku_config import A100DeviceSKUConfig
+from vidur.config.model_config import (
+    DeepSeekV4ProModelConfig,
+    DeepSeekV3ModelConfig,
+    Llama3_70BModelConfig,
+)
+
+_V4  = DeepSeekV4ProModelConfig()   # 61-layer MoE, CSA/HCA/SWA hybrid
+_V3  = DeepSeekV3ModelConfig()      # MLA baseline
+_L3  = Llama3_70BModelConfig()      # MHA baseline
+_A100 = A100DeviceSKUConfig()       # HBM BW, FP16 TFLOPs
+```
+
+All hardware constants (`HBM_BW_GBS = 2039`, `FP16_TFLOPS = 312`) are read directly from
+`_A100.*`; all model geometry (layer counts, chunk sizes, head dimensions, expert counts) from
+`_V4.*`.  Timing uses an **analytical roofline model** — no GPU profiling data required.
+
+#### Key dataclasses
+
+| Dataclass | Role |
+|---|---|
+| `SwaStrategy` | Encodes Full / Periodic(C) / Zero on-disk SWA policy |
+| `V4LayerKv` | KV storage for one layer: `n_compressed`, `n_tail`, `n_state` |
+| `V4KvLayout` | Aggregated per-request layout: CSA/HCA compressed + tails + SWA window |
+| `StrategyResult` | Cache-hit latency decomposition: disk load + recompute + first decode |
+| `BaselineResult` | V3 MLA / Llama-3-70B MHA on-disk bytes for comparison |
+
+#### V4 KV Layout: heterogeneous entries
+
+V4-Pro's inference engine manages **four KV entry types** in a single request:
+
+| Entry type | Where stored | Bytes / token (stored) | How computed |
 |---|---|---|---|
-| **CSA compressed** | On-disk + HBM | `KV_FULL / csa_chunk` = 512 B/tok | 1 summary KV per 64 tokens |
-| **HCA compressed** | On-disk + HBM | `KV_FULL / hca_chunk` = 32 B/tok | 1 summary KV per 1024 tokens |
-| **SWA window** | On-disk (strategy) + HBM | 32 768 B/tok × min(S, 4096) tokens | Full resolution, bounded window |
-| **Uncompressed tail** | HBM only (state cache) | 32 768 B/tok × (S mod chunk) | CSA tail ≤ 63 tok, HCA tail ≤ 1023 tok |
+| **CSA compressed** | On-disk (+ HBM warm copy) | `kv_full / csa_chunk` = 512 B | `floor(S / 64)` summary entries per CSA layer |
+| **HCA compressed** | On-disk (+ HBM warm copy) | `kv_full / hca_chunk` = 32 B | `floor(S / 1024)` entries per HCA layer |
+| **SWA window** | On-disk (strategy-dependent) + HBM state cache | 32 768 B (full-resolution, bounded) | `min(S, swa_window)` = up to 4 096 tokens |
+| **Uncompressed tail** | HBM only ("state cache") | 32 768 B/tok × (S mod chunk) | CSA tail ≤ 63 tok; HCA tail ≤ 1 023 tok |
 
-`KV_FULL = 2 × 16 heads × 512 head_dim × 2 bytes = 32 768 bytes/token` (V4's large head_dim makes each uncompressed entry expensive).
+`kv_full = 2 × num_kv_heads × head_dim × 2 bytes = 2 × 16 × 512 × 2 = 32 768 B/token`
+(V4's large `head_dim=512` makes each uncompressed entry 8× more expensive than V3's 64-dim heads.)
 
-Layer split assumed: **8 SWA**, **28 CSA**, **25 HCA** out of 61 total (estimated; exact breakdown not published).
+Layer split (estimated; exact breakdown not published):
+**8 SWA + 28 CSA (chunk=64) + 25 HCA (chunk=1024) = 61 total**
+
+The `_build_layer()` function models this precisely:
+
+```python
+def _build_layer(layer_type, seq_len, kv_full):
+    if layer_type == "CSA":
+        n_comp  = seq_len // _V4.csa_chunk_size   # 64
+        n_tail  = seq_len %  _V4.csa_chunk_size
+        n_state = n_tail
+    elif layer_type == "HCA":
+        n_comp  = seq_len // _V4.hca_chunk_size   # 1024
+        n_tail  = seq_len %  _V4.hca_chunk_size
+        n_state = n_tail
+    else:  # SWA — full-resolution, bounded window
+        n_comp  = 0
+        n_state = min(seq_len, _V4.swa_window_size)  # 4096
+```
+
+#### Latency model
+
+Cache-hit total latency = **disk load** + **SWA recompute** + **first decode HBM read**:
+
+- **Disk load**: `disk_bytes / (NVME_BW × 0.80)` — CSA + HCA compressed + SWA stored tokens
+- **SWA recompute**: analytical prefill FLOPs through `n_swa_layers=8`, only when SWA not stored
+- **First decode HBM read**: `state_cache_bytes / (HBM_BW × 0.80 × TP)` — state cache = tails + SWA window
 
 ### 6.1 On-Disk Storage Breakdown
 
-![V4-Pro KV cache storage breakdown](plots/10_kv_breakdown.png)
+![V4-Pro KV storage breakdown](../example_outputs/experiments/deepseek_v4_swa_kv_analysis/plot_a_kv_storage_breakdown.png)
 
-*Left: on-disk storage stacked by component (CSA compressed / HCA compressed / SWA disk) vs V3 MLA and Llama-3-70B totals.  Right: HBM state-cache = uncompressed tails + active SWA window.*
+*Left bars (per context): HBM state-cache = CSA tail + HCA tail + SWA window.
+Right bars: on-disk components under Full SWA strategy = CSA compressed + HCA compressed + SWA full copy.*
 
 | Context | V4 Full SWA | V4 Zero SWA | V3 MLA | Llama-3-70B |
 |---|---|---|---|---|
-| 4K | 1.136 GB | 0.062 GB | 0.283 GB | 1.342 GB |
-| 16K | 1.322 GB | 0.248 GB | 1.132 GB | 5.369 GB |
-| 65K | 2.066 GB | 0.992 GB | 4.530 GB | 21.475 GB |
-| 131K | 3.058 GB | 1.984 GB | 9.060 GB | 42.950 GB |
-| 1M | 16.209 GB | 15.136 GB | 69.120 GB | 327.680 GB |
+| 4K   |  1.136 GB |  0.062 GB |  0.288 GB |   1.342 GB |
+| 16K  |  1.322 GB |  0.248 GB |  1.151 GB |   5.369 GB |
+| 64K  |  2.066 GB |  0.992 GB |  4.605 GB |  21.475 GB |
+| 128K |  3.058 GB |  1.984 GB |  9.211 GB |  42.950 GB |
+| 1M   | 16.209 GB | 15.136 GB | 70.272 GB | 327.680 GB |
 
-At long context the **SWA disk footprint is constant** (1.074 GB — the saturated 4096-token window), so the Full vs Zero difference is always exactly 1.074 GB regardless of context length.
+At long context the **SWA disk footprint is constant** (1.074 GB — the saturated 4096-token window),
+so the Full vs Zero difference is always exactly 1.074 GB regardless of context length.
 
-![On-disk KV storage vs context](plots/11_kv_disk_storage.png)
+![On-disk storage vs context](../example_outputs/experiments/deepseek_v4_swa_kv_analysis/plot_b_disk_storage_vs_context.png)
 
-V4 Full SWA stays **3–21× smaller** than V3 MLA across the full context range, and **19–270× smaller** than Llama-3-70B MHA.
+V4 Full SWA stays **3–21× smaller** than V3 MLA and **18–270× smaller** than Llama-3-70B MHA
+across the full context range.
 
 ### 6.2 Three SWA Caching Strategies
 
-On a **shared-prefix cache hit**, the system loads compressed CSA/HCA KV from disk and handles the SWA window one of three ways:
+On a **shared-prefix cache hit** the system loads CSA/HCA compressed KV from disk and handles
+the SWA window one of three ways:
 
-| Strategy | SWA on disk | Recompute on hit | Disk load | Recompute | Best for |
-|---|---|---|---|---|---|
-| **Full SWA Caching** | Full window (4096 tok) | None | Highest | 0 ms | Latency-critical, repeated prompts |
-| **Periodic Checkpointing** | Every C tokens | ≤ C tokens | Medium | ~1 ms (C=2048) | Balanced |
-| **Zero SWA Caching** | Nothing | Full window | Lowest | ~3 ms | Storage-constrained |
+| Strategy | SWA on disk | Recompute on hit | Disk delta vs Full | Recompute cost |
+|---|---|---|---|---|
+| **Full SWA Caching** | Full window (4 096 tok) | None | baseline | 0 ms |
+| **Periodic(C)** | `floor(win / C) × C` tokens | up to C tokens | −(win % C) × kv_full × n_swa | ≤ C-token prefill |
+| **Zero SWA Caching** | Nothing | Full window | −1.074 GB | ~172 ms (bounded) |
+
+`compute_strategy_result()` computes all three numbers analytically using:
+- **Disk bytes** = CSA compressed + HCA compressed + `swa_disk_tokens × kv_full × n_swa_layers`
+- **Disk load ms** = `disk_bytes / (NVME_BW × 0.80)`
+- **Recompute ms** = prefill FLOPs through SWA layers for `swa_recompute_tokens`
 
 ### 6.3 Cache-Hit Latency
 
-![Cache-hit latency breakdown](plots/12_cache_hit_latency.png)
+![Cache-hit latency breakdown](../example_outputs/experiments/deepseek_v4_swa_kv_analysis/plot_c_cache_hit_latency.png)
 
-*Stacked bars: disk load (blue) + SWA recomputation (orange) + first decode read (green). Values in ms.*
+*Grouped bars: solid = disk load, hatched = SWA recompute, dotted = first decode HBM read.*
 
-At **131K tokens**:
+At **128K tokens** (from the analytical model):
 
 | Strategy | Disk load | SWA recompute | First decode | **Total** |
 |---|---|---|---|---|
-| Full SWA Caching | 546.0 ms | 0.0 ms | 15.0 ms | **561.0 ms** |
-| Periodic (C=2048) | 546.0 ms | 1.2 ms | 15.0 ms | **562.2 ms** |
-| Periodic (C=512) | 546.0 ms | 0.2 ms | 15.0 ms | **561.2 ms** |
-| Zero SWA Caching | 354.3 ms | 3.4 ms | 15.0 ms | **372.7 ms** |
+| Full SWA Caching   | 546.0 ms |   0.00 ms | 0.08 ms | **546.1 ms** |
+| Periodic (C=500)   | 541.5 ms |   3.32 ms | 0.08 ms | **544.9 ms** |
+| Periodic (C=1500)  | 494.7 ms |  39.96 ms | 0.08 ms | **534.7 ms** |
+| Zero SWA Caching   | 354.3 ms | 172.29 ms | 0.08 ms | **526.6 ms** |
 
-**Key finding:** disk load dominates at long context (>95% of latency). The SWA recomputation cost is small (~1–3 ms) because it only covers ≤ window_size = 4096 tokens through 8 SWA layers. **Zero SWA Caching is actually fastest** — it saves ~190 ms of SWA disk I/O in exchange for only 3 ms of recomputation. The recompute cost never exceeds ~3.4 ms regardless of context length (bounded by the window).
+**Key findings:**
 
-This reversal (Zero faster than Full at long context) occurs because the SWA window stays fixed at 4096 tokens while the total disk load grows. The SWA fraction of total disk shrinks from ~95% at 1K tokens to ~7% at 131K — so the I/O saving from not caching SWA becomes relatively small, but zero SWA avoids loading that fixed 1.074 GB chunk, which at 7 GB/s NVMe takes 190 ms.
+1. **Disk load dominates** (>95% of latency at long context). The NVMe bandwidth bottleneck
+   dwarfs all compute costs — the SWA window recompute through 8 layers never exceeds ~172 ms
+   because it's bounded to ≤ 4 096 tokens regardless of sequence length.
+
+2. **Zero SWA Caching is fastest at long context** — it avoids loading 1.074 GB of SWA data
+   (~192 ms at 7 GB/s NVMe), saving more time than the full-window recompute costs (172 ms).
+   This reversal holds everywhere >8K tokens.
+
+3. **First-decode HBM read is negligible** (0.08 ms at 128K, 0.12 ms at 1M) because the state
+   cache is small and TP=8 parallelises the HBM read across eight A100s.
 
 ### 6.4 Storage–Latency Pareto
 
-![SWA strategy Pareto](plots/13_swa_pareto.png)
+![SWA strategy Pareto](../example_outputs/experiments/deepseek_v4_swa_kv_analysis/plot_d_pareto_storage_vs_latency.png)
 
-*Left: all strategies across all contexts. Right: checkpoint interval sweep at 131K tokens — the Pareto frontier shows Periodic C=512 is near-optimal (nearly zero recompute, 1.074 GB less disk than Full).*
+*Pareto sweep at 131K context: orange dots = Periodic(C) for C ∈ {200,500,800,…,4500}.
+Full (red) anchors the high-storage/low-latency corner; Zero (green) anchors the opposite.*
 
-**Recommendation**: at long context (>16K tokens), **Periodic Checkpointing with C=512** offers the best trade-off — it uses 1.074 GB less on-disk space than Full SWA Caching with only 0.2 ms recomputation penalty. Zero SWA Caching saves the same storage with a ~3 ms penalty, which is still negligible compared to the ~550 ms disk load.
+The Periodic curve is **convex** — moving from C=200 toward C=4500 adds storage almost linearly
+but reduces latency with diminishing returns beyond C≈1500. The practically useful range is
+C ∈ [500, 1500]:
+
+| C | On-disk storage | Total latency | vs Full: Δstorage | Δlatency |
+|---|---|---|---|---|
+| Full | 3.058 GB | 546.1 ms | — | — |
+| C=1500 | 2.770 GB | 534.7 ms | −0.288 GB | −11.4 ms |
+| C=500  | 3.032 GB | 544.9 ms | −0.026 GB |  −1.2 ms |
+| Zero   | 1.984 GB | 526.6 ms | −1.074 GB | −19.5 ms |
+
+**Recommendation**: at long context, **Zero SWA Caching** is dominant — it saves 1.074 GB of
+storage *and* reduces latency by ~20 ms. Periodic(C) is useful only if strict HBM-resident
+recompute budget makes the 172 ms recompute cost unacceptable.
 
 ---
 
 ## 7. Summary
 
-| | Analytical (1M ctx) | Analytical (65K ctx) | InferLens Event-Sim (512 ctx) |
+| | Analytical (1M ctx) | Analytical (64K ctx) | InferLens Event-Sim (512 ctx) |
 |---|---|---|---|
-| V4-Pro vs V3 KV cache | **4.2× smaller** | **4.2× smaller** | same direction |
-| V4-Pro vs V3 decode speed | **4.2× faster** | **4.2× faster** | 1.67× slower (short-ctx compute dominates) |
+| V4-Pro vs V3 on-disk KV | **4.3× smaller** (Full SWA) | **2.2× smaller** | — |
+| V4-Pro vs Llama-3-70B on-disk KV | **20× smaller** (Full SWA) | **10× smaller** | — |
+| V4-Pro vs V3 decode speed | **4.2× faster** | **4.2× faster** | 1.67× slower (short-ctx compute bound) |
 | V4-Pro vs V3 FLOPs | **200× lower** at 1M ctx | 200× lower | N/A |
+| SWA latency winner | Zero SWA (−20 ms, −1 GB) | Zero SWA | — |
 
-**Key takeaway:** DeepSeek-V4-Pro's CSA/HCA hybrid attention is purpose-built for **long-context efficiency**. At the 512-token scale of current benchmarks, V4 is slower because it carries a larger model (1.6T vs 671B). The gains activate above ~16K tokens and become dramatic at 1M tokens, where V4 achieves **4.2× higher decode throughput** and **200× lower attention FLOPs** than V3 — consistent with the paper's headline claim of 27% V3-equivalent compute at 1M context.
+**Key takeaway:** DeepSeek-V4-Pro's CSA/HCA hybrid attention is purpose-built for
+**long-context efficiency**. At 512-token scale V4 is slower (larger model, 1.6T vs 671B).
+The gains activate above ~16K tokens and compound dramatically at 1M tokens — **4.2× higher
+decode throughput**, **200× fewer attention FLOPs**, and **4–20× less KV cache storage** than
+V3/Llama. Among the three on-disk SWA strategies, Zero SWA Caching dominates at long context:
+it simultaneously reduces storage by 1.074 GB and latency by ~20 ms, because the NVMe load
+savings (192 ms) exceed the bounded recompute cost (172 ms) everywhere above 8K tokens.

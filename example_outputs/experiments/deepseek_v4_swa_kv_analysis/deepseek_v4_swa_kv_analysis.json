@@ -1,0 +1,752 @@
+{
+  "config": {
+    "model": "deepseek-ai/DeepSeek-V4-Pro",
+    "device": "A100",
+    "n_layers_total": 61,
+    "n_swa_layers": 8,
+    "n_csa_layers": 28,
+    "n_hca_layers": 25,
+    "num_kv_heads": 16,
+    "head_dim": 512,
+    "csa_chunk_size": 64,
+    "hca_chunk_size": 1024,
+    "swa_window_size": 4096,
+    "kv_full_bytes": 32768,
+    "hbm_bw_gbs": 2039.0,
+    "disk_bw_gbs": 7.0,
+    "bw_efficiency": 0.8,
+    "tp": 8,
+    "prefill_mfu": 0.45,
+    "fp16_tflops": 312
+  },
+  "layouts": [
+    {
+      "seq_len": 4096,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 0.058720256,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.0032768,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 1.13573888,
+      "zero_disk_gb": 0.061997056
+    },
+    {
+      "seq_len": 8192,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 0.117440512,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.0065536,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 1.197735936,
+      "zero_disk_gb": 0.123994112
+    },
+    {
+      "seq_len": 16384,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 0.234881024,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.0131072,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 1.321730048,
+      "zero_disk_gb": 0.247988224
+    },
+    {
+      "seq_len": 32768,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 0.469762048,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.0262144,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 1.569718272,
+      "zero_disk_gb": 0.495976448
+    },
+    {
+      "seq_len": 65536,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 0.939524096,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.0524288,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 2.06569472,
+      "zero_disk_gb": 0.991952896
+    },
+    {
+      "seq_len": 131072,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 1.879048192,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.1048576,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 3.057647616,
+      "zero_disk_gb": 1.983905792
+    },
+    {
+      "seq_len": 262144,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 3.758096384,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.2097152,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 5.041553408,
+      "zero_disk_gb": 3.967811584
+    },
+    {
+      "seq_len": 524288,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 7.516192768,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.4194304,
+      "hca_tail_mb": 0.0,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.073741824,
+      "full_disk_gb": 9.009364992,
+      "zero_disk_gb": 7.935623168
+    },
+    {
+      "seq_len": 1000000,
+      "kv_full_bytes": 32768,
+      "csa_compressed_gb": 14.336,
+      "csa_tail_mb": 0.0,
+      "hca_compressed_gb": 0.7995392,
+      "hca_tail_mb": 471.8592,
+      "swa_state_gb": 1.073741824,
+      "state_cache_gb": 1.545601024,
+      "full_disk_gb": 16.209281024,
+      "zero_disk_gb": 15.1355392
+    }
+  ],
+  "strategy_results": [
+    {
+      "seq_len": 4096,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 1.13573888,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 202.81051428571425,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 202.89279587472848
+    },
+    {
+      "seq_len": 4096,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 1.110573056,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 198.31661714285713,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 201.71992712982006
+    },
+    {
+      "seq_len": 4096,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 0.848429056,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 151.50518857142856,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 191.5489106381636
+    },
+    {
+      "seq_len": 4096,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 0.061997056,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 11.070902857142855,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 183.44133124866423
+    },
+    {
+      "seq_len": 8192,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 1.197735936,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 213.88141714285712,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 213.96369873187135
+    },
+    {
+      "seq_len": 8192,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 1.172570112,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 209.38751999999997,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 212.7908299869629
+    },
+    {
+      "seq_len": 8192,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 0.910426112,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 162.5760914285714,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 202.61981349530643
+    },
+    {
+      "seq_len": 8192,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 0.123994112,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 22.14180571428571,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 194.51223410580707
+    },
+    {
+      "seq_len": 16384,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 1.321730048,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 236.0232228571428,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 236.10550444615703
+    },
+    {
+      "seq_len": 16384,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 1.296564224,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 231.52932571428568,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 234.9326357012486
+    },
+    {
+      "seq_len": 16384,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 1.034420224,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 184.7178971428571,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 224.76161920959214
+    },
+    {
+      "seq_len": 16384,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 0.247988224,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 44.28361142857142,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 216.65403982009278
+    },
+    {
+      "seq_len": 32768,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 1.569718272,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 280.3068342857142,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 280.3891158747284
+    },
+    {
+      "seq_len": 32768,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 1.544552448,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 275.8129371428571,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 279.21624712982003
+    },
+    {
+      "seq_len": 32768,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 1.282408448,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 229.00150857142853,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 269.0452306381635
+    },
+    {
+      "seq_len": 32768,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 0.495976448,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 88.56722285714284,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 260.93765124866417
+    },
+    {
+      "seq_len": 65536,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 2.06569472,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 368.8740571428571,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 368.9563387318713
+    },
+    {
+      "seq_len": 65536,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 2.040528896,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 364.38015999999993,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 367.78346998696287
+    },
+    {
+      "seq_len": 65536,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 1.778384896,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 317.56873142857137,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 357.61245349530634
+    },
+    {
+      "seq_len": 65536,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 0.991952896,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 177.13444571428568,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 349.504874105807
+    },
+    {
+      "seq_len": 131072,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 3.057647616,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 546.0085028571427,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 546.0907844461569
+    },
+    {
+      "seq_len": 131072,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 3.032481792,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 541.5146057142857,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 544.9179157012486
+    },
+    {
+      "seq_len": 131072,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 2.770337792,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 494.70317714285704,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 534.746899209592
+    },
+    {
+      "seq_len": 131072,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 1.983905792,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 354.26889142857135,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 526.6393198200926
+    },
+    {
+      "seq_len": 262144,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 5.041553408,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 900.2773942857142,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 900.3596758747284
+    },
+    {
+      "seq_len": 262144,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 5.016387584,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 895.783497142857,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 899.1868071298198
+    },
+    {
+      "seq_len": 262144,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 4.754243584,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 848.9720685714284,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 889.0157906381634
+    },
+    {
+      "seq_len": 262144,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 3.967811584,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 708.5377828571427,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 880.908211248664
+    },
+    {
+      "seq_len": 524288,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 9.009364992,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 1608.815177142857,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 1608.8974587318712
+    },
+    {
+      "seq_len": 524288,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 8.984199168,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 1604.3212799999997,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 1607.7245899869627
+    },
+    {
+      "seq_len": 524288,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 8.722055168,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 1557.5098514285712,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 1597.5535734953062
+    },
+    {
+      "seq_len": 524288,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 7.935623168,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 1417.0755657142854,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 1589.4459941058067
+    },
+    {
+      "seq_len": 1000000,
+      "strategy": "Full SWA Caching",
+      "disk_gb": 16.209281024,
+      "swa_disk_tokens": 4096,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 2894.514468571428,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.11844049043648847,
+      "total_latency_ms": 2894.6329090618647
+    },
+    {
+      "seq_len": 1000000,
+      "strategy": "Periodic (C=500)",
+      "disk_gb": 16.1841152,
+      "swa_disk_tokens": 4000,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 2890.0205714285707,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.11844049043648847,
+      "total_latency_ms": 2893.460040316956
+    },
+    {
+      "seq_len": 1000000,
+      "strategy": "Periodic (C=1500)",
+      "disk_gb": 15.9219712,
+      "swa_disk_tokens": 3000,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 2843.2091428571425,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.11844049043648847,
+      "total_latency_ms": 2883.2890238253
+    },
+    {
+      "seq_len": 1000000,
+      "strategy": "Zero SWA Caching",
+      "disk_gb": 15.1355392,
+      "swa_disk_tokens": 0,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 2702.7748571428565,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.11844049043648847,
+      "total_latency_ms": 2875.1814444358
+    }
+  ],
+  "v3_baselines": [
+    {
+      "seq_len": 4096,
+      "disk_gb": 0.287834112
+    },
+    {
+      "seq_len": 8192,
+      "disk_gb": 0.575668224
+    },
+    {
+      "seq_len": 16384,
+      "disk_gb": 1.151336448
+    },
+    {
+      "seq_len": 32768,
+      "disk_gb": 2.302672896
+    },
+    {
+      "seq_len": 65536,
+      "disk_gb": 4.605345792
+    },
+    {
+      "seq_len": 131072,
+      "disk_gb": 9.210691584
+    },
+    {
+      "seq_len": 262144,
+      "disk_gb": 18.421383168
+    },
+    {
+      "seq_len": 524288,
+      "disk_gb": 36.842766336
+    },
+    {
+      "seq_len": 1000000,
+      "disk_gb": 70.272
+    }
+  ],
+  "l3_baselines": [
+    {
+      "seq_len": 4096,
+      "disk_gb": 1.34217728
+    },
+    {
+      "seq_len": 8192,
+      "disk_gb": 2.68435456
+    },
+    {
+      "seq_len": 16384,
+      "disk_gb": 5.36870912
+    },
+    {
+      "seq_len": 32768,
+      "disk_gb": 10.73741824
+    },
+    {
+      "seq_len": 65536,
+      "disk_gb": 21.47483648
+    },
+    {
+      "seq_len": 131072,
+      "disk_gb": 42.94967296
+    },
+    {
+      "seq_len": 262144,
+      "disk_gb": 85.89934592
+    },
+    {
+      "seq_len": 524288,
+      "disk_gb": 171.79869184
+    },
+    {
+      "seq_len": 1000000,
+      "disk_gb": 327.68
+    }
+  ],
+  "pareto_sweep": [
+    {
+      "label": "Full SWA Caching",
+      "checkpoint_interval": null,
+      "is_full": true,
+      "is_zero": false,
+      "disk_gb": 3.057647616,
+      "swa_recompute_tokens": 0,
+      "disk_load_ms": 546.0085028571427,
+      "swa_recompute_ms": 0.0,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 546.0907844461569
+    },
+    {
+      "label": "Periodic (C=200)",
+      "checkpoint_interval": 200,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 3.032481792,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 541.5146057142857,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 544.9179157012486
+    },
+    {
+      "label": "Periodic (C=500)",
+      "checkpoint_interval": 500,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 3.032481792,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 541.5146057142857,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 544.9179157012486
+    },
+    {
+      "label": "Periodic (C=800)",
+      "checkpoint_interval": 800,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 3.032481792,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 541.5146057142857,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 544.9179157012486
+    },
+    {
+      "label": "Periodic (C=1100)",
+      "checkpoint_interval": 1100,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 2.848980992,
+      "swa_recompute_tokens": 796,
+      "disk_load_ms": 508.74660571428564,
+      "swa_recompute_ms": 28.577221127293445,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 537.4061084305932
+    },
+    {
+      "label": "Periodic (C=1500)",
+      "checkpoint_interval": 1500,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 2.770337792,
+      "swa_recompute_tokens": 1096,
+      "disk_load_ms": 494.70317714285704,
+      "swa_recompute_ms": 39.96144047772079,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 534.746899209592
+    },
+    {
+      "label": "Periodic (C=2000)",
+      "checkpoint_interval": 2000,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 3.032481792,
+      "swa_recompute_tokens": 96,
+      "disk_load_ms": 541.5146057142857,
+      "swa_recompute_ms": 3.321028397948718,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 544.9179157012486
+    },
+    {
+      "label": "Periodic (C=2700)",
+      "checkpoint_interval": 2700,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 2.691694592,
+      "swa_recompute_tokens": 1396,
+      "disk_load_ms": 480.6597485714285,
+      "swa_recompute_ms": 51.6817418794302,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 532.4237720398729
+    },
+    {
+      "label": "Periodic (C=3300)",
+      "checkpoint_interval": 3300,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 2.848980992,
+      "swa_recompute_tokens": 796,
+      "disk_load_ms": 508.74660571428564,
+      "swa_recompute_ms": 28.577221127293445,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 537.4061084305932
+    },
+    {
+      "label": "Periodic (C=3800)",
+      "checkpoint_interval": 3800,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 2.980052992,
+      "swa_recompute_tokens": 296,
+      "disk_load_ms": 532.1523199999999,
+      "swa_recompute_ms": 10.350371212763534,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 542.5849728017777
+    },
+    {
+      "label": "Periodic (C=4500)",
+      "checkpoint_interval": 4500,
+      "is_full": false,
+      "is_zero": false,
+      "disk_gb": 1.983905792,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 354.26889142857135,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 526.6393198200926
+    },
+    {
+      "label": "Zero SWA Caching",
+      "checkpoint_interval": null,
+      "is_full": false,
+      "is_zero": true,
+      "disk_gb": 1.983905792,
+      "swa_recompute_tokens": 4096,
+      "disk_load_ms": 354.26889142857135,
+      "swa_recompute_ms": 172.28814680250713,
+      "first_decode_read_ms": 0.08228158901422265,
+      "total_latency_ms": 526.6393198200926
+    }
+  ]
+}
