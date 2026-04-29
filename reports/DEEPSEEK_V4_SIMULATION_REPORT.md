@@ -208,7 +208,81 @@ The `SparseProfiledExecutionTimePredictor` will automatically load `attention.cs
 
 ---
 
-## 6. Summary
+## 6. SWA KV Cache: Storage and Latency Analysis
+
+V4-Pro's inference engine manages **four heterogeneous KV entry types** in a single request:
+
+| Entry type | Where stored | Size per token | Notes |
+|---|---|---|---|
+| **CSA compressed** | On-disk + HBM | `KV_FULL / csa_chunk` = 512 B/tok | 1 summary KV per 64 tokens |
+| **HCA compressed** | On-disk + HBM | `KV_FULL / hca_chunk` = 32 B/tok | 1 summary KV per 1024 tokens |
+| **SWA window** | On-disk (strategy) + HBM | 32 768 B/tok × min(S, 4096) tokens | Full resolution, bounded window |
+| **Uncompressed tail** | HBM only (state cache) | 32 768 B/tok × (S mod chunk) | CSA tail ≤ 63 tok, HCA tail ≤ 1023 tok |
+
+`KV_FULL = 2 × 16 heads × 512 head_dim × 2 bytes = 32 768 bytes/token` (V4's large head_dim makes each uncompressed entry expensive).
+
+Layer split assumed: **8 SWA**, **28 CSA**, **25 HCA** out of 61 total (estimated; exact breakdown not published).
+
+### 6.1 On-Disk Storage Breakdown
+
+![V4-Pro KV cache storage breakdown](plots/10_kv_breakdown.png)
+
+*Left: on-disk storage stacked by component (CSA compressed / HCA compressed / SWA disk) vs V3 MLA and Llama-3-70B totals.  Right: HBM state-cache = uncompressed tails + active SWA window.*
+
+| Context | V4 Full SWA | V4 Zero SWA | V3 MLA | Llama-3-70B |
+|---|---|---|---|---|
+| 4K | 1.136 GB | 0.062 GB | 0.283 GB | 1.342 GB |
+| 16K | 1.322 GB | 0.248 GB | 1.132 GB | 5.369 GB |
+| 65K | 2.066 GB | 0.992 GB | 4.530 GB | 21.475 GB |
+| 131K | 3.058 GB | 1.984 GB | 9.060 GB | 42.950 GB |
+| 1M | 16.209 GB | 15.136 GB | 69.120 GB | 327.680 GB |
+
+At long context the **SWA disk footprint is constant** (1.074 GB — the saturated 4096-token window), so the Full vs Zero difference is always exactly 1.074 GB regardless of context length.
+
+![On-disk KV storage vs context](plots/11_kv_disk_storage.png)
+
+V4 Full SWA stays **3–21× smaller** than V3 MLA across the full context range, and **19–270× smaller** than Llama-3-70B MHA.
+
+### 6.2 Three SWA Caching Strategies
+
+On a **shared-prefix cache hit**, the system loads compressed CSA/HCA KV from disk and handles the SWA window one of three ways:
+
+| Strategy | SWA on disk | Recompute on hit | Disk load | Recompute | Best for |
+|---|---|---|---|---|---|
+| **Full SWA Caching** | Full window (4096 tok) | None | Highest | 0 ms | Latency-critical, repeated prompts |
+| **Periodic Checkpointing** | Every C tokens | ≤ C tokens | Medium | ~1 ms (C=2048) | Balanced |
+| **Zero SWA Caching** | Nothing | Full window | Lowest | ~3 ms | Storage-constrained |
+
+### 6.3 Cache-Hit Latency
+
+![Cache-hit latency breakdown](plots/12_cache_hit_latency.png)
+
+*Stacked bars: disk load (blue) + SWA recomputation (orange) + first decode read (green). Values in ms.*
+
+At **131K tokens**:
+
+| Strategy | Disk load | SWA recompute | First decode | **Total** |
+|---|---|---|---|---|
+| Full SWA Caching | 546.0 ms | 0.0 ms | 15.0 ms | **561.0 ms** |
+| Periodic (C=2048) | 546.0 ms | 1.2 ms | 15.0 ms | **562.2 ms** |
+| Periodic (C=512) | 546.0 ms | 0.2 ms | 15.0 ms | **561.2 ms** |
+| Zero SWA Caching | 354.3 ms | 3.4 ms | 15.0 ms | **372.7 ms** |
+
+**Key finding:** disk load dominates at long context (>95% of latency). The SWA recomputation cost is small (~1–3 ms) because it only covers ≤ window_size = 4096 tokens through 8 SWA layers. **Zero SWA Caching is actually fastest** — it saves ~190 ms of SWA disk I/O in exchange for only 3 ms of recomputation. The recompute cost never exceeds ~3.4 ms regardless of context length (bounded by the window).
+
+This reversal (Zero faster than Full at long context) occurs because the SWA window stays fixed at 4096 tokens while the total disk load grows. The SWA fraction of total disk shrinks from ~95% at 1K tokens to ~7% at 131K — so the I/O saving from not caching SWA becomes relatively small, but zero SWA avoids loading that fixed 1.074 GB chunk, which at 7 GB/s NVMe takes 190 ms.
+
+### 6.4 Storage–Latency Pareto
+
+![SWA strategy Pareto](plots/13_swa_pareto.png)
+
+*Left: all strategies across all contexts. Right: checkpoint interval sweep at 131K tokens — the Pareto frontier shows Periodic C=512 is near-optimal (nearly zero recompute, 1.074 GB less disk than Full).*
+
+**Recommendation**: at long context (>16K tokens), **Periodic Checkpointing with C=512** offers the best trade-off — it uses 1.074 GB less on-disk space than Full SWA Caching with only 0.2 ms recomputation penalty. Zero SWA Caching saves the same storage with a ~3 ms penalty, which is still negligible compared to the ~550 ms disk load.
+
+---
+
+## 7. Summary
 
 | | Analytical (1M ctx) | Analytical (65K ctx) | InferLens Event-Sim (512 ctx) |
 |---|---|---|---|
