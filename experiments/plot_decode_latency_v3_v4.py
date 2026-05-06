@@ -42,26 +42,26 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ── Latency models ───────────────────────────────────────────────────────────
 
+KV_ENTRY_BYTES  = (_V4.kv_entry_dim + _V4.indexer_dim) * 2   # 1280 bytes per compressed entry
+SWA_ENTRY_BYTES = _V4.kv_entry_dim * 2                        # 1024 bytes per SWA token
+N_ALL_LAYERS    = _V4.n_csa_layers + _V4.n_hca_layers         # 61
+
+
 def v3_kv_bytes(seq_len: int) -> int:
-    kv_per_tok_per_layer = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2  # 1152
+    # MLA (1152 B) + DSA indexer (256 B) = 1408 B/tok/layer
+    kv_per_tok_per_layer = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 + 256  # 1408
     return kv_per_tok_per_layer * seq_len * _V3.num_layers
 
 
 def v4_kv_bytes(seq_len: int) -> int:
-    kv_full   = 2 * _V4.num_kv_heads * _V4.head_dim * 2  # 32768
+    # c4a layers (stride-4): S//4 compressed entries + 128-tok SWA window
+    c4a_comp  = (seq_len // _V4.csa_chunk_size)  * KV_ENTRY_BYTES * _V4.n_csa_layers
+    # c128a layers (stride-128): S//128 compressed entries + 128-tok SWA window
+    c128a_comp = (seq_len // _V4.hca_chunk_size) * KV_ENTRY_BYTES * _V4.n_hca_layers
+    # 128-token SWA window embedded in every layer
+    swa = min(seq_len, _V4.swa_window_size) * SWA_ENTRY_BYTES * N_ALL_LAYERS
 
-    csa_chunk = _V4.csa_chunk_size   # 64
-    hca_chunk = _V4.hca_chunk_size   # 1024
-    swa_win   = _V4.swa_window_size  # 4096
-    n_csa     = _V4.n_csa_layers     # 28
-    n_hca     = _V4.n_hca_layers     # 25
-    n_swa     = _V4.n_swa_layers     # 8
-
-    csa = (seq_len // csa_chunk + seq_len % csa_chunk) * kv_full * n_csa
-    hca = (seq_len // hca_chunk + seq_len % hca_chunk) * kv_full * n_hca
-    swa = min(seq_len, swa_win) * kv_full * n_swa
-
-    return csa + hca + swa
+    return c4a_comp + c128a_comp + swa
 
 
 def decode_ms(kv_bytes: int) -> float:

@@ -92,32 +92,32 @@ HBM_AVAIL_FOR_KV = {
 }
 
 
-# ── Core KV geometry ─────────────────────────────────────────────────────────
-
-KV_FULL = 2 * _V4.num_kv_heads * _V4.head_dim * 2   # 32 768 bytes/token (FP16)
+# ── Core KV geometry (corrected from vLLM DeepSeek-V4 blog post) ─────────────
+# Each compressed entry = 512-dim shared KV latent + 128-dim DSA indexer, bf16
+# SWA tokens keep only the shared KV latent (no indexer)
+KV_ENTRY_BYTES  = (_V4.kv_entry_dim + _V4.indexer_dim) * 2   # 1280 bytes
+SWA_ENTRY_BYTES = _V4.kv_entry_dim * 2                        # 1024 bytes
+N_ALL_LAYERS    = _V4.n_csa_layers + _V4.n_hca_layers         # 61 (30 c4a + 31 c128a)
 
 
 def v4_kv_breakdown(seq_len: int) -> dict:
     """Per-request KV breakdown for V4 at seq_len tokens."""
-    csa_chunk = _V4.csa_chunk_size   # 64
-    hca_chunk = _V4.hca_chunk_size   # 1024
-    swa_win   = _V4.swa_window_size  # 4096
-    n_csa, n_hca, n_swa = _V4.n_csa_layers, _V4.n_hca_layers, _V4.n_swa_layers
+    n_c4a  = _V4.n_csa_layers   # 30 c4a layers (stride-4)
+    n_c128a = _V4.n_hca_layers  # 31 c128a layers (stride-128)
 
-    csa_comp = (seq_len // csa_chunk) * KV_FULL * n_csa
-    csa_tail = (seq_len %  csa_chunk) * KV_FULL * n_csa
-    hca_comp = (seq_len // hca_chunk) * KV_FULL * n_hca
-    hca_tail = (seq_len %  hca_chunk) * KV_FULL * n_hca
-    swa_state = min(seq_len, swa_win)  * KV_FULL * n_swa
+    c4a_comp   = (seq_len // _V4.csa_chunk_size)  * KV_ENTRY_BYTES * n_c4a
+    c128a_comp = (seq_len // _V4.hca_chunk_size) * KV_ENTRY_BYTES * n_c128a
+    # 128-token SWA window embedded in every layer (c4a and c128a)
+    swa_state  = min(seq_len, _V4.swa_window_size) * SWA_ENTRY_BYTES * N_ALL_LAYERS
 
-    state_cache = csa_tail + hca_tail + swa_state
-    compressed  = csa_comp + hca_comp           # goes to disk
+    compressed  = c4a_comp + c128a_comp   # grows linearly → disk candidate
+    state_cache = swa_state               # HBM-resident, bounded at 128 tok × 61 layers
 
     return {
-        "csa_compressed": csa_comp,
-        "hca_compressed": hca_comp,
-        "csa_tail":       csa_tail,
-        "hca_tail":       hca_tail,
+        "csa_compressed": c4a_comp,
+        "hca_compressed": c128a_comp,
+        "csa_tail":       0,
+        "hca_tail":       0,
         "swa_state":      swa_state,
         "state_cache":    state_cache,   # HBM-resident, bounded
         "compressed":     compressed,    # grows linearly with S → disk candidate
@@ -126,7 +126,8 @@ def v4_kv_breakdown(seq_len: int) -> dict:
 
 
 def v3_kv_bytes(seq_len: int) -> int:
-    kv_per = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2   # 1152 B/tok/layer
+    # MLA (1152 B) + DSA indexer (256 B) = 1408 B/tok/layer
+    kv_per = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 + 256  # 1408 B/tok/layer
     return kv_per * seq_len * _V3.num_layers
 
 
@@ -135,11 +136,10 @@ def l3_kv_bytes(seq_len: int) -> int:
     return kv_per * seq_len * _L3.num_layers
 
 
-# ── State cache maximum (saturation at large S) ───────────────────────────────
-MAX_CSA_TAIL  = (_V4.csa_chunk_size  - 1) * KV_FULL * _V4.n_csa_layers   # 63 tok × 28 layers
-MAX_HCA_TAIL  = (_V4.hca_chunk_size  - 1) * KV_FULL * _V4.n_hca_layers   # 1023 tok × 25 layers
-MAX_SWA_STATE = _V4.swa_window_size       * KV_FULL * _V4.n_swa_layers    # 4096 tok × 8 layers
-MAX_STATE_CACHE = MAX_CSA_TAIL + MAX_HCA_TAIL + MAX_SWA_STATE
+# ── State cache maximum (saturates at S ≥ 128 tokens) ────────────────────────
+# SWA window is 128 tokens per layer across all 61 layers; no uncompressed tails
+MAX_SWA_STATE   = _V4.swa_window_size * SWA_ENTRY_BYTES * N_ALL_LAYERS  # 128 × 1024 × 61 ≈ 7.9 MB
+MAX_STATE_CACHE = MAX_SWA_STATE
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -209,56 +209,54 @@ def compute_capacity(gpu_counts: List[int], contexts: List[int]) -> List[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Analysis C — Head-dim amplification
+# Analysis C — KV latent dimension sensitivity
 # ═══════════════════════════════════════════════════════════════════════════════
+# V4 stores a 512-dim shared KV latent per compressed entry and per SWA token.
+# This analysis shows how the state-cache and compressed history scale with
+# the latent dimension (hypothetical vs actual 512).
 
-HEAD_DIMS = [64, 128, 256, 512]   # hypothetical vs actual
+KV_LATENT_DIMS = [64, 128, 256, 512]   # hypothetical vs actual (512)
 
 
-def state_cache_at_saturation(head_dim: int) -> dict:
-    """Saturated state cache bytes if V4 had a different head_dim."""
-    kv_full_hd = 2 * _V4.num_kv_heads * head_dim * 2
-    csa_tail   = (_V4.csa_chunk_size - 1)  * kv_full_hd * _V4.n_csa_layers
-    hca_tail   = (_V4.hca_chunk_size - 1)  * kv_full_hd * _V4.n_hca_layers
-    swa_state  = _V4.swa_window_size        * kv_full_hd * _V4.n_swa_layers
+def state_cache_at_saturation(kv_latent_dim: int) -> dict:
+    """Saturated state cache bytes if V4 had a different KV latent dimension."""
+    swa_bytes_per_tok = kv_latent_dim * 2   # K+V, no indexer in SWA
+    swa_state = _V4.swa_window_size * swa_bytes_per_tok * N_ALL_LAYERS
     return {
-        "head_dim":        head_dim,
-        "kv_full_bytes":   kv_full_hd,
-        "csa_tail_mb":     csa_tail   / 1e6,
-        "hca_tail_mb":     hca_tail   / 1e6,
-        "swa_state_mb":    swa_state  / 1e6,
-        "total_state_mb":  (csa_tail + hca_tail + swa_state) / 1e6,
+        "kv_latent_dim":   kv_latent_dim,
+        "swa_bytes_per_tok": swa_bytes_per_tok,
+        "swa_state_mb":    swa_state / 1e6,
+        "total_state_mb":  swa_state / 1e6,
     }
 
 
-def compressed_per_token_per_layer_avg(head_dim: int) -> float:
-    """Average compressed KV bytes/token/layer for CSA+HCA with given head_dim."""
-    kv_full_hd = 2 * _V4.num_kv_heads * head_dim * 2
+def compressed_per_token_per_layer_avg(kv_latent_dim: int) -> float:
+    """Average compressed KV bytes/context-token/layer for c4a+c128a layers."""
+    entry_bytes = (kv_latent_dim + _V4.indexer_dim) * 2   # with DSA indexer
     n_csa, n_hca = _V4.n_csa_layers, _V4.n_hca_layers
-    csa_bpt = kv_full_hd / _V4.csa_chunk_size   # bytes/token/layer for CSA
-    hca_bpt = kv_full_hd / _V4.hca_chunk_size   # bytes/token/layer for HCA
-    return (csa_bpt * n_csa + hca_bpt * n_hca) / (n_csa + n_hca)
+    c4a_bpt  = entry_bytes / _V4.csa_chunk_size    # bytes/token/layer for c4a
+    c128a_bpt = entry_bytes / _V4.hca_chunk_size   # bytes/token/layer for c128a
+    return (c4a_bpt * n_csa + c128a_bpt * n_hca) / (n_csa + n_hca)
 
 
-def compute_head_dim_analysis(head_dims: List[int]) -> List[dict]:
+def compute_head_dim_analysis(kv_latent_dims: List[int]) -> List[dict]:
     rows = []
-    for hd in head_dims:
-        sat = state_cache_at_saturation(hd)
-        avg_comp = compressed_per_token_per_layer_avg(hd)
-        # compressed KV at 1M context
-        kv_full_hd = 2 * _V4.num_kv_heads * hd * 2
+    for kld in kv_latent_dims:
+        sat = state_cache_at_saturation(kld)
+        avg_comp = compressed_per_token_per_layer_avg(kld)
+        entry_bytes = (kld + _V4.indexer_dim) * 2
         comp_1m = (
-            (1_000_000 // _V4.csa_chunk_size) * kv_full_hd * _V4.n_csa_layers
-            + (1_000_000 // _V4.hca_chunk_size) * kv_full_hd * _V4.n_hca_layers
+            (1_000_000 // _V4.csa_chunk_size)  * entry_bytes * _V4.n_csa_layers
+            + (1_000_000 // _V4.hca_chunk_size) * entry_bytes * _V4.n_hca_layers
         )
         rows.append({
-            "head_dim":              hd,
-            "kv_full_bytes":         sat["kv_full_bytes"],
+            "kv_latent_dim":         kld,
+            "swa_bytes_per_tok":     sat["swa_bytes_per_tok"],
+            "state_cache_sat_mb":    sat["total_state_mb"],
             "state_cache_sat_gb":    sat["total_state_mb"] / 1e3,
-            "swa_only_gb":           sat["swa_state_mb"]   / 1e3,
             "avg_comp_bytes_tok_lyr": avg_comp,
             "compressed_1m_gb":      comp_1m / 1e9,
-            "is_actual":             hd == _V4.head_dim,
+            "is_actual":             kld == _V4.kv_entry_dim,
         })
     return rows
 
@@ -340,17 +338,17 @@ def print_tables(results: dict) -> None:
                       f"{r['per_replica_cap']:>13,}")
 
     print()
-    print("  C — Head-Dim Amplification (state cache at saturation, ≥4096-token session)")
-    print(f"  {'head_dim':>9}  {'kv_full B/tok':>14}  {'CSA+HCA avg B/tok/lyr':>22}  "
-          f"{'SWA window GB':>14}  {'Total state GB':>15}")
-    print("  " + "-" * 82)
+    print("  C — KV Latent Dim Sensitivity (state cache at saturation, ≥128-token session)")
+    print(f"  {'kv_latent_dim':>14}  {'SWA B/tok':>10}  {'avg comp B/tok/lyr':>20}  "
+          f"{'State cache MB':>15}  {'Compressed@1M GB':>17}")
+    print("  " + "-" * 84)
     for r in results["head_dim_analysis"]:
         marker = " ← actual V4" if r["is_actual"] else ""
-        print(f"  {r['head_dim']:>9}  "
-              f"{r['kv_full_bytes']:>14,}  "
-              f"{r['avg_comp_bytes_tok_lyr']:>22.1f}  "
-              f"{r['swa_only_gb']:>14.3f}  "
-              f"{r['state_cache_sat_gb']:>14.3f}{marker}")
+        print(f"  {r['kv_latent_dim']:>14}  "
+              f"{r['swa_bytes_per_tok']:>10,}  "
+              f"{r['avg_comp_bytes_tok_lyr']:>20.1f}  "
+              f"{r['state_cache_sat_mb']:>15.2f}  "
+              f"{r['compressed_1m_gb']:>16.3f}{marker}")
 
     print()
     print("  D — Multi-Turn Session (2048 tokens/turn)")
@@ -412,8 +410,8 @@ def plot_a_separation(results: dict) -> None:
     ax.set_xlabel("Context Length")
     ax.set_ylabel("KV Cache (GB, log scale)")
     ax.set_title(
-        "A — V4 State Cache (HBM, bounded) vs Compressed History (must go somewhere)\n"
-        "State cache saturates at ~2 GB; compressed history grows to 15 GB at 1M tokens",
+        "A — V4 State Cache (HBM, bounded) vs Compressed History (disk candidate)\n"
+        f"State cache saturates at {MAX_STATE_CACHE/1e6:.1f} MB; compressed history grows to ~9.6 GB at 1M tokens",
         fontsize=11,
     )
     ax.legend(fontsize=9)
@@ -489,59 +487,59 @@ def plot_b_capacity(results: dict) -> None:
 
 def plot_c_head_dim(results: dict) -> None:
     rows = results["head_dim_analysis"]
-    hds  = [r["head_dim"]           for r in rows]
-    swa  = [r["swa_only_gb"]        for r in rows]
-    sc   = [r["state_cache_sat_gb"] for r in rows]
-    comp = [r["compressed_1m_gb"]   for r in rows]
+    klds = [r["kv_latent_dim"]       for r in rows]
+    sc   = [r["state_cache_sat_gb"]  for r in rows]
+    sc_mb= [r["state_cache_sat_mb"]  for r in rows]
+    comp = [r["compressed_1m_gb"]    for r in rows]
     avg  = [r["avg_comp_bytes_tok_lyr"] for r in rows]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Left: state cache and compressed KV at 1M
+    # Left: state cache (MB) and compressed KV at 1M (GB) — different axes
     ax = axes[0]
-    x  = np.arange(len(hds))
+    ax2r = ax.twinx()
+    x  = np.arange(len(klds))
     w  = 0.3
-    ax.bar(x - w/2, sc,   w, color="#1abc9c", label="State cache (saturated)")
-    ax.bar(x + w/2, comp, w, color="#e74c3c", label="Compressed history @ 1M ctx")
+    b1 = ax.bar(x - w/2, sc_mb, w, color="#1abc9c", label="State cache MB (left)", zorder=3)
+    b2 = ax2r.bar(x + w/2, comp, w, color="#e74c3c", label="Compressed @ 1M ctx GB (right)", zorder=3)
 
     # Highlight actual V4
     actual_idx = next(i for i, r in enumerate(rows) if r["is_actual"])
-    for bar_set in [ax.containers[0], ax.containers[1]]:
-        bar_set[actual_idx].set_edgecolor("black")
-        bar_set[actual_idx].set_linewidth(2)
+    b1[actual_idx].set_edgecolor("black"); b1[actual_idx].set_linewidth(2)
+    b2[actual_idx].set_edgecolor("black"); b2[actual_idx].set_linewidth(2)
 
     ax.set_xticks(x)
-    ax.set_xticklabels([f"head_dim={h}" for h in hds], rotation=15, ha="right", fontsize=9)
-    ax.set_ylabel("KV Cache (GB)")
+    ax.set_xticklabels([f"kv_latent={k}" for k in klds], rotation=15, ha="right", fontsize=9)
+    ax.set_ylabel("State cache (MB, saturated)")
+    ax2r.set_ylabel("Compressed history @ 1M ctx (GB)")
     ax.set_title(
-        "C-left — KV cost vs hypothetical head_dim\n(V4 geometry, FP16; actual V4 = head_dim=512)",
+        "C-left — KV cost vs hypothetical KV latent dim\n(actual V4 = 512; boxed = actual)",
         fontsize=10,
     )
-    ax.legend(fontsize=9)
+    lines = [b1, b2]
+    labels = ["State cache (MB)", "Compressed@1M (GB)"]
+    ax.legend(lines, labels, fontsize=9)
     ax.grid(axis="y", alpha=0.3)
-    for i, (s, c2) in enumerate(zip(sc, comp)):
-        ax.text(i - w/2, s + 0.1,  f"{s:.2f}", ha="center", fontsize=8)
-        ax.text(i + w/2, c2 + 0.1, f"{c2:.1f}", ha="center", fontsize=8)
 
     # Right: compressed bytes/tok/layer
-    ax2 = axes[1]
-    colors = ["#e74c3c" if h == _V4.head_dim else "#95a5a6" for h in hds]
-    ax2.bar(range(len(hds)), avg, color=colors, zorder=3)
-    ax2.set_xticks(range(len(hds)))
-    ax2.set_xticklabels([f"head_dim={h}" for h in hds], rotation=15, ha="right", fontsize=9)
-    ax2.set_ylabel("Avg compressed B/token/layer (CSA+HCA)")
-    ax2.set_title(
+    ax3 = axes[1]
+    colors = ["#e74c3c" if k == _V4.kv_entry_dim else "#95a5a6" for k in klds]
+    ax3.bar(range(len(klds)), avg, color=colors, zorder=3)
+    ax3.set_xticks(range(len(klds)))
+    ax3.set_xticklabels([f"kv_latent={k}" for k in klds], rotation=15, ha="right", fontsize=9)
+    ax3.set_ylabel("Avg compressed B/token/layer (c4a+c128a)")
+    ax3.set_title(
         "C-right — Compressed KV bytes per token per layer\n(lower = better compression)",
         fontsize=10,
     )
-    ax2.grid(axis="y", alpha=0.3)
+    ax3.grid(axis="y", alpha=0.3)
     for i, a in enumerate(avg):
-        ax2.text(i, a + 0.5, f"{a:.0f}", ha="center", fontsize=9)
+        ax3.text(i, a + 0.2, f"{a:.1f}", ha="center", fontsize=9)
 
-    # Reference: V3 MLA
-    v3_bpt = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2
-    ax2.axhline(v3_bpt, color="#3498db", ls="--", lw=1.5, label=f"V3 MLA: {v3_bpt} B/tok/layer")
-    ax2.legend(fontsize=9)
+    # Reference: V3 MLA+indexer
+    v3_bpt = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 + 256  # 1408
+    ax3.axhline(v3_bpt, color="#3498db", ls="--", lw=1.5, label=f"V3 MLA+idx: {v3_bpt} B/tok/layer")
+    ax3.legend(fontsize=9)
     plt.tight_layout()
     _save(fig, "plot_c_head_dim_amplification.png")
 
@@ -598,28 +596,29 @@ def main() -> None:
     print("Running DeepSeek-V4-Pro Disk Necessity Analysis …")
     print(f"  V4 model weights/GPU: {V4_WEIGHTS_PER_GPU_GB:.2f} GB  |  "
           f"HBM available for KV: {HBM_AVAIL_FOR_KV['V4']:.1f} GB")
-    print(f"  Max state cache (saturated): {MAX_STATE_CACHE / 1e9:.3f} GB  |  "
-          f"kv_full: {KV_FULL:,} bytes/token")
+    print(f"  Max state cache (saturated): {MAX_STATE_CACHE / 1e6:.1f} MB  |  "
+          f"KV_ENTRY_BYTES: {KV_ENTRY_BYTES} B/entry  SWA_ENTRY_BYTES: {SWA_ENTRY_BYTES} B/tok")
 
     results = {
         "config": {
-            "model":            _V4.get_name(),
-            "device":           "A100",
-            "hbm_gb":           HBM_GB_PER_GPU,
-            "tp":               TP,
-            "v4_weights_gb":    V4_WEIGHTS_PER_GPU_GB,
-            "hbm_avail_for_kv": HBM_AVAIL_FOR_KV["V4"],
-            "max_state_cache_gb": MAX_STATE_CACHE / 1e9,
-            "kv_full_bytes":    KV_FULL,
-            "n_swa_layers":     _V4.n_swa_layers,
-            "n_csa_layers":     _V4.n_csa_layers,
-            "n_hca_layers":     _V4.n_hca_layers,
-            "tokens_per_turn":  TOKENS_PER_TURN,
+            "model":              _V4.get_name(),
+            "device":             "A100",
+            "hbm_gb":             HBM_GB_PER_GPU,
+            "tp":                 TP,
+            "v4_weights_gb":      V4_WEIGHTS_PER_GPU_GB,
+            "hbm_avail_for_kv":   HBM_AVAIL_FOR_KV["V4"],
+            "max_state_cache_mb": MAX_STATE_CACHE / 1e6,
+            "kv_entry_bytes":     KV_ENTRY_BYTES,
+            "swa_entry_bytes":    SWA_ENTRY_BYTES,
+            "n_csa_layers":       _V4.n_csa_layers,
+            "n_hca_layers":       _V4.n_hca_layers,
+            "swa_window_size":    _V4.swa_window_size,
+            "tokens_per_turn":    TOKENS_PER_TURN,
         },
-        "separation":       compute_separation(CONTEXTS),
-        "capacity":         compute_capacity(GPU_COUNTS, CTX_FOR_CAPACITY),
-        "head_dim_analysis": compute_head_dim_analysis(HEAD_DIMS),
-        "multiturn":        compute_multiturn(TOKENS_PER_TURN, MAX_TURNS),
+        "separation":        compute_separation(CONTEXTS),
+        "capacity":          compute_capacity(GPU_COUNTS, CTX_FOR_CAPACITY),
+        "head_dim_analysis": compute_head_dim_analysis(KV_LATENT_DIMS),
+        "multiturn":         compute_multiturn(TOKENS_PER_TURN, MAX_TURNS),
     }
 
     json_path = os.path.join(RESULTS_DIR, "deepseek_v4_disk_necessity.json")

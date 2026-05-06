@@ -12,8 +12,8 @@ Models the heterogeneous KV cache described in the DeepSeek V4 inference framewo
    (Full SWA Caching, Periodic Checkpointing, Zero SWA Caching) offer
    different trade-offs between storage and computation."
 
-V4-Pro layer split (estimated; exact breakdown not published):
-  61 total = 8 SWA (sliding-window local) + 28 CSA (moderate global) + 25 HCA (heavy global)
+V4-Pro layer split (from vLLM DeepSeek-V4 blog post):
+  61 total = 30 c4a (stride-4, compressed + 128-tok SWA) + 31 c128a (stride-128 + 128-tok SWA)
 
 All timing is purely analytical — no GPU profiling data used.
 Uses InferLens model configs and device SKU configs for all parameters.
@@ -70,6 +70,12 @@ TP              = 8
 DISK_EFF_BPS = NVME_DISK_BW_GBS * BW_EFFICIENCY * 1e9
 HBM_EFF_BPS  = HBM_BW_GBS       * BW_EFFICIENCY * 1e9
 
+# ── Corrected V4 KV entry sizes (from vLLM DeepSeek-V4 blog post) ────────────
+# Each compressed entry = 512-dim shared KV latent + 128-dim DSA indexer, bf16
+# SWA tokens keep only the shared KV latent (no indexer)
+KV_ENTRY_BYTES  = (_V4.kv_entry_dim + _V4.indexer_dim) * 2   # 1280 bytes
+SWA_ENTRY_BYTES = _V4.kv_entry_dim * 2                        # 1024 bytes
+
 # ── Sweep configuration ──────────────────────────────────────────────────────
 CONTEXT_LENGTHS = [4_096, 8_192, 16_384, 32_768, 65_536,
                    131_072, 262_144, 524_288, 1_000_000]
@@ -117,12 +123,13 @@ class SwaStrategy:
 @dataclass
 class V4LayerKv:
     """KV storage for a single V4 layer at a given sequence length."""
-    layer_type: str          # "CSA", "HCA", or "SWA"
+    layer_type: str          # "c4a" or "c128a"
     seq_len: int
-    n_compressed: int        # floor(S / chunk) compressed entries
-    n_tail: int              # S % chunk — full-resolution tail in state cache
-    n_state: int             # tokens held in HBM state cache
-    kv_full_bytes: int       # bytes per uncompressed token (32 768 for V4)
+    n_compressed: int        # floor(S / stride) compressed entries at KV_ENTRY_BYTES each
+    n_tail: int              # 0 (no uncompressed tail in corrected model)
+    n_state: int             # SWA window tokens (max 128) at SWA_ENTRY_BYTES each
+    kv_full_bytes: int       # bytes per compressed entry (1280 for V4)
+    kv_swa_bytes: int = 1024 # bytes per SWA token (1024 for V4)
 
     @property
     def compressed_bytes(self) -> int:
@@ -134,14 +141,14 @@ class V4LayerKv:
 
     @property
     def state_bytes(self) -> int:
-        return self.n_state * self.kv_full_bytes
+        return self.n_state * self.kv_swa_bytes  # SWA uses latent-only entry size
 
 
 @dataclass
 class V4KvLayout:
     """Complete KV cache layout for a V4-Pro request at one context length."""
     seq_len: int
-    kv_full_bytes: int           # 32 768 — bytes per uncompressed token
+    kv_full_bytes: int           # 1280 — bytes per compressed entry
 
     # Per-layer lists
     csa_layers: List[V4LayerKv]
@@ -205,66 +212,50 @@ class BaselineResult:
 # Analytical core — KV layout
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _kv_full_bytes() -> int:
-    """Full-resolution KV bytes per token: 2 * num_kv_heads * head_dim * 2 (FP16)."""
-    return 2 * _V4.num_kv_heads * _V4.head_dim * 2  # = 32 768
+def _build_layer(layer_type: str, seq_len: int) -> V4LayerKv:
+    """Build per-layer KV layout for a c4a or c128a layer."""
+    swa_win = _V4.swa_window_size  # 128 tokens
 
-
-def _build_layer(layer_type: str, seq_len: int, kv_full: int) -> V4LayerKv:
-    csa_chunk = _V4.csa_chunk_size  # 64
-    hca_chunk = _V4.hca_chunk_size  # 1024
-    swa_win   = _V4.swa_window_size  # 4096
-
-    if layer_type == "CSA":
-        n_comp = seq_len // csa_chunk
-        n_tail = seq_len %  csa_chunk
-        n_state = n_tail
-    elif layer_type == "HCA":
-        n_comp = seq_len // hca_chunk
-        n_tail = seq_len %  hca_chunk
-        n_state = n_tail
-    else:  # SWA
-        n_comp  = 0
-        n_tail  = 0
-        n_state = min(seq_len, swa_win)
+    if layer_type == "c4a":
+        n_comp = seq_len // _V4.csa_chunk_size   # S // 4
+    else:  # c128a
+        n_comp = seq_len // _V4.hca_chunk_size   # S // 128
 
     return V4LayerKv(
         layer_type=layer_type,
         seq_len=seq_len,
         n_compressed=n_comp,
-        n_tail=n_tail,
-        n_state=n_state,
-        kv_full_bytes=kv_full,
+        n_tail=0,
+        n_state=min(seq_len, swa_win),
+        kv_full_bytes=KV_ENTRY_BYTES,
+        kv_swa_bytes=SWA_ENTRY_BYTES,
     )
 
 
 def compute_v4_kv_layout(seq_len: int) -> V4KvLayout:
     """Build the full heterogeneous KV layout for V4-Pro at the given context length."""
-    kv_full   = _kv_full_bytes()
-    n_csa     = _V4.n_csa_layers   # 28
-    n_hca     = _V4.n_hca_layers   # 25
-    n_swa     = _V4.n_swa_layers   # 8
+    n_csa = _V4.n_csa_layers   # 30 c4a layers
+    n_hca = _V4.n_hca_layers   # 31 c128a layers
 
-    csa_layers = [_build_layer("CSA", seq_len, kv_full) for _ in range(n_csa)]
-    hca_layers = [_build_layer("HCA", seq_len, kv_full) for _ in range(n_hca)]
-    swa_layers = [_build_layer("SWA", seq_len, kv_full) for _ in range(n_swa)]
+    csa_layers = [_build_layer("c4a",  seq_len) for _ in range(n_csa)]
+    hca_layers = [_build_layer("c128a", seq_len) for _ in range(n_hca)]
+    swa_layers = []   # no dedicated SWA layers; SWA window embedded in every layer
 
     csa_comp  = sum(l.compressed_bytes for l in csa_layers)
-    csa_tail  = sum(l.tail_bytes       for l in csa_layers)
     hca_comp  = sum(l.compressed_bytes for l in hca_layers)
-    hca_tail  = sum(l.tail_bytes       for l in hca_layers)
-    swa_state = sum(l.state_bytes      for l in swa_layers)
+    # SWA window (128 tokens) is present in every c4a and c128a layer
+    swa_state = sum(l.state_bytes for l in csa_layers + hca_layers)
 
     return V4KvLayout(
         seq_len=seq_len,
-        kv_full_bytes=kv_full,
+        kv_full_bytes=KV_ENTRY_BYTES,
         csa_layers=csa_layers,
         hca_layers=hca_layers,
         swa_layers=swa_layers,
         csa_compressed_bytes=csa_comp,
-        csa_tail_bytes=csa_tail,
+        csa_tail_bytes=0,
         hca_compressed_bytes=hca_comp,
-        hca_tail_bytes=hca_tail,
+        hca_tail_bytes=0,
         swa_state_bytes=swa_state,
     )
 
@@ -276,38 +267,36 @@ def compute_v4_kv_layout(seq_len: int) -> V4KvLayout:
 def _strategy_swa_disk_tokens(strategy: SwaStrategy, layout: V4KvLayout) -> Tuple[int, int]:
     """Return (swa_disk_tokens_per_layer, swa_recompute_tokens).
 
-    swa_disk_tokens_per_layer: how many SWA tokens are persisted per SWA layer.
-    swa_recompute_tokens: tokens that must be recomputed on a cache hit.
+    The 128-token SWA window is embedded in every layer.  Strategies govern
+    whether this window is persisted to disk or recomputed on a cache hit.
     """
-    swa_win = _V4.swa_window_size
-    actual_win = min(layout.seq_len, swa_win)
+    actual_win = min(layout.seq_len, _V4.swa_window_size)  # max 128
 
     if strategy.is_full:
         return actual_win, 0
     if strategy.is_zero:
         return 0, actual_win
-    # Periodic(C)
+    # Periodic(C) — checkpoint every C tokens within the window
     c = strategy.checkpoint_interval
-    n_ckpts  = actual_win // c
-    disk_tok = n_ckpts * c
+    disk_tok = (actual_win // c) * c
     recomp   = actual_win - disk_tok
     return disk_tok, recomp
 
 
 def _swa_recompute_ms(n_recompute: int) -> float:
-    """Analytical prefill time (ms) to recompute n_recompute tokens through SWA layers.
+    """Analytical prefill time (ms) to recompute n_recompute SWA tokens across all layers.
 
-    FLOPs = (attention + MoE MLP) × n_swa_layers
-    Attention: 4 × n² × head_dim × num_q_heads  (QK + SV, causal window ≈ n)
+    FLOPs = (attention + MoE MLP) × all_layers
+    Attention: 4 × n² × kv_entry_dim (causal window ≈ n)
     MoE MLP:   num_experts_per_tok × 3 × expert_dim × embedding_dim × n × 2
     """
     if n_recompute == 0:
         return 0.0
-    n   = n_recompute
-    n_s = _V4.n_swa_layers
-    attn_flops = 4 * n * n * _V4.head_dim * _V4.num_q_heads * n_s
+    n       = n_recompute
+    n_layers = _V4.n_csa_layers + _V4.n_hca_layers   # all 61 layers
+    attn_flops = 4 * n * n * _V4.kv_entry_dim * n_layers
     mlp_flops  = (_V4.num_experts_per_tok * 3 * _V4.moe_intermediate_size
-                  * _V4.embedding_dim * n * 2 * n_s)
+                  * _V4.embedding_dim * n * 2 * n_layers)
     total_flops = attn_flops + mlp_flops
     return total_flops / (FP16_TFLOPS * PREFILL_MFU * 1e12) * 1e3
 
@@ -316,17 +305,16 @@ def compute_strategy_result(
     strategy: SwaStrategy, layout: V4KvLayout
 ) -> StrategyResult:
     """Compute on-disk bytes and cache-hit latency for one strategy."""
-    kv_full  = layout.kv_full_bytes
-    n_swa    = _V4.n_swa_layers
+    n_all = _V4.n_csa_layers + _V4.n_hca_layers  # 61: every layer has a SWA window
 
     swa_disk_tok, swa_recomp_tok = _strategy_swa_disk_tokens(strategy, layout)
 
     disk_bytes = (layout.csa_compressed_bytes
                   + layout.hca_compressed_bytes
-                  + swa_disk_tok * kv_full * n_swa)
+                  + swa_disk_tok * SWA_ENTRY_BYTES * n_all)
 
-    disk_load_ms        = disk_bytes / DISK_EFF_BPS * 1e3
-    swa_recompute_ms    = _swa_recompute_ms(swa_recomp_tok)
+    disk_load_ms         = disk_bytes / DISK_EFF_BPS * 1e3
+    swa_recompute_ms     = _swa_recompute_ms(swa_recomp_tok)
     first_decode_read_ms = layout.state_cache_bytes / HBM_EFF_BPS / TP * 1e3
 
     return StrategyResult(
@@ -346,7 +334,8 @@ def compute_strategy_result(
 
 def compute_baseline(model_name: str, seq_len: int) -> BaselineResult:
     if model_name == "V3":
-        kv = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2  # 1152
+        # MLA (1152 B) + DSA indexer (256 B) = 1408 B/tok/layer
+        kv = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 + 256  # 1408
         n  = _V3.num_layers
     else:  # Llama
         kv = 2 * _L3.num_kv_heads * (_L3.embedding_dim // _L3.num_q_heads) * 2  # 4096
@@ -442,7 +431,8 @@ def compute_results() -> dict:
             "csa_chunk_size":  _V4.csa_chunk_size,
             "hca_chunk_size":  _V4.hca_chunk_size,
             "swa_window_size": _V4.swa_window_size,
-            "kv_full_bytes":   _kv_full_bytes(),
+            "kv_entry_bytes":  KV_ENTRY_BYTES,
+            "swa_entry_bytes": SWA_ENTRY_BYTES,
             "hbm_bw_gbs":      HBM_BW_GBS,
             "disk_bw_gbs":     NVME_DISK_BW_GBS,
             "bw_efficiency":   BW_EFFICIENCY,
@@ -475,11 +465,10 @@ def print_tables(results: dict) -> None:
           f"HBM {cfg['hbm_bw_gbs']} GB/s  |  "
           f"NVMe {cfg['disk_bw_gbs']} GB/s  |  "
           f"TP={cfg['tp']}  |  MFU={cfg['prefill_mfu']}")
-    print(f"  Layer split: {cfg['n_swa_layers']} SWA + "
-          f"{cfg['n_csa_layers']} CSA (chunk={cfg['csa_chunk_size']}) + "
-          f"{cfg['n_hca_layers']} HCA (chunk={cfg['hca_chunk_size']})  |  "
-          f"SWA window={cfg['swa_window_size']} tokens  |  "
-          f"kv_full={cfg['kv_full_bytes']} B/tok")
+    print(f"  Layer split: {cfg['n_csa_layers']} c4a (stride={cfg['csa_chunk_size']}) + "
+          f"{cfg['n_hca_layers']} c128a (stride={cfg['hca_chunk_size']})  |  "
+          f"SWA window={cfg['swa_window_size']} tok/layer  |  "
+          f"KV_ENTRY={cfg['kv_entry_bytes']} B  SWA_ENTRY={cfg['swa_entry_bytes']} B")
     print("=" * 90)
 
     # Table 1: KV layout breakdown

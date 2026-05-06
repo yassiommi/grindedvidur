@@ -45,16 +45,22 @@ class BaseModelConfig(BaseFixedConfig):
     v_head_dim: Optional[int] = None
 
     # CSA/HCA Hybrid Attention fields (DeepSeek-V4)
-    csa_chunk_size: Optional[int] = None   # CSA compression chunk size
-    csa_top_k: Optional[int] = None        # CSA sparse selector k
-    hca_chunk_size: Optional[int] = None   # HCA heavy compression chunk size
+    # c4a: stride-4 compression; c128a: stride-128 compression (vLLM naming)
+    csa_chunk_size: Optional[int] = None   # c4a stride (4 tokens per compressed entry)
+    csa_top_k: Optional[int] = None        # sparse-attention top-k selector
+    hca_chunk_size: Optional[int] = None   # c128a stride (128 tokens per entry)
     n_hc: int = 1                          # mHC stream width (1 = standard residual)
 
-    # SWA (Sliding Window Attention) fields (DeepSeek-V4)
-    n_swa_layers: int = 0                  # number of SWA layers (0 = none)
-    n_csa_layers: Optional[int] = None     # explicit CSA layer count (None = (n_layers - n_swa) // 2)
-    n_hca_layers: Optional[int] = None     # explicit HCA layer count (None = n_layers - n_swa - n_csa)
-    swa_window_size: Optional[int] = None  # SWA window in tokens
+    # KV entry dimensions for MLA-style latent KV (DeepSeek-V4)
+    # Each compressed entry stores a shared KV latent (kv_entry_dim) + indexer (indexer_dim)
+    kv_entry_dim: Optional[int] = None     # shared KV latent dimension (512 for V4)
+    indexer_dim: Optional[int] = None      # DSA indexer dimension (128 for V4)
+
+    # SWA embedded in every c4a/c128a layer (not separate SWA layers)
+    n_swa_layers: int = 0                  # number of pure-SWA layers (0 for V4; SWA embedded per layer)
+    n_csa_layers: Optional[int] = None     # c4a layer count
+    n_hca_layers: Optional[int] = None     # c128a layer count
+    swa_window_size: Optional[int] = None  # SWA tokens carried in each layer (128 for V4)
 
     @property
     def expert_intermediate_size(self) -> int:
@@ -329,23 +335,23 @@ class DeepSeekV3ModelConfig(BaseModelConfig):
 
 @dataclass
 class DeepSeekV4ProModelConfig(BaseModelConfig):
-    """DeepSeek-V4-Pro: 1.6T/49B MoE with Hybrid CSA+HCA attention and mHC residuals.
+    """DeepSeek-V4-Pro: 1.6T/49B MoE with c4a+c128a hybrid attention and mHC residuals.
 
-    Key innovations vs V3:
-    - Hybrid attention (CSA + HCA interleaved) replaces MLA → 10% KV cache at 1M ctx
-    - 384 routed experts, 6/token (vs 256, 8/token in V3)
-    - mHC hyper-connections (n_hc=4) replace standard residuals
-    - 1M token native context (vs 128K in V3)
+    Architecture (source: vLLM blog 2026-04-24):
+    - 30 c4a layers (stride-4 compressed attention, SWA window=128)
+    - 31 c128a layers (stride-128 compressed attention, SWA window=128)
+    - Every layer carries a 128-token local SWA window + compressed global history
+    - Each compressed entry: 512-dim shared KV latent (1024 B) + 128-dim indexer (256 B) = 1280 B
+    - Total KV at 1M context: ~9.62 GiB (8.7× smaller than V3 including indexer)
 
-    NOTE: num_layers, embedding_dim, num_q_heads are estimated from public info.
-    Verify against the hyperparameter table in the DeepSeek V4 technical report PDF.
-    Head dim=512 is confirmed; 16 heads × 512 = 8192 embedding_dim (estimate).
+    NOTE: embedding_dim, num_q_heads are estimated. kv_entry_dim/indexer_dim are confirmed
+    from vLLM blog implementation details.
     """
-    num_layers: int = 61              # estimate; verify from PDF
-    num_q_heads: int = 16             # head_dim=512 → 16×512=8192; verify from PDF
+    num_layers: int = 61
+    num_q_heads: int = 16
     num_kv_heads: int = 16
-    embedding_dim: int = 8192         # estimate; verify from PDF
-    mlp_hidden_dim: int = 18432       # dense layers; estimate from V3 scale
+    embedding_dim: int = 8192
+    mlp_hidden_dim: int = 18432
     max_position_embeddings: int = 1_000_000
     use_gated_mlp: bool = True
     use_bias: bool = False
@@ -361,19 +367,21 @@ class DeepSeekV4ProModelConfig(BaseModelConfig):
     num_routed_experts: int = 384
     num_experts_per_tok: int = 6
     num_shared_experts: int = 1
-    moe_intermediate_size: int = 2048  # estimate; verify from PDF
+    moe_intermediate_size: int = 2048
 
-    # Hybrid CSA+HCA+SWA attention (replaces MLA)
+    # Hybrid c4a+c128a attention — every layer has both compressed history + SWA window
     attention_type: str = "HYBRID_CSA_HCA"
-    csa_chunk_size: int = 64
-    csa_top_k: int = 16
-    hca_chunk_size: int = 1024
+    csa_chunk_size: int = 4        # c4a stride: 1 compressed entry per 4 tokens (was 64)
+    csa_top_k: int = 512           # default sparse-attention k for c4a
+    hca_chunk_size: int = 128      # c128a stride: 1 entry per 128 tokens (was 1024)
+    swa_window_size: int = 128     # SWA local window embedded in every layer (was 4096)
+    n_csa_layers: int = 30         # c4a layer count (was 28)
+    n_hca_layers: int = 31         # c128a layer count (was 25)
+    n_swa_layers: int = 0          # no pure-SWA layers; SWA embedded in c4a/c128a
 
-    # SWA: 8 layers use sliding-window attention (local context)
-    n_swa_layers: int = 8
-    n_csa_layers: int = 28   # of the remaining 53 non-SWA layers
-    n_hca_layers: int = 25   # remaining layers
-    swa_window_size: int = 4096
+    # KV latent dimensions (MLA-style shared KV representation)
+    kv_entry_dim: int = 512        # shared KV latent per compressed entry (1024 bytes bf16)
+    indexer_dim: int = 128         # DSA indexer per compressed entry (256 bytes bf16)
 
     # mHC hyper-connections
     n_hc: int = 4
@@ -727,6 +735,8 @@ class GenericModelConfig(BaseModelConfig):
             csa_top_k=data.get("csa_top_k"),
             hca_chunk_size=data.get("hca_chunk_size"),
             n_hc=data.get("n_hc", 1),
+            kv_entry_dim=data.get("kv_entry_dim"),
+            indexer_dim=data.get("indexer_dim"),
             n_swa_layers=data.get("n_swa_layers", 0),
             n_csa_layers=data.get("n_csa_layers"),
             n_hca_layers=data.get("n_hca_layers"),

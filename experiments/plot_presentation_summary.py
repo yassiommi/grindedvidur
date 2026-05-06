@@ -79,30 +79,32 @@ TP      = 8
 HBM_EFF = _A100.memory_bandwidth_gb_per_s * BW_EFF * 1e9   # bytes/s
 COMPUTE_MS = 0.007
 
-KV_FULL = 2 * _V4.num_kv_heads * _V4.head_dim * 2   # 32 768
+KV_ENTRY_BYTES  = (_V4.kv_entry_dim + _V4.indexer_dim) * 2   # 1280 bytes per compressed entry
+SWA_ENTRY_BYTES = _V4.kv_entry_dim * 2                        # 1024 bytes per SWA token
+N_ALL_LAYERS    = _V4.n_csa_layers + _V4.n_hca_layers         # 61
 
 def v3_decode_ms(s):
-    kv = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 * s * _V3.num_layers
+    # MLA (1152 B) + DSA indexer (256 B) = 1408 B/tok/layer
+    kv = ((_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 + 256) * s * _V3.num_layers
     return kv / (HBM_EFF * TP) * 1e3
 
 def v4_decode_ms(s):
-    csa = (s // _V4.csa_chunk_size + s % _V4.csa_chunk_size) * KV_FULL * _V4.n_csa_layers
-    hca = (s // _V4.hca_chunk_size + s % _V4.hca_chunk_size) * KV_FULL * _V4.n_hca_layers
-    swa = min(s, _V4.swa_window_size) * KV_FULL * _V4.n_swa_layers
-    return (csa + hca + swa) / (HBM_EFF * TP) * 1e3 + COMPUTE_MS
+    c4a   = (s // _V4.csa_chunk_size)  * KV_ENTRY_BYTES * _V4.n_csa_layers
+    c128a = (s // _V4.hca_chunk_size) * KV_ENTRY_BYTES * _V4.n_hca_layers
+    swa   = min(s, _V4.swa_window_size) * SWA_ENTRY_BYTES * N_ALL_LAYERS
+    return (c4a + c128a + swa) / (HBM_EFF * TP) * 1e3 + COMPUTE_MS
 
 def v4_attn_flops(s):
-    # Attention FLOPs: Q×K and A×V per head, per layer
-    # CSA/HCA: computed over compressed entries, not full seq_len
-    n_csa_entries = s // _V4.csa_chunk_size
-    n_hca_entries = s // _V4.hca_chunk_size
-    csa_flops = 4 * n_csa_entries * _V4.head_dim * _V4.num_q_heads * _V4.n_csa_layers
-    hca_flops = 4 * n_hca_entries * _V4.head_dim * _V4.num_q_heads * _V4.n_hca_layers
-    swa_flops = 4 * min(s, _V4.swa_window_size) * _V4.head_dim * _V4.num_q_heads * _V4.n_swa_layers
-    return (csa_flops + hca_flops + swa_flops) / 1e9   # GFLOPs
+    # Attention FLOPs per decode step: Q×K and A×V over compressed entries
+    n_c4a   = s // _V4.csa_chunk_size
+    n_c128a = s // _V4.hca_chunk_size
+    c4a_flops   = 4 * n_c4a   * _V4.kv_entry_dim * _V4.num_q_heads * _V4.n_csa_layers
+    c128a_flops = 4 * n_c128a * _V4.kv_entry_dim * _V4.num_q_heads * _V4.n_hca_layers
+    swa_flops   = 4 * min(s, _V4.swa_window_size) * _V4.kv_entry_dim * _V4.num_q_heads * N_ALL_LAYERS
+    return (c4a_flops + c128a_flops + swa_flops) / 1e9   # GFLOPs
 
 def v3_attn_flops(s):
-    # V3 MLA: full seq_len attention (absorbed, so effective heads = num_q_heads)
+    # V3 MLA: full seq_len attention (absorbed, effective heads = num_q_heads)
     return 4 * s * _V3.qk_nope_head_dim * _V3.num_q_heads * _V3.num_layers / 1e9
 
 def llama_attn_flops(s):
@@ -148,9 +150,9 @@ ax2.set_ylabel("V3 / V4 speedup ratio", fontsize=9)
 ax2.set_ylim(0, max(ratio) * 1.3)
 ax2.tick_params(axis="y", labelsize=8)
 
-# Crossover shading
-ax_lat.axvspan(1.5, 2.5, alpha=0.09, color="#e74c3c", zorder=0)
-ax_lat.text(2.0, 0.0025, "crossover\n~16K–32K", ha="center", va="bottom",
+# Crossover shading (V4 faster than V3 starting at ~1K-2K tokens = index 0-1 range)
+ax_lat.axvspan(-0.5, 0.5, alpha=0.09, color="#e74c3c", zorder=0)
+ax_lat.text(0.0, min(v4_ms) * 1.3, "crossover\n~1K–2K", ha="center", va="bottom",
             fontsize=8, color="#c0392b", style="italic")
 
 # Speedup labels on bars
@@ -160,9 +162,10 @@ for i, (r, v4) in enumerate(zip(ratio, v4_ms)):
                     ha="center", va="bottom", fontsize=8.5,
                     fontweight="bold", color="#27ae60")
 
-# Callout at 1M
+# Callout at 1M — compute from actual values
+speedup_1m = ratio[-1]
 ax_lat.annotate(
-    "4.2× faster at 1M ctx\n786 vs 186 tok/s",
+    f"{speedup_1m:.1f}× faster at 1M ctx",
     xy=(len(CONTEXTS) - 1 + w/2, v4_ms[-1]),
     xytext=(-55, 18), textcoords="offset points",
     fontsize=8.5, color=C_V4, fontweight="bold",
@@ -175,7 +178,7 @@ ax_lat.set_xticks(x)
 ax_lat.set_xticklabels(labels)
 ax_lat.set_xlabel("Context Length")
 ax_lat.set_ylabel("Decode latency per step (ms, log)")
-ax_lat.set_title("Latency Crossover: V4 slower at short ctx, 4.2× faster at long ctx")
+ax_lat.set_title(f"Latency Crossover: V4 slower at short ctx, {speedup_1m:.1f}× faster at 1M ctx")
 ax_lat.grid(axis="y", alpha=0.25)
 
 h1, l1 = ax_lat.get_legend_handles_labels()
@@ -226,28 +229,41 @@ fig2.suptitle("DeepSeek V4-Pro: KV Cache Storage  ·  A100 · TP=8",
 
 # ── Panel 1: Compression ratio ────────────────────────────────────────────────
 ax1 = axes[0]
-models_c  = ["Llama-3-70B\n(MHA)", "DeepSeek-V3\n(MLA)", "DeepSeek-V4-Pro\n(CSA+HCA avg)"]
-kv_bpt    = [4096, 1152, 272]
-colors_c  = [C_LLAMA, C_V3, C_V4]
+
+# Compute V4 avg bytes/tok/layer at large context (compressed entries dominate)
+_S1M = 1_000_000
+_v4_comp_at_1m = ((_S1M // _V4.csa_chunk_size) * KV_ENTRY_BYTES * _V4.n_csa_layers
+                   + (_S1M // _V4.hca_chunk_size) * KV_ENTRY_BYTES * _V4.n_hca_layers)
+v4_bpt = round(_v4_comp_at_1m / (_S1M * (_V4.n_csa_layers + _V4.n_hca_layers)))
+
+l3_bpt = 2 * _L3.num_kv_heads * (_L3.embedding_dim // _L3.num_q_heads) * 2  # 4096
+v3_bpt = (_V3.kv_lora_rank + _V3.qk_rope_head_dim) * 2 + 256                # 1408
+
+models_c = ["Llama-3-70B\n(MHA)", "DeepSeek-V3\n(MLA+idx)", "DeepSeek-V4-Pro\n(c4a+c128a avg)"]
+kv_bpt   = [l3_bpt, v3_bpt, v4_bpt]
+colors_c = [C_LLAMA, C_V3, C_V4]
 
 bars1 = ax1.bar(range(3), kv_bpt, color=colors_c, width=0.5, zorder=3)
 for i, (v, b) in enumerate(zip(kv_bpt, bars1)):
     ax1.text(i, v + 60, f"{v:,} B", ha="center", va="bottom", fontsize=9, fontweight="bold")
 
-# Brackets
-for i, (label, yref) in enumerate([("15× vs V4", 4096), ("4.2× vs V4", 1152)]):
+# Brackets — compute ratios dynamically
+ratio_l3 = round(l3_bpt / v4_bpt, 1)
+ratio_v3 = round(v3_bpt / v4_bpt, 1)
+for i, (label, yref) in enumerate([(f"{ratio_l3:.0f}× vs V4", l3_bpt),
+                                    (f"{ratio_v3:.0f}× vs V4", v3_bpt)]):
     xi, xv4 = i, 2
-    ymax = yref + 300
+    ymax = yref + 200
     ax1.annotate("", xy=(xv4, ymax), xytext=(xi, ymax),
                  arrowprops=dict(arrowstyle="<->", color="#555", lw=1.3))
-    ax1.text((xi + xv4) / 2, ymax + 80, label,
+    ax1.text((xi + xv4) / 2, ymax + 60, label,
              ha="center", va="bottom", fontsize=8.5, color="#333")
 
 ax1.set_xticks(range(3))
 ax1.set_xticklabels(models_c, fontsize=9)
 ax1.set_ylabel("Bytes / token / layer (FP16)")
 ax1.set_title("KV Compression\nper Token per Layer")
-ax1.set_ylim(0, 5200)
+ax1.set_ylim(0, max(kv_bpt) * 1.35)
 ax1.grid(axis="y", alpha=0.25)
 
 # ── Panel 2: Two-region scaling ───────────────────────────────────────────────
@@ -266,17 +282,18 @@ ax2.fill_between(xi, 0,       state_g, color=C_STATE, alpha=0.5, label="State ca
 ax2.fill_between(xi, state_g, total_g, color=C_HIST,  alpha=0.5, label="Compressed history (→ disk)")
 ax2.plot(xi, v3_g, color=C_V3, lw=2, ls="--", label="V3 MLA total")
 
-# Saturation line
+# Saturation line (state cache saturates at 128-tok SWA window × 61 layers ≈ 7.9 MB)
 sat = max(state_g)
 ax2.axhline(sat, color=C_STATE, lw=1.2, ls=":", alpha=0.8)
-ax2.text(len(seqs) - 1, sat + 0.3, f"State cache cap\n≈ {sat:.1f} GB", ha="right",
+sat_mb = sat * 1e3
+ax2.text(len(seqs) - 1, sat * 3, f"State cache cap\n≈ {sat_mb:.0f} MB", ha="right",
          fontsize=8, color="#16a085")
 
-# Annotation for V3 vs V4 at 1M
-ax2.annotate("V3: 70 GB", xy=(len(seqs) - 1, v3_g[-1]),
+# Annotation for V3 vs V4 at 1M — pulled from JSON data
+ax2.annotate(f"V3: {v3_g[-1]:.0f} GB", xy=(len(seqs) - 1, v3_g[-1]),
              xytext=(-2, 6), textcoords="offset points",
              fontsize=8, color=C_V3, fontweight="bold")
-ax2.annotate("V4: 16 GB", xy=(len(seqs) - 1, total_g[-1]),
+ax2.annotate(f"V4: {total_g[-1]:.1f} GB", xy=(len(seqs) - 1, total_g[-1]),
              xytext=(-2, 6), textcoords="offset points",
              fontsize=8, color=C_HIST, fontweight="bold")
 
@@ -314,10 +331,11 @@ for i, (v4, v3, l3) in enumerate(zip(cap_v4, cap_v3, cap_l3)):
     ax3.text(i,      v3 + 1.5, str(v3),  ha="center", fontsize=8,   color=C_V3)
     ax3.text(i - wc, l3 + 1.5, str(l3),  ha="center", fontsize=8,   color=C_LLAMA)
 
-# "5× better" at 1M
+# Capacity ratio at 1M — computed from data
+cap_ratio_1m = cap_v4[-1] / max(cap_v3[-1], 1)
 ax3.annotate("", xy=(3 + wc, cap_v4[-1] + 4), xytext=(3, cap_v3[-1] + 4),
              arrowprops=dict(arrowstyle="<->", color="#555", lw=1.3))
-ax3.text(3 + wc/2, cap_v4[-1] + 9, "5× better\nvs V3",
+ax3.text(3 + wc/2, cap_v4[-1] + 9, f"{cap_ratio_1m:.0f}× better\nvs V3",
          ha="center", fontsize=8.5, fontweight="bold", color="#333")
 
 ax3.set_xticks(xc)
