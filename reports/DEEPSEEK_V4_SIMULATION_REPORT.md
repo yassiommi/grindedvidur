@@ -376,6 +376,117 @@ recompute budget makes the 172 ms recompute cost unacceptable.
 
 ---
 
+## 6.5 Why V4 Still Needs On-Disk KV Despite Its Aggressive Compression
+
+*Experiment: `experiments/run_deepseek_v4_disk_necessity.py`*
+
+**The intuition:** V4's KV per token is 15× smaller than Llama and 4.2× smaller than V3 —
+so why offload to disk at all?
+
+The answer lies in separating what is actually "small" from what is not, and understanding
+the difference between single-session capacity and production-scale serving.
+
+### 6.5.1 The Two-Region KV Structure
+
+V4's KV cache has two fundamentally different regions with opposite scaling behaviour:
+
+| Region | Contents | Scales with context? | Max size (per request) |
+|---|---|---|---|
+| **State cache** (HBM-resident) | CSA tails + HCA tails + SWA window | **No — bounded** | ~1.97 GB |
+| **Compressed history** (→ disk) | CSA + HCA summary entries | **Yes — linear** | 15.1 GB @ 1M ctx |
+
+![State cache vs compressed history](../example_outputs/experiments/deepseek_v4_disk_necessity/plot_a_state_vs_history.png)
+
+The state cache saturates at **~1.97 GB** once the SWA window fills (≥ 4096 tokens). Every
+additional token past that point only adds to the compressed history. This is why V4 looks
+so efficient at long context — but the compressed history still grows without bound.
+
+At 1M context the compressed history reaches **15.1 GB per request**, which is much smaller
+than V3's 70 GB — but still too large to keep many sessions alive simultaneously in HBM.
+
+### 6.5.2 Why the State Cache Isn't as Small as You'd Expect
+
+The SWA window alone is **1.074 GB per request** (all 8 SWA layers × 4096 tokens × 32 768 bytes/token).
+The 32 768 bytes/token figure is large because `head_dim = 512` — 8× larger than V3's effective
+attention head dimension. With `head_dim = 64` (typical), the same 4096-token window would cost
+only 134 MB.
+
+![Head-dim amplification](../example_outputs/experiments/deepseek_v4_disk_necessity/plot_c_head_dim_amplification.png)
+
+| head_dim | kv_full (B/tok) | SWA window | State cache (saturated) |
+|---|---|---|---|
+| 64  | 4 096 | 0.13 GB | 0.25 GB |
+| 128 | 8 192 | 0.27 GB | 0.49 GB |
+| 256 | 16 384 | 0.54 GB | 0.98 GB |
+| **512 (actual V4)** | **32 768** | **1.07 GB** | **1.97 GB** |
+
+V4's large `head_dim=512` provides richer per-token attention representations (a deliberate
+quality trade-off) but makes each *uncompressed* token 8× more expensive than if V4 had been
+designed with narrower heads.
+
+### 6.5.3 HBM Capacity at Production Scale
+
+A single TP=8 A100 replica has ~64.8 GB free for KV after loading V4's weights (~12.2 GB/GPU)
+and framework overhead (~3 GB/GPU). The compressed history is sharded across TP=8 GPUs, giving
+each GPU a 1/8 slice.
+
+![Concurrent request capacity](../example_outputs/experiments/deepseek_v4_disk_necessity/plot_b_hbm_capacity.png)
+
+| Context | V4 compressed KV / GPU | Max concurrent (V4) | Max concurrent (V3) |
+|---|---|---|---|
+| 128K | 0.25 GB | 261 | 29 |
+| 256K | 0.50 GB | 130 | 14 |
+| 512K | 0.99 GB | 65 | 7 |
+| **1M** | **1.89 GB** | **34** | **7** |
+
+V4's compression provides **5× better concurrency than V3** at 1M context. But a production
+inference cluster typically serves **thousands of concurrent long-context sessions**. At 34
+simultaneous 1M-context sessions per replica, serving 1 000 concurrent users would require
+~30 TP=8 A100 replicas — and would still leave all session KVs in HBM with no room for spill.
+
+The core problem: **production serving is asynchronous**. When a user submits a request, the
+GPU may be mid-flight with other requests. Their 1–15 GB compressed KV cannot stay resident
+in HBM indefinitely between turns. Disk provides the idle storage pool that enables
+over-subscribing the GPU across thousands of sessions.
+
+### 6.5.4 Multi-Turn Accumulation
+
+In a long conversation (2 048 tokens/turn), the compressed history grows with every turn:
+
+![Multi-turn KV accumulation](../example_outputs/experiments/deepseek_v4_disk_necessity/plot_d_multiturn.png)
+
+| Turn | Context | State cache (HBM) | Compressed (→ disk) | V3 total |
+|---|---|---|---|---|
+| 1   | 2K   | 0.54 GB | 0.03 GB | 0.14 GB |
+| 10  | 20K  | 1.07 GB | 0.31 GB | 1.44 GB |
+| 50  | 100K | 1.07 GB | 1.55 GB | 7.20 GB |
+| 100 | 200K | 1.07 GB | 3.10 GB | 14.39 GB |
+| 200 | 400K | 1.07 GB | 6.20 GB | 28.78 GB |
+
+For a single isolated user the state cache stays bounded at ~1.07 GB while compressed history
+grows linearly. If the GPU were dedicated to one user this would be fine — but in reality
+the same GPU alternates between thousands of sessions, evicting and reloading KV on every
+request switch. **Disk is the eviction target**, not emergency overflow.
+
+### 6.5.5 Summary: Three Reasons V4 Needs Disk Despite Small KV
+
+1. **Concurrent session over-subscription.** Even at 34 concurrent 1M-context sessions per
+   TP=8 replica, production requires far more. Disk absorbs the idle session KV between turns.
+
+2. **head_dim=512 amplification.** V4's large heads make each uncompressed token 8× more
+   expensive than typical. The SWA window is 1.07 GB, not the ~130 MB you'd expect from a
+   model with standard head dimensions.
+
+3. **Compressed history is linear, not bounded.** The "small KV" story only holds for the
+   *state cache* (bounded at ~2 GB). The *compressed history* grows to 15 GB at 1M context
+   and must be persisted somewhere between turns.
+
+The disk offloading in V4 is therefore best understood as **idle-session KV storage** — not
+emergency overflow — enabled by the fact that even at 15 GB per 1M-context session, NVMe
+load latency (< 3 seconds at 7 GB/s) is acceptable for session restore.
+
+---
+
 ## 7. Summary
 
 | | Analytical (1M ctx) | Analytical (64K ctx) | InferLens Event-Sim (512 ctx) |
