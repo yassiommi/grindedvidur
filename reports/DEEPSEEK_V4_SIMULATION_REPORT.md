@@ -2,7 +2,6 @@
 
 **Date:** 2026-04-28  
 **Framework:** InferLens — discrete-event LLM inference simulator  
-**Branch:** `claude/deepseek-v4-integration-2O1Or`
 
 ---
 
@@ -16,8 +15,8 @@ V4 replaces V3's Multi-head Latent Attention (MLA) with a **two-type hybrid syst
 
 | Type | Mechanism | KV cache / layer | Per entry |
 |---|---|---|---|
-| **c4a** (stride-4 compressed) | Every 4 tokens → 1 compressed entry; + 128-token SWA window | seq_len/4 entries + 128 SWA | 1280 bytes (512-dim latent + 128-dim DSA indexer, bf16) |
-| **c128a** (stride-128 compressed) | Every 128 tokens → 1 compressed entry; + 128-token SWA window | seq_len/128 entries + 128 SWA | 1280 bytes per compressed entry; 1024 bytes per SWA token |
+| **c4a (CSA)** (stride-4 compressed) | Every 4 tokens → 1 compressed entry; + 128-token SWA window | seq_len/4 entries + 128 SWA | 1280 bytes (512-dim latent + 128-dim DSA indexer, bf16) |
+| **c128a (HCA)** (stride-128 compressed) | Every 128 tokens → 1 compressed entry; + 128-token SWA window | seq_len/128 entries + 128 SWA | 1280 bytes per compressed entry; 1024 bytes per SWA token |
 
 Layer split: **30 c4a + 31 c128a = 61 total** (no dedicated SWA layers — the 128-token window is embedded in every layer). The combined effect at 1M context: **~8.7× less KV cache than V3**.
 
@@ -171,11 +170,13 @@ The speedup grows with context (3.9× at 8K → 8.6× at 1M) because at short co
 
 ## 5. Using GPU Profiling Data
 
+Can we use real offline profiling data for more accurate simulation?
+
 **Yes — that is exactly what the `sparse_profiled` predictor is designed for.**
 
 ### Current mode
 
-The simulation runs in **analytical fallback mode**: execution time is estimated from FLOPs formulas scaled against Llama-3-70B profiling CSVs. The CSA/HCA attention timing uses the same MLA projection structure from those CSVs.
+The simulation runs in **analytical fallback mode**: execution time is estimated from FLOPs formulas. The CSA/HCA attention timing uses the same MLA projection structure from those CSVs.
 
 ### When you have a GPU
 
@@ -202,13 +203,6 @@ python -m vidur.main \
 ```
 
 The `SparseProfiledExecutionTimePredictor` will automatically load `attention.csv` (CSA/HCA timings via `_load_hybrid_attention()`), `mlp.csv` (MoE timings), and `io.csv` (bandwidth), falling back to analytical estimates for any missing file.
-
-### Accuracy improvement
-
-| Predictor | Timing accuracy | Notes |
-|---|---|---|
-| `linear_regression` (current) | ~5–10% MAPE for dense ops; MoE analytical | Uses Llama-3-70B profiling, scaled to V4 dimensions |
-| `sparse_profiled` (with GPU data) | ~2–5% MAPE | Real V4 CUDA timings for every attention and MoE operation |
 
 ---
 
