@@ -12,11 +12,11 @@ improves over the all-F DSA baseline by:
 
 | seq_len | BS  | mode    | DSA pipelined | IndexCache pipelined | speedup |
 |--------:|----:|---------|--------------:|---------------------:|--------:|
-| 32K     | 64  | offload | 1194 ms       | 757 ms               | **1.58×** |
-| 128K    | 16  | offload | 1188 ms       | 462 ms               | **2.57×** |
-| 256K    | 64  | offload | 9486 ms       | 2932 ms              | **3.24×** |
-| 1M      | 64  | offload | 37 913 ms     | 10 388 ms            | **3.65×** |
-| 1M      | 16  | hbm     | 356 ms        | 244 ms               | **1.46×** |
+| 32K     | 64  | offload | 1194 ms       |  812 ms              | **1.47×** |
+| 128K    | 16  | offload | 1240 ms       |  476 ms              | **2.61×** |
+| 256K    | 64  | offload | 9694 ms       | 2986 ms              | **3.25×** |
+| 1M      | 64  | offload | 38 121 ms     | 10 443 ms            | **3.65×** |
+| 1M      | 16  | hbm     | 358 ms        |  246 ms              | **1.45×** |
 | 4K      | any | offload | —             | —                    | ≈1.02× (compute-bound) |
 
 In short, IndexCache helps exactly where DSA hurts most: **long context,
@@ -50,15 +50,11 @@ For every transformer layer we partition work into three streams:
 | **KV**  | Gather of MLA KV for the 2560 attended tokens (top-k 2048 + sliding 512) | Every layer |
 | **COMP**| Pre-norm, q_down, q_up, RoPE, kv_up_proj, attn core, o_proj, residual, MoE block | Every layer |
 
-We model two IO-stream policies:
+IDX and KV share a single IO bus (one PCIe Gen4 x16 link in offload, the
+HBM bus in HBM mode), so they serialise on that channel. Per-layer IO
+= `idx_io + kv_io`.
 
-- **single**: IDX and KV transfers serialised over one PCIe (or HBM)
-  channel. Per-layer IO = `idx_io + kv_io`.
-- **dual**: IDX and KV use independent IO engines — analogous to GPU-
-  initiated remote loads on separate channels or two DMA engines. Per-
-  layer IO = `max(idx_io, kv_io)`.
-
-In offload mode, the dominant IO is the indexer K read; KV gather is
+In offload mode the dominant IO is the indexer K read; KV gather is
 ~3 MB (negligible at PCIe). In HBM mode all IO is HBM-bound and small
 versus per-layer compute.
 
@@ -69,13 +65,42 @@ computes, the IO needed by layer *i+1* (its indexer K and KV indices)
 is being fetched. Steady-state per-layer cost is
 
 ```
-pipeline_step = max(compute_i, io_next)
+pipeline_step = max(compute_i, io_{i+1})
 ```
 
 The first layer pays its full IO cold (no prior compute to hide
 behind), and the final layer pays no further IO. The simulator returns
 a tail-corrected total — we never silently amortise away the cold
 start.
+
+### How "exposed IO" is calculated
+
+`io_exposed_ms` is the IO that compute could **not** hide. The
+scheduler computes it directly:
+
+```python
+t = io_of(costs[0])                    # cold prefetch — fully exposed
+overlapped = 0
+for i in 0 .. N-1:
+    io_next = io_of(costs[i+1]) if i+1 < N else 0
+    t        += max(compute_i, io_next)
+    overlapped += min(compute_i, io_next)
+io_total   = sum_i io_of(costs[i])
+io_exposed = io_total - overlapped
+```
+
+Equivalently in closed form:
+
+```
+io_exposed = io_first  +  Σ_{i=0..N-1}  max(0, io_{i+1} − compute_i)
+```
+
+i.e. (1) the layer-0 cold prefetch (no preceding compute) plus (2) for
+each layer transition, the spillover where the next layer's IO is
+larger than the current layer's compute. The pipeline total then
+satisfies `pipeline_total = compute_total + io_exposed` (verified
+numerically). This is the value plotted as the red bars on
+`fig_overlap_offload_bs16.png` / `fig_overlap_hbm_bs16.png`.
 
 ### F/S patterns
 
@@ -115,7 +140,7 @@ compute** and is fully overlapped.
 
 ### How much IO can compute hide?
 
-![fig1](figures/indexcache/fig_io_exposed_dual.png) shows the **ms of
+![fig1](figures/indexcache/fig_io_exposed.png) shows the **ms of
 IO that compute could not hide**, as a heatmap of (seq_len × BS) for
 each F-period and each placement mode. Three regimes:
 
@@ -130,9 +155,9 @@ each F-period and each placement mode. Three regimes:
    the remaining indexer reads from F layers grow linearly with
    `seq_len * BS`, eventually overflowing compute again.
 
-### Speedup heatmap (fp=4, dual stream)
+### Speedup heatmap (fp=4, F:S:S:S)
 
-![fig2](figures/indexcache/fig_speedup_fp4_dual.png):
+![fig2](figures/indexcache/fig_speedup_fp4.png)
 
 - **HBM mode**: 1.00–1.74× over DSA. Speedup grows with seq_len because
   even on HBM, a 2 GB indexer read at 1M seq_len + BS=64 takes ~24 ms
@@ -145,7 +170,7 @@ each F-period and each placement mode. Three regimes:
 
 ### Per-step compute vs IO breakdown
 
-![fig3](figures/indexcache/fig_overlap_offload_bs16.png) (BS=16, offload, dual policy) shows that
+![fig3](figures/indexcache/fig_overlap_offload_bs16.png) (BS=16, offload, IDX+KV share IO bus) shows that
 at this batch size:
 
 - All-F DSA's IO cost crosses compute at **sl ≈ 32K** and grows linearly
@@ -160,8 +185,8 @@ at this batch size:
 
 ## When does IO fully hide in compute?
 
-In the dual-stream pipelined model, IO is fully hidden when, for every
-F layer, `compute_per_layer ≥ io_per_F_layer`. Equivalently:
+IO is fully hidden when, for every F layer, `compute_per_layer ≥
+(idx_io + kv_io)_F`. Equivalently:
 
 ```
 seq_len * BS  ≤  (compute_per_layer / INDEXER_K_BYTES_PER_TOKEN) * pcie_BW
@@ -202,19 +227,18 @@ This is why IndexCache wins even though it never touches the KV gather:
 removing 75% of indexer reads removes 75% of the bandwidth
 consumption, full stop.
 
-### 2. GPU-initiated DMA pays off most when issuance is data-dependent
+### 2. GPU-initiated DMA matters for latency, not for bandwidth
 
 The KV gather is data-dependent — the top-k chosen by the indexer
 determines which 2048 KV slots to fetch. With a CPU-orchestrated
 schedule the GPU has to round-trip top-k indices to host before the
-host can issue the gather; this serialises IDX→KV. With **GPU-initiated
-loads** (e.g. NVSHMEM-style or BAR1-mapped UVM with GPU-side fetch
-kernels), the GPU can issue the KV gather as soon as the top-k kernel
-completes, with no host stall. In our dual-stream policy this is the
-difference between `idx_io + kv_io` (single) and `max(idx_io, kv_io)`
-(dual): for the long-context offload regime we measure **5–10% step
-savings** from this alone (see `fig_io_exposed_single.png` vs
-`fig_io_exposed_dual.png`).
+host can issue the gather; this serialises IDX→KV with **a host
+round-trip in between**. With **GPU-initiated loads** (e.g. NVSHMEM-
+style or BAR1-mapped UVM with GPU-side fetch kernels), the GPU can
+issue the KV gather as soon as the top-k kernel completes — no host
+stall. The PCIe bandwidth itself is unchanged (one link, IDX and KV
+still serialise), so the savings are exactly the eliminated host
+synchronisation latency, not a parallelisation of IO.
 
 ### 3. The right metric for "should I prefetch?" is per-F-layer compute
 
@@ -251,16 +275,12 @@ Outputs raw sweep JSON (`experiments/indexcache_results.json`),
 summary table, and plots in `reports/figures/indexcache/`.
 
 The full sweep covers 8 seq_lens × 7 batch sizes × 2 modes × 4
-F-periods × 2 IO policies = **896 configurations** and runs in ~2
-seconds since it is fully analytical/profiled (no GPU required).
+F-periods = **448 configurations** and runs in ~1 second since it is
+fully analytical/profiled (no GPU required).
 
 ## Limitations
 
-1. The "dual" IO policy assumes truly independent paths for indexer K
-   and KV. On real H100 systems with one PCIe link this is an *upper
-   bound*, not an achievable schedule. The "single" policy is the
-   conservative default; truth lies between.
-2. We assume the F layer's compute itself can also overlap with its
+1. We assume the F layer's compute itself can also overlap with its
    own IDX prefetch from the previous compute slot. This is the
    standard double-buffered prefetch assumption and matches what
    modern NVIDIA stacks (CUDA streams, NCCL/NVSHMEM) deliver, but

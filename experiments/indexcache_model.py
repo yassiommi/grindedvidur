@@ -41,12 +41,8 @@ layer i is computing, the IO needed by layer i+1 (indexer-K and KV gather)
 is being read into HBM on a separate stream. Steady-state cost per layer
 becomes max(layer_compute, layer_io_next), modulo edge effects.
 
-Two prefetch policies are modelled:
-  - "single": stream IDX and KV are issued back-to-back on one IO engine.
-              Per-layer IO = idx_read + kv_read.
-  - "dual":   stream IDX runs on a *separate* IO path from stream KV
-              (e.g. dedicated DMA engines / GPU-initiated remote loads).
-              Per-layer IO = max(idx_read, kv_read).
+IDX and KV share one PCIe link in offload (and one HBM bus in HBM mode),
+so they serialise on the IO channel. Per-layer IO = idx_read + kv_read.
 
 We compare three modes:
   - "dsa"        : every layer is F. (Baseline.)
@@ -65,8 +61,8 @@ Care taken (lessons learned)
 3. For S layers, indexer_compute and topk are both zero — they're
    inherited. The KV gather still happens (the actual top-k tokens were
    chosen at the last F layer; this layer's KV is still loaded for them).
-4. F:S patterns interact with bandwidth contention. The "single" policy
-   is the conservative default; "dual" is an upper bound.
+4. IDX and KV share the PCIe link, so we sum their costs per layer
+   (no parallel IO engine).
 """
 
 from __future__ import annotations
@@ -99,14 +95,9 @@ class LayerCost:
     other_compute_ms: float  # block_a + block_c + moe + small bookkeeping
 
     @property
-    def total_io_single(self) -> float:
-        """Stream IDX and KV serialised on one PCIe/HBM channel."""
+    def total_io(self) -> float:
+        """IDX and KV share the IO channel: their costs sum."""
         return self.idx_io_ms + self.kv_io_ms
-
-    @property
-    def total_io_dual(self) -> float:
-        """Stream IDX and KV in parallel (separate IO engines)."""
-        return max(self.idx_io_ms, self.kv_io_ms)
 
     @property
     def total_compute(self) -> float:
@@ -205,40 +196,34 @@ def schedule_sequential(costs: List[LayerCost]) -> Dict[str, float]:
     return {"total_ms": total}
 
 
-def schedule_pipelined(
-    costs: List[LayerCost],
-    io_policy: str = "single",
-) -> Dict[str, float]:
+def schedule_pipelined(costs: List[LayerCost]) -> Dict[str, float]:
     """Cross-layer prefetch: layer i+1's IO runs while layer i computes.
 
     Steady-state per-layer cost = max(compute_i, io_{i+1}).
-    Cold start: layer 0's IO must complete before layer 0's compute begins.
+    Cold start: layer 0's IO must complete before layer 0's compute begins
+    (no preceding compute to hide it behind).
     Tail: layer N-1's compute still has to finish; no further IO is needed.
 
     Schedule:
-        t = 0
-        t += io_0                       # cold prefetch
+        t = io_0                       # cold prefetch of layer 0
         for i in 0..N-1:
-            t += max(compute_i, io_{i+1} or 0)
-        # last term has io_N = 0
+            t += max(compute_i, io_{i+1})    # io_N = 0 by convention
     """
-    assert io_policy in ("single", "dual")
     if not costs:
         return {"total_ms": 0.0, "io_hidden_ms": 0.0, "io_total_ms": 0.0,
                 "compute_total_ms": 0.0}
 
-    io_of = (lambda c: c.total_io_single) if io_policy == "single" else (lambda c: c.total_io_dual)
+    io_of = lambda c: c.total_io
 
     io_total = sum(io_of(c) for c in costs)
     compute_total = sum(c.total_compute for c in costs)
 
-    t = io_of(costs[0])  # cold prefetch of layer 0
+    t = io_of(costs[0])  # cold prefetch of layer 0 — fully exposed
     overlapped = 0.0
     for i in range(len(costs)):
         comp_i = costs[i].total_compute
         io_next = io_of(costs[i + 1]) if i + 1 < len(costs) else 0.0
         step = max(comp_i, io_next)
-        # how much of io_next was hidden behind comp_i:
         if io_next > 0:
             overlapped += min(comp_i, io_next)
         t += step
@@ -259,7 +244,6 @@ def simulate(
     batch_size: int,
     mode: str,
     f_period: int,
-    io_policy: str = "single",
     n_layers: int = NUM_LAYERS,
     tables: ProfileTables = None,
 ) -> Dict[str, float]:
@@ -269,23 +253,22 @@ def simulate(
     costs = build_layer_costs(seq_len, batch_size, mode, f_period, tables, n_layers)
 
     seq = schedule_sequential(costs)
-    pipe = schedule_pipelined(costs, io_policy=io_policy)
+    pipe = schedule_pipelined(costs)
 
     n_F = sum(1 for c in costs if c.kind == "F")
     n_S = sum(1 for c in costs if c.kind == "S")
 
-    # Reference: every-layer-F (DSA baseline, sequential within-layer overlap)
+    # Reference: every-layer-F (DSA baseline)
     ref_costs = build_layer_costs(seq_len, batch_size, mode, f_period=1,
                                   tables=tables, n_layers=n_layers)
     ref_seq = schedule_sequential(ref_costs)
-    ref_pipe = schedule_pipelined(ref_costs, io_policy=io_policy)
+    ref_pipe = schedule_pipelined(ref_costs)
 
     return {
         "seq_len": seq_len,
         "batch_size": batch_size,
         "mode": mode,
         "f_period": f_period,
-        "io_policy": io_policy,
         "n_F": n_F,
         "n_S": n_S,
         "indexer_savings_pct": 100.0 * n_S / n_layers,
@@ -317,7 +300,6 @@ def sweep(
     batch_sizes: List[int],
     modes: Tuple[str, ...] = ("hbm", "offload"),
     f_periods: Tuple[int, ...] = (1, 2, 4, 8),
-    io_policies: Tuple[str, ...] = ("single", "dual"),
 ) -> List[Dict[str, float]]:
     tables = load_profiles()
     rows = []
@@ -325,6 +307,5 @@ def sweep(
         for sl in seq_lens:
             for bs in batch_sizes:
                 for fp in f_periods:
-                    for pol in io_policies:
-                        rows.append(simulate(sl, bs, mode, fp, pol, tables=tables))
+                    rows.append(simulate(sl, bs, mode, fp, tables=tables))
     return rows

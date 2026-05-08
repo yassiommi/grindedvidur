@@ -30,7 +30,6 @@ SEQ_LENS = [4096, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 MODES = ("hbm", "offload")
 F_PERIODS = (1, 2, 4, 8)
-IO_POLICIES = ("single", "dual")
 
 
 def sl_label(sl: int) -> str:
@@ -38,9 +37,10 @@ def sl_label(sl: int) -> str:
 
 
 def print_summary_table(rows):
-    """Print concise summary at fp=4, dual policy."""
+    """Print concise summary at fp=4 (F:S:S:S)."""
     print(f"\n{'=' * 110}")
-    print(" IndexCache (F:S:S:S, dual IO stream, pipelined) vs. baseline DSA (all-F, pipelined)")
+    print(" IndexCache (F:S:S:S, pipelined) vs. baseline DSA (all-F, pipelined)")
+    print(" IO channel: IDX and KV share one PCIe/HBM bus (their costs sum per layer).")
     print(f"{'=' * 110}")
     hdr = (f"{'sl':>6} {'bs':>4} {'mode':>8} | "
            f"{'compute':>9} {'ic_IO':>9} {'dsa_IO':>9} | "
@@ -49,7 +49,7 @@ def print_summary_table(rows):
     print(hdr)
     print("-" * 110)
     for r in rows:
-        if r["f_period"] != 4 or r["io_policy"] != "dual":
+        if r["f_period"] != 4:
             continue
         hidden = "FULL" if r["ic_io_fully_hidden"] else f"{100*r['ic_io_hidden_ms']/max(r['ic_io_total_ms'],1e-9):.0f}%"
         print(f"{sl_label(r['seq_len']):>6} {r['batch_size']:>4} {r['mode']:>8} | "
@@ -58,9 +58,9 @@ def print_summary_table(rows):
               f"{hidden:>11}")
 
 
-def _matrix(rows, mode, f_period, io_policy, key, seq_lens, batch_sizes):
+def _matrix(rows, mode, f_period, key, seq_lens, batch_sizes):
     by = {(r["seq_len"], r["batch_size"]): r for r in rows
-          if r["mode"] == mode and r["f_period"] == f_period and r["io_policy"] == io_policy}
+          if r["mode"] == mode and r["f_period"] == f_period}
     M = np.zeros((len(seq_lens), len(batch_sizes)))
     for i, sl in enumerate(seq_lens):
         for j, bs in enumerate(batch_sizes):
@@ -68,18 +68,17 @@ def _matrix(rows, mode, f_period, io_policy, key, seq_lens, batch_sizes):
     return M
 
 
-def plot_io_exposed_heatmaps(rows, out_path: str, seq_lens, batch_sizes,
-                             io_policy="dual"):
+def plot_io_exposed_heatmaps(rows, out_path: str, seq_lens, batch_sizes):
     """Heatmap of exposed IO (ms) — i.e. IO that compute could NOT hide."""
     fig, axes = plt.subplots(len(F_PERIODS), 2, figsize=(11, 3.0 * len(F_PERIODS)),
                              squeeze=False)
     fig.suptitle(f"Exposed IO per decode step (ms) — IO not hidden by compute "
-                 f"[policy={io_policy}, {NUM_LAYERS} layers]", fontsize=12)
+                 f"[{NUM_LAYERS} layers, IDX+KV share IO bus]", fontsize=12)
     vmax = 0.0
     Ms = {}
     for fi, fp in enumerate(F_PERIODS):
         for mi, mode in enumerate(MODES):
-            M = _matrix(rows, mode, fp, io_policy, "ic_io_exposed_ms",
+            M = _matrix(rows, mode, fp, "ic_io_exposed_ms",
                         seq_lens, batch_sizes)
             Ms[(fi, mi)] = M
             vmax = max(vmax, M.max())
@@ -114,14 +113,14 @@ def plot_io_exposed_heatmaps(rows, out_path: str, seq_lens, batch_sizes,
 
 
 def plot_speedup_heatmap(rows, out_path: str, seq_lens, batch_sizes,
-                         io_policy="dual", f_period=4):
+                         f_period=4):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), squeeze=False)
-    fig.suptitle(f"Pipelined IndexCache (F:S^{f_period-1}) speedup over pipelined DSA "
-                 f"[policy={io_policy}]", fontsize=12)
+    fig.suptitle(f"Pipelined IndexCache (F:S^{f_period-1}) speedup over pipelined DSA",
+                 fontsize=12)
     vmax = 0.0
     Ms = {}
     for mi, mode in enumerate(MODES):
-        M = _matrix(rows, mode, f_period, io_policy, "speedup_pipe",
+        M = _matrix(rows, mode, f_period, "speedup_pipe",
                     seq_lens, batch_sizes)
         Ms[mi] = M
         vmax = max(vmax, M.max())
@@ -150,13 +149,15 @@ def plot_speedup_heatmap(rows, out_path: str, seq_lens, batch_sizes,
 
 
 def plot_overlap_breakdown(rows, out_path: str, seq_lens, batch_sizes,
-                           mode="offload", io_policy="dual"):
-    """For each F-period, show stacked compute-vs-IO and the overlap region."""
+                           mode="offload"):
+    """For each F-period, show compute, total IO and the IO that compute
+    could NOT hide ('exposed' = io_first_cold + sum max(0, io_{i+1} - comp_i)).
+    """
     bs_fixed = 16
     fig, axes = plt.subplots(1, len(F_PERIODS), figsize=(4.0 * len(F_PERIODS), 4.0),
                              squeeze=False, sharey=True)
-    fig.suptitle(f"Per-step compute vs. IO (ms), {mode}, BS={bs_fixed}, "
-                 f"policy={io_policy}, pipelined", fontsize=12)
+    fig.suptitle(f"Per-step compute vs. IO (ms), {mode}, BS={bs_fixed}, pipelined "
+                 f"(IDX+KV share IO bus)", fontsize=12)
     for fi, fp in enumerate(F_PERIODS):
         ax = axes[0][fi]
         comps = []
@@ -165,8 +166,7 @@ def plot_overlap_breakdown(rows, out_path: str, seq_lens, batch_sizes,
         for sl in seq_lens:
             r = next(r for r in rows
                      if r["seq_len"] == sl and r["batch_size"] == bs_fixed
-                     and r["mode"] == mode and r["f_period"] == fp
-                     and r["io_policy"] == io_policy)
+                     and r["mode"] == mode and r["f_period"] == fp)
             comps.append(r["ic_compute_total_ms"])
             ios.append(r["ic_io_total_ms"])
             exposed.append(r["ic_io_exposed_ms"])
@@ -202,33 +202,28 @@ def main():
     print(f"  batch_sizes  = {list(BATCH_SIZES)}")
     print(f"  modes        = {list(MODES)}")
     print(f"  F-periods    = {list(F_PERIODS)}  (1=all-F=DSA, 4=F:S:S:S, 8=F:S^7)")
-    print(f"  IO-policies  = {list(IO_POLICIES)}")
 
-    rows = sweep(SEQ_LENS, BATCH_SIZES, MODES, F_PERIODS, IO_POLICIES)
+    rows = sweep(SEQ_LENS, BATCH_SIZES, MODES, F_PERIODS)
     print(f"  → {len(rows)} configurations")
 
     print_summary_table(rows)
 
     print("\nWriting plots...")
     plot_io_exposed_heatmaps(
-        rows, os.path.join(args.out_dir, "fig_io_exposed_dual.png"),
-        SEQ_LENS, BATCH_SIZES, io_policy="dual",
-    )
-    plot_io_exposed_heatmaps(
-        rows, os.path.join(args.out_dir, "fig_io_exposed_single.png"),
-        SEQ_LENS, BATCH_SIZES, io_policy="single",
+        rows, os.path.join(args.out_dir, "fig_io_exposed.png"),
+        SEQ_LENS, BATCH_SIZES,
     )
     plot_speedup_heatmap(
-        rows, os.path.join(args.out_dir, "fig_speedup_fp4_dual.png"),
-        SEQ_LENS, BATCH_SIZES, io_policy="dual", f_period=4,
+        rows, os.path.join(args.out_dir, "fig_speedup_fp4.png"),
+        SEQ_LENS, BATCH_SIZES, f_period=4,
     )
     plot_overlap_breakdown(
         rows, os.path.join(args.out_dir, "fig_overlap_offload_bs16.png"),
-        SEQ_LENS, BATCH_SIZES, mode="offload", io_policy="dual",
+        SEQ_LENS, BATCH_SIZES, mode="offload",
     )
     plot_overlap_breakdown(
         rows, os.path.join(args.out_dir, "fig_overlap_hbm_bs16.png"),
-        SEQ_LENS, BATCH_SIZES, mode="hbm", io_policy="dual",
+        SEQ_LENS, BATCH_SIZES, mode="hbm",
     )
 
     with open(args.json_out, "w") as f:
