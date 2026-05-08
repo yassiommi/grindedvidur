@@ -87,12 +87,29 @@ from experiments.dsa_timing_model import (
 # ─────────────────────────────────────────────────────────────────────
 @dataclass
 class LayerCost:
-    """Per-layer cost decomposed for pipeline scheduling."""
+    """Per-layer cost decomposed for pipeline scheduling.
+
+    Streams (resource model):
+      - IO bus  : carries idx_io and kv_io (sum, single channel).
+      - Compute : block_a + idx_comp + block_c + moe.
+
+    Within-layer overlap: block_a (Q projection compute) runs concurrent
+    with block_b (the IO + idx_comp + topk on the IO bus). Block_c
+    cannot start until block_b's KV gather has landed. So per-layer:
+        within_layer_time = max(block_a, block_b_io) + block_c + moe
+    For pipeline scheduling we split this into:
+        T_io       = idx_io + kv_io        (IO bus time, the part that
+                                              must complete before block_c)
+        T_compute  = max(0, block_a - T_io) + block_c + moe + idx_comp
+                     (compute work; block_a is freebie if shorter than IO)
+    """
     kind: str           # "F" or "S"
     idx_io_ms: float    # indexer-K read (0 for S layers)
     kv_io_ms: float     # MLA-KV gather (always > 0)
     idx_comp_ms: float  # indexer matmul + topk (0 for S layers)
-    other_compute_ms: float  # block_a + block_c + moe + small bookkeeping
+    block_a_ms: float   # pre-norm + q_down + q_up + rope (compute, parallel with IO)
+    block_c_ms: float   # kv_up_proj + attn core + o_proj + residual
+    moe_ms: float       # MoE block (sequential after attention)
 
     @property
     def total_io(self) -> float:
@@ -100,21 +117,34 @@ class LayerCost:
         return self.idx_io_ms + self.kv_io_ms
 
     @property
-    def total_compute(self) -> float:
-        return self.idx_comp_ms + self.other_compute_ms
+    def block_a_exposed_ms(self) -> float:
+        """block_a portion that compute pays even after overlapping with IO bus.
 
-    def sequential_layer_ms(self) -> float:
-        """No cross-layer overlap. Within-layer block A||B as in baseline."""
-        # block_b = idx_io + idx_comp + kv_io  (single IO channel)
-        block_b = self.idx_io_ms + self.idx_comp_ms + self.kv_io_ms
-        # block_a + block_c + moe lumped into other_compute_ms; we cannot
-        # split block_a here, so we approximate: within-layer overlap is
-        # already captured at the underlying analyze_layer_bs level for the
-        # F case, which is what we use as the reference. For the S case we
-        # rebuild it: A||(kv_io) + C + MoE.
-        # This method is informational only; the pipelined methods below are
-        # what we actually report.
-        return self.idx_io_ms + self.idx_comp_ms + self.kv_io_ms + self.other_compute_ms
+        If block_a < total_io, block_a runs entirely concurrent with the IO
+        on its own compute units, so its compute cost is hidden in the IO
+        latency: zero compute payment.
+        If block_a > total_io, the part beyond total_io still has to be paid
+        on the compute stream.
+        """
+        return max(0.0, self.block_a_ms - self.total_io)
+
+    @property
+    def total_compute(self) -> float:
+        """Compute work counted against the compute stream.
+
+        block_c + moe + idx_comp must follow the IO. block_a's exposed part
+        (if any) is also counted; the rest of block_a is hidden in IO.
+        """
+        return (self.block_a_exposed_ms + self.idx_comp_ms
+                + self.block_c_ms + self.moe_ms)
+
+    def within_layer_time_ms(self) -> float:
+        """Sequential within-layer time (no cross-layer prefetch).
+
+            within_layer = max(block_a, block_b_io) + block_c + moe + idx_comp
+        """
+        return (max(self.block_a_ms, self.total_io)
+                + self.idx_comp_ms + self.block_c_ms + self.moe_ms)
 
 
 def _f_pattern(n_layers: int, f_period: int) -> List[str]:
@@ -141,14 +171,12 @@ def build_layer_costs(
     # Reference numbers from the established model — these are what F layers cost.
     ref = analyze_layer_bs(seq_len, mode, batch_size, tables)
 
-    # Components we will reuse:
+    # Components we reuse from the underlying timing model:
     idx_io_F = ref["indexer_read_ms"]
-    idx_comp_F = 0.005 + max(0.005, 0.005 * batch_size)  # indexer_compute + topk floor
-    # The 0.005 + ... above mirrors analyze_layer_bs' indexer_compute_ms (5us
-    # kernel floor) + topk_ms (~bs us scaling, floored at 5us). We round
-    # up to the same floors used in the source model.
-    # block_a + block_c + moe: this is "other_compute" on the critical path.
-    other_compute = ref["block_a_ms"] + ref["block_c_ms"] + ref["moe_total_ms"]
+    idx_comp_F = 0.005 + max(0.005, 0.005 * batch_size)  # indexer matmul (5us floor) + topk
+    block_a = ref["block_a_ms"]
+    block_c = ref["block_c_ms"]
+    moe = ref["moe_total_ms"]
     kv_io = ref["fetch_kv_ms"]
 
     pattern = _f_pattern(n_layers, f_period)
@@ -160,7 +188,9 @@ def build_layer_costs(
                 idx_io_ms=idx_io_F,
                 kv_io_ms=kv_io,
                 idx_comp_ms=idx_comp_F,
-                other_compute_ms=other_compute,
+                block_a_ms=block_a,
+                block_c_ms=block_c,
+                moe_ms=moe,
             ))
         else:
             costs.append(LayerCost(
@@ -168,7 +198,9 @@ def build_layer_costs(
                 idx_io_ms=0.0,
                 kv_io_ms=kv_io,
                 idx_comp_ms=0.0,
-                other_compute_ms=other_compute,
+                block_a_ms=block_a,
+                block_c_ms=block_c,
+                moe_ms=moe,
             ))
     return costs
 
@@ -177,62 +209,77 @@ def build_layer_costs(
 # Pipeline schedulers
 # ─────────────────────────────────────────────────────────────────────
 def schedule_sequential(costs: List[LayerCost]) -> Dict[str, float]:
-    """No cross-layer overlap, but within-layer block_a || block_b.
+    """No cross-layer overlap. Each layer fully serial except block_a||block_b.
 
-    block_b = idx_io + idx_comp + kv_io   (single IO channel)
-    block_a is part of other_compute_ms — but block_a is small (~0.08ms)
-    relative to other_compute, and overlaps with block_b. To stay
-    conservative and not double-credit, we treat the pipeline as
-        layer = max(block_b, 0) + other_compute
-    where block_a's overlap with block_b is captured implicitly in the
-    underlying ref's block_a_ms (which we keep inside other_compute). For
-    long seq_len / big bs, block_b dwarfs block_a anyway and this matters
-    by <5%.
+    Per-layer = max(block_a, total_io) + idx_comp + block_c + moe
     """
-    total = 0.0
-    for c in costs:
-        block_b = c.idx_io_ms + c.idx_comp_ms + c.kv_io_ms
-        total += block_b + c.other_compute_ms
+    total = sum(c.within_layer_time_ms() for c in costs)
     return {"total_ms": total}
 
 
 def schedule_pipelined(costs: List[LayerCost]) -> Dict[str, float]:
-    """Cross-layer prefetch: layer i+1's IO runs while layer i computes.
+    """Producer/consumer pipeline with deep prefetch buffer.
 
-    Steady-state per-layer cost = max(compute_i, io_{i+1}).
-    Cold start: layer 0's IO must complete before layer 0's compute begins
-    (no preceding compute to hide it behind).
-    Tail: layer N-1's compute still has to finish; no further IO is needed.
+    Two streams (IO bus and compute) run independently. Layer i's compute
+    cannot start until both:
+      (a) layer i-1's compute has finished (sequential layer dependency), and
+      (b) layer i's IO has completed on the IO bus (block_c needs the
+          gathered KV; we conservatively also require idx_io done).
 
-    Schedule:
-        t = io_0                       # cold prefetch of layer 0
-        for i in 0..N-1:
-            t += max(compute_i, io_{i+1})    # io_N = 0 by convention
+    The IO bus runs back-to-back across all layers — a layer's IO is
+    issued as soon as the bus becomes free, NOT just one layer ahead.
+    This matches a system with a deep prefetch queue (≥ a few F-layer
+    buffers, e.g. ~100 MB at sl=200K BS=1, ~32 GB at sl=1M BS=64).
+
+    Recursion:
+        end_io_i      = sum_{j<=i} T_io_j               (cumulative IO)
+        end_comp_{-1} = 0
+        end_comp_i    = max(end_comp_{i-1}, end_io_i) + T_comp_i
+
+    Final pipeline time = end_comp_{N-1}.
     """
     if not costs:
         return {"total_ms": 0.0, "io_hidden_ms": 0.0, "io_total_ms": 0.0,
-                "compute_total_ms": 0.0}
+                "compute_total_ms": 0.0, "io_exposed_ms": 0.0,
+                "io_stalled_compute_ms": 0.0}
 
-    io_of = lambda c: c.total_io
+    cum_io = 0.0
+    end_comp = 0.0
+    io_stalled = 0.0   # ms compute spent waiting on IO
+    compute_busy = 0.0
+    io_busy = 0.0
+    last_comp_end = 0.0
+    for c in costs:
+        cum_io += c.total_io
+        io_busy += c.total_io
+        # Compute can start at max(prev compute end, this layer's IO end)
+        start = max(last_comp_end, cum_io)
+        if start > last_comp_end and last_comp_end > 0:
+            io_stalled += start - last_comp_end  # compute waited on IO
+        elif cum_io > start and start == last_comp_end:
+            pass  # IO already done before compute slot — IO was hidden
+        last_comp_end = start + c.total_compute
+        compute_busy += c.total_compute
 
-    io_total = sum(io_of(c) for c in costs)
-    compute_total = sum(c.total_compute for c in costs)
+    end_comp = last_comp_end
 
-    t = io_of(costs[0])  # cold prefetch of layer 0 — fully exposed
-    overlapped = 0.0
-    for i in range(len(costs)):
-        comp_i = costs[i].total_compute
-        io_next = io_of(costs[i + 1]) if i + 1 < len(costs) else 0.0
-        step = max(comp_i, io_next)
-        if io_next > 0:
-            overlapped += min(comp_i, io_next)
-        t += step
+    io_total = cum_io
+    compute_total = compute_busy
+    # Identity: end_comp = io_stalled_or_cold + compute_total
+    # The "exposed" IO is exactly the time compute spent stalled (incl cold).
+    # Cold start: layer 0's compute can't begin before layer 0's IO completes.
+    cold_start = costs[0].total_io if costs else 0.0
+    io_stalled_total = end_comp - compute_total
+    overlapped = io_total - io_stalled_total
+
     return {
-        "total_ms": t,
+        "total_ms": end_comp,
         "io_total_ms": io_total,
         "compute_total_ms": compute_total,
         "io_hidden_ms": overlapped,
-        "io_exposed_ms": io_total - overlapped,
+        "io_exposed_ms": io_stalled_total,    # time compute waited on IO
+        "io_stalled_compute_ms": io_stalled_total,
+        "cold_start_ms": cold_start,
     }
 
 

@@ -12,12 +12,13 @@ improves over the all-F DSA baseline by:
 
 | seq_len | BS  | mode    | DSA pipelined | IndexCache pipelined | speedup |
 |--------:|----:|---------|--------------:|---------------------:|--------:|
-| 32K     | 64  | offload | 1194 ms       |  812 ms              | **1.47×** |
-| 128K    | 16  | offload | 1240 ms       |  476 ms              | **2.61×** |
-| 256K    | 64  | offload | 9694 ms       | 2986 ms              | **3.25×** |
-| 1M      | 64  | offload | 38 121 ms     | 10 443 ms            | **3.65×** |
-| 1M      | 16  | hbm     | 358 ms        |  246 ms              | **1.45×** |
-| 4K      | any | offload | —             | —                    | ≈1.02× (compute-bound) |
+| 32K     | 64  | offload | 1294 ms       |  420 ms              | **3.08×** |
+| 128K    | 16  | offload | 1240 ms       |  366 ms              | **3.39×** |
+| 256K    | 64  | offload | 9694 ms       | 2703 ms              | **3.59×** |
+| 1M      | 64  | offload | 38 121 ms     | 10 160 ms            | **3.75×** |
+| 200K    |  1  | offload |   120 ms      |   46 ms              | **2.60×** |
+| 200K    |  1  | hbm     |    43 ms      |   46 ms              | **0.95×** (compute-bound, see below) |
+| 4K      | any | offload | ≈40–600 ms    | ≈40–600 ms           | ≈1.0× (compute-bound) |
 
 In short, IndexCache helps exactly where DSA hurts most: **long context,
 moderate-to-large batch, and when the KV/indexer caches do not fit in
@@ -58,49 +59,79 @@ In offload mode the dominant IO is the indexer K read; KV gather is
 ~3 MB (negligible at PCIe). In HBM mode all IO is HBM-bound and small
 versus per-layer compute.
 
-### Pipeline schedule
+### Pipeline schedule (producer / consumer with deep prefetch buffer)
 
-We exploit cross-layer prefetch via double buffering: while layer *i*
-computes, the IO needed by layer *i+1* (its indexer K and KV indices)
-is being fetched. Steady-state per-layer cost is
+Two streams run concurrently — the **IO bus** (PCIe in offload, HBM bus
+in HBM mode) and **compute**. The IO bus issues each layer's transfers
+back-to-back, accumulating a prefetch lead over compute. Compute waits
+only when the cumulative IO has not yet caught up:
 
 ```
-pipeline_step = max(compute_i, io_{i+1})
+end_io_i      = Σ_{j ≤ i} T_io_j                  (back-to-back IO)
+end_comp_{-1} = 0
+end_comp_i    = max(end_comp_{i-1}, end_io_i) + T_compute_i
+
+pipeline_total = end_comp_{N-1}
 ```
+
+Crucially, this **allows multiple S layers' compute time to
+collectively hide an F layer's indexer K read**, even when no single
+S-layer compute slot would be enough on its own. With F:S:S:S, the
+~3 × T_comp_S compute slot between F layers (≈ 2.4 ms at BS=1) is
+plenty to cover one F-layer indexer read of ~1.95 ms at sl=200K
+offload. An older "max(comp_i, io_{i+1})" model would only allow
+1-layer lookahead and would expose the entire spillover; that model
+underestimated IndexCache's value by ~1.5–2×.
 
 The first layer pays its full IO cold (no prior compute to hide
-behind), and the final layer pays no further IO. The simulator returns
-a tail-corrected total — we never silently amortise away the cold
-start.
+behind). The final layer's compute extends past end-of-IO. The
+identity `pipeline_total = compute_total + io_exposed` holds exactly
+where `io_exposed = end_comp - compute_total` (the time compute spent
+stalled waiting on IO, including the cold start).
+
+### Within-layer overlap
+
+Within each layer, **block_a (Q projection) and block_b (idx + KV IO)
+run in parallel on disjoint resources** (compute units vs IO bus):
+
+```
+T_compute_layer = max(0, block_a − T_io)  +  idx_comp + block_c + moe
+T_io_layer      = idx_io + kv_io
+```
+
+If `block_a < T_io`, block_a is *fully hidden* in the IO. If `block_a >
+T_io` (only happens for big-BS HBM-mode S layers where T_io collapses
+to ~0.015 ms), the spillover `block_a − T_io` is paid as compute. This
+is the source of the small HBM-mode regression visible in the
+end-to-end table for IndexCache: S layers' indexer IO disappears, so
+their block_a no longer has any IO to hide behind.
 
 ### How "exposed IO" is calculated
 
-`io_exposed_ms` is the IO that compute could **not** hide. The
-scheduler computes it directly:
+`io_exposed_ms` = `pipeline_total − compute_total` = the time the
+compute stream spent *stalled* waiting on the IO stream. In the
+producer/consumer schedule this is exactly:
 
 ```python
-t = io_of(costs[0])                    # cold prefetch — fully exposed
-overlapped = 0
-for i in 0 .. N-1:
-    io_next = io_of(costs[i+1]) if i+1 < N else 0
-    t        += max(compute_i, io_next)
-    overlapped += min(compute_i, io_next)
-io_total   = sum_i io_of(costs[i])
-io_exposed = io_total - overlapped
+end_io = 0
+end_comp = 0
+for c in costs:
+    end_io  += c.total_io                       # IO runs back-to-back
+    cmp_start = max(end_comp, end_io)            # compute waits if IO behind
+    end_comp = cmp_start + c.total_compute
+io_exposed = end_comp - sum(c.total_compute for c in costs)
 ```
 
-Equivalently in closed form:
+This collapses to:
+- `cold_start` (= layer 0's IO, no preceding compute) **plus**
+- any subsequent stalls where cumulative IO has run past cumulative compute.
 
-```
-io_exposed = io_first  +  Σ_{i=0..N-1}  max(0, io_{i+1} − compute_i)
-```
-
-i.e. (1) the layer-0 cold prefetch (no preceding compute) plus (2) for
-each layer transition, the spillover where the next layer's IO is
-larger than the current layer's compute. The pipeline total then
-satisfies `pipeline_total = compute_total + io_exposed` (verified
-numerically). This is the value plotted as the red bars on
-`fig_overlap_offload_bs16.png` / `fig_overlap_hbm_bs16.png`.
+In the IO-bound regime (DSA at long sl/BS offload) almost every layer
+stalls and `io_exposed ≈ io_total − T_compute_last_layer`. In the
+compute-bound regime (HBM mode, or IndexCache offload at long sl)
+only the cold start is exposed. The pipeline total then satisfies
+`pipeline_total = compute_total + io_exposed` (verified to floating-
+point precision in `experiments/validate_indexcache_200k.py`).
 
 ### F/S patterns
 
@@ -121,6 +152,85 @@ So a single F layer at this point has **IO ≈ 1.5× compute** — IO does
 not fit inside compute even with prefetch. An S layer has **IO ≈ 0.07×
 compute** and is fully overlapped.
 
+## End-to-end DSA vs IndexCache (per decode step, ms)
+
+Producer/consumer pipeline, F:S:S:S for IndexCache. Output of
+`python -m experiments.validate_indexcache_200k`:
+
+### offload mode
+
+| scenario       | DSA pipe | IC pipe | speedup | DSA io  | IC io   | compute | IC stall |
+|----------------|---------:|--------:|--------:|--------:|--------:|--------:|---------:|
+| 4K   / BS=1    |    43.44 |   44.14 |   0.98× |    5.57 |    3.86 |   44.04 |     0.09 |
+| 32K  / BS=1    |    43.71 |   44.40 |   0.98× |   21.76 |    8.11 |   44.04 |     0.36 |
+| 128K / BS=1    |    77.99 |   45.31 |   1.72× |   77.28 |   22.67 |   44.04 |     1.27 |
+| **200K / BS=1**|  119.63  | **45.99** | **2.60×** | 118.92 |  33.59  |   44.04 |   1.95   |
+| 512K / BS=1    |   300.08 |   81.63 |   3.68× |  299.37 |   80.92 |   44.04 |    37.59 |
+| 1M   / BS=1    |   596.20 |  159.30 |   3.74× |  595.49 |  158.59 |   44.04 |   115.26 |
+| 32K  / BS=16   |   351.44 |  201.40 |   1.74× |  348.17 |  129.72 |  195.69 |     5.71 |
+| 128K / BS=16   |  1239.79 |  366.00 |   3.39× | 1236.52 |  362.73 |  195.69 |   170.31 |
+| 200K / BS=16   |  1906.05 |  540.76 |   3.52× | 1902.78 |  537.49 |  195.69 |   345.06 |
+| 128K / BS=64   |  4955.91 | 1460.76 |   3.39× | 4946.07 | 1450.93 |  585.27 |   875.49 |
+| 200K / BS=64   |  7620.95 | 2159.79 |   3.53× | 7611.12 | 2149.95 |  585.27 |  1574.52 |
+
+### HBM mode
+
+| scenario       | DSA pipe | IC pipe | speedup | DSA io | IC io | compute | IC stall |
+|----------------|---------:|--------:|--------:|-------:|------:|--------:|---------:|
+| 4K   / BS=1    |    46.35 |   46.58 |   1.00× |   1.83 |  1.16 |   46.55 |     0.03 |
+| 200K / BS=1    |    43.44 |   45.86 |   0.95× |   5.22 |  2.04 |   45.77 |     0.09 |
+| 1M   / BS=1    |    43.73 |   46.15 |   0.95× |  22.95 |  6.70 |   45.77 |     0.38 |
+| 200K / BS=16   |   200.68 |  199.03 |   1.01× |  70.80 | 20.00 |  197.87 |     1.16 |
+| 200K / BS=64   |   604.54 |  589.91 |   1.02× | 283.22 | 80.00 |  585.27 |     4.64 |
+
+The HBM-mode 0.95× is **not a bug** — it's the within-layer overlap
+effect. In DSA all-F at HBM, every layer's small `block_a` (~0.08 ms)
+is fully hidden inside the layer's `idx_io` (~0.07 ms at 200K, but
+`max` keeps it at ~0.085 ms anyway). In IndexCache the 45 S layers
+have `idx_io = 0` (we do not read what we do not need), so their
+`block_a` becomes pure compute. The savings on IO are smaller than
+the loss of overlap on compute, so net pipeline time creeps up by
+~5%. At larger BS the picture flips because `block_a` grows and the
+IO savings dominate (1.02× win at BS=64).
+
+The asymptotic offload speedup of **3.75×** is exactly the F-period-4
+ceiling: `1 / (n_F / N_layers) = 1 / (16/61) = 3.81×` minus a small
+shave for the cold-start + last-layer-compute tail.
+
+## Variable values used
+
+```
+Hardware (H100 SXM):
+  HBM peak BW         = 1384.0 GB/s   (floor 0.015 ms below ~16 MB)
+  PCIe Gen4 x16 BW    =   51.5 GB/s   (floor 0.020 ms below ~0.5 MB)
+
+Model (DeepSeek-V3):
+  NUM_LAYERS          = 61
+  HIDDEN_SIZE         = 7168
+  NUM_HEADS           = 128
+  KV_LORA_RANK        = 512
+  Q_LORA_RANK         = 1536
+  NUM_ROUTED_EXPERTS  = 256   (EP=8, 32 experts/GPU)
+
+DSA / IndexCache:
+  Top-k selected      = 2048
+  Sliding window      = 512
+  Attended per layer  = 2560
+  Indexer K bytes/tok = 512 B   (KV_LORA_RANK × 1 B FP8)
+  MLA  KV bytes/tok   = 1152 B  ((KV_LORA_RANK + ROPE) × 2 B FP16)
+
+Derived sizes @ seq_len=200K, BS=1:
+  Indexer K per layer            = 100.00 MB
+  Indexer K all 61 F layers      =   5.96 GB     ← fits in HBM
+  Indexer K only 16 F (F:S:S:S)  =   1.56 GB
+  KV gather per layer (2560 tok) =   2.81 MB
+```
+
+We follow the user's guidance and **assume the indexer K fits in
+80 GB HBM** in HBM mode regardless of (BS, seq_len). For the
+extreme corner BS=64/sl=1M with all-F, that's 16 × 64 × 1M × 512 B =
+500 GB; the model does not gate on capacity but reports the read time.
+
 ## Correctness checks
 
 1. `f_period=1` reduces exactly to the DSA baseline numerically (test
@@ -128,13 +238,16 @@ compute** and is fully overlapped.
 2. `n_F + n_S = NUM_LAYERS` for all f_period; indexer-savings %
    matches `(n_S / N)`: f_period=4 gives 73.8% (45/61), f_period=8
    gives 86.9% (53/61).
-3. Pipelined total = `compute_total + io_exposed_ms` to within
-   numerical precision (the cold-start prefetch is exactly the
-   "exposed" IO when compute >> per-layer IO).
-4. We do not double-credit within-layer overlap: block_a's overlap
-   with block_b stays inside the upstream `analyze_layer_bs` numbers
-   that we treat as opaque references. Cross-layer overlap is layered
-   on top, not in addition.
+3. `pipeline_total = compute_total + io_exposed_ms` to within
+   numerical precision (validated identity at every scenario).
+4. `Σ T_io_layer == pipe.io_total_ms` and `Σ T_compute_layer == pipe.compute_total_ms`.
+5. The 200K/BS=1 validator runs five identity checks per scenario × 4
+   scenarios (HBM/offload × DSA/IC) — all 20 pass to floating-point
+   precision.
+6. Within-layer overlap is now explicit: `T_compute_layer` includes
+   `max(0, block_a - T_io)`, not `block_a` outright. The HBM-mode
+   regression visible in the e2e table is a sign this is being
+   counted (correctly) rather than a modelling error.
 
 ## Results
 

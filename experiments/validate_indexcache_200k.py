@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """IndexCache validation: single request, 200K seq_len, BS=1.
 
-Walks one decode step end-to-end and prints, for both DSA (all-F) and
-IndexCache (F:S:S:S):
-  1. Per-layer cost (idx_io, kv_io, idx_comp, other_compute)
-  2. Cumulative pipeline timeline tick-by-tick
-  3. Identity checks:
-        sum(io)         == ic_io_total_ms
-        sum(compute)    == ic_compute_total_ms
-        pipe_total      == compute_total + io_exposed
-        io_exposed      == io_first + sum max(0, io_{i+1} - comp_i)
-  4. Cross-check vs the single-call simulate() output
+Walks one decode step end-to-end with the producer/consumer pipeline
+model (deep prefetch buffer; IO bus runs back-to-back, compute waits
+when cumulative IO falls behind).
+
+Prints:
+  1. Variable values used (sizes, bandwidths, per-token costs)
+  2. Per-layer cost decomposition (idx_io, kv_io, block_a/c, MoE)
+  3. Cumulative pipeline timeline (end_io_i, end_comp_i)
+  4. End-to-end DSA vs IndexCache time comparisons across modes/F-periods
+  5. Identity checks:
+        end_comp_N-1  == compute_total + io_stalled_compute  (within fp tol)
+        sum(layer IO) == io_total
+        sum(compute)  == compute_total
+        manual pipeline == simulate() output
 
 Run:
     python -m experiments.validate_indexcache_200k
@@ -23,11 +27,78 @@ from experiments.indexcache_model import (
     schedule_pipelined,
     simulate,
 )
-from experiments.dsa_timing_model import NUM_LAYERS, load_profiles
+from experiments.dsa_timing_model import (
+    DSA_ATTENDED,
+    DSA_SELECTED_TOKENS,
+    DSA_SLIDING_WINDOW,
+    EP,
+    H100_HBM_FLOOR_MS,
+    H100_HBM_PEAK_GBS,
+    H100_PCIE_FLOOR_MS,
+    H100_PCIE_PEAK_GBS,
+    HIDDEN_SIZE,
+    INDEXER_K_BYTES_PER_TOKEN,
+    KV_LORA_RANK,
+    MLA_KV_BYTES_PER_TOKEN,
+    NUM_HEADS,
+    NUM_LAYERS,
+    NUM_ROUTED_EXPERTS,
+    Q_LORA_RANK,
+    load_profiles,
+)
 
 
 SEQ_LEN = 200 * 1024  # 204800 tokens
 BATCH_SIZE = 1
+
+
+def _print_variables(seq_len: int, bs: int) -> None:
+    print()
+    print("=" * 92)
+    print(" Variable values")
+    print("=" * 92)
+    print(f"  Hardware (H100 SXM):")
+    print(f"    HBM peak BW         = {H100_HBM_PEAK_GBS:>8.1f} GB/s   "
+          f"(floor {H100_HBM_FLOOR_MS:.3f} ms)")
+    print(f"    PCIe Gen4 x16 BW    = {H100_PCIE_PEAK_GBS:>8.1f} GB/s   "
+          f"(floor {H100_PCIE_FLOOR_MS:.3f} ms)")
+    print()
+    print(f"  Model (DeepSeek-V3):")
+    print(f"    NUM_LAYERS          = {NUM_LAYERS}")
+    print(f"    HIDDEN_SIZE         = {HIDDEN_SIZE}")
+    print(f"    NUM_HEADS           = {NUM_HEADS}")
+    print(f"    KV_LORA_RANK        = {KV_LORA_RANK}")
+    print(f"    Q_LORA_RANK         = {Q_LORA_RANK}")
+    print(f"    NUM_ROUTED_EXPERTS  = {NUM_ROUTED_EXPERTS}   (EP={EP})")
+    print()
+    print(f"  DSA / IndexCache:")
+    print(f"    Top-k selected      = {DSA_SELECTED_TOKENS}")
+    print(f"    Sliding window      = {DSA_SLIDING_WINDOW}")
+    print(f"    Attended per layer  = {DSA_ATTENDED}")
+    print(f"    Indexer K bytes/tok = {INDEXER_K_BYTES_PER_TOKEN} B   "
+          f"(KV_LORA_RANK={KV_LORA_RANK} × FP8={1} B)")
+    print(f"    MLA  KV bytes/tok   = {MLA_KV_BYTES_PER_TOKEN} B   "
+          f"(KV_LORA_RANK + ROPE)·FP16")
+    print()
+    print(f"  Workload (this validation):")
+    print(f"    seq_len             = {seq_len:>8,}  ({seq_len // 1024} K tokens)")
+    print(f"    batch_size          = {bs}")
+    print()
+    # Derived sizes
+    idx_K_per_layer = bs * seq_len * INDEXER_K_BYTES_PER_TOKEN
+    kv_per_layer    = bs * seq_len * MLA_KV_BYTES_PER_TOKEN
+    kv_gather_per_layer = bs * DSA_ATTENDED * MLA_KV_BYTES_PER_TOKEN
+    print(f"  Derived sizes (bytes):")
+    print(f"    Indexer K per layer            = {idx_K_per_layer:>13,}  "
+          f"({idx_K_per_layer / (1024**2):>8.2f} MB)")
+    print(f"    Indexer K all 61 F layers      = {61 * idx_K_per_layer:>13,}  "
+          f"({61 * idx_K_per_layer / (1024**3):>8.2f} GB)")
+    print(f"    Indexer K only 16 F (F:S:S:S)  = {16 * idx_K_per_layer:>13,}  "
+          f"({16 * idx_K_per_layer / (1024**3):>8.2f} GB)")
+    print(f"    Full MLA KV per layer          = {kv_per_layer:>13,}  "
+          f"({kv_per_layer / (1024**2):>8.2f} MB)")
+    print(f"    KV gather per layer ({DSA_ATTENDED} tok)  = {kv_gather_per_layer:>13,}  "
+          f"({kv_gather_per_layer / (1024**2):>8.2f} MB)")
 
 
 def _print_header(title: str) -> None:
@@ -38,50 +109,63 @@ def _print_header(title: str) -> None:
 
 
 def _print_layer_table(costs, max_rows=None):
-    print(f"  {'i':>3}  {'kind':>4}  {'idx_io':>9}  {'kv_io':>9}  {'idx_comp':>9}  "
-          f"{'other_cmp':>10}  {'layer_io':>9}  {'layer_cmp':>10}")
-    print("  " + "-" * 78)
+    print(f"  {'i':>3}  {'kind':>4}  {'idx_io':>8}  {'kv_io':>8}  {'idx_cmp':>8}  "
+          f"{'block_a':>8}  {'block_c':>8}  {'moe':>8}  {'T_io':>8}  {'T_cmp':>8}")
+    print("  " + "-" * 86)
     rows = costs if max_rows is None else costs[:max_rows]
     for i, c in enumerate(rows):
-        print(f"  {i:>3}  {c.kind:>4}  {c.idx_io_ms:>9.4f}  {c.kv_io_ms:>9.4f}  "
-              f"{c.idx_comp_ms:>9.4f}  {c.other_compute_ms:>10.4f}  "
-              f"{c.total_io:>9.4f}  {c.total_compute:>10.4f}")
+        print(f"  {i:>3}  {c.kind:>4}  {c.idx_io_ms:>8.4f}  {c.kv_io_ms:>8.4f}  "
+              f"{c.idx_comp_ms:>8.4f}  {c.block_a_ms:>8.4f}  {c.block_c_ms:>8.4f}  "
+              f"{c.moe_ms:>8.4f}  {c.total_io:>8.4f}  {c.total_compute:>8.4f}")
     if max_rows is not None and len(costs) > max_rows:
         print(f"  ... [{len(costs) - max_rows} more layers omitted] ...")
 
 
 def _walk_pipeline(costs, label: str) -> None:
-    """Print the pipeline timeline tick by tick."""
-    print(f"\n  Pipeline walk ({label}):")
-    print(f"  {'step':>20}  {'compute_i':>10}  {'io_next':>10}  {'tick':>10}  {'cum_t':>10}")
-    print("  " + "-" * 70)
+    """Print the producer/consumer pipeline timeline.
 
-    t = costs[0].total_io  # cold prefetch
-    cum_io = costs[0].total_io
+    Two streams:
+      end_io_i   = cumulative IO done after layer i's IO completes
+      end_cmp_i  = max(end_cmp_{i-1}, end_io_i) + T_compute_i
+    """
+    print(f"\n  Pipeline walk ({label}) — producer/consumer (deep prefetch buffer):")
+    print(f"  {'i':>3}  {'kind':>4}  {'T_io':>8}  {'T_cmp':>8}  "
+          f"{'end_io':>9}  {'cmp_start':>10}  {'end_cmp':>9}  {'note':>14}")
+    print("  " + "-" * 80)
+
+    end_io = 0.0
+    end_cmp = 0.0
     cum_compute = 0.0
-    cum_overlap = 0.0
-    print(f"  {'cold prefetch L0':>20}  {0.0:>10.4f}  {costs[0].total_io:>10.4f}  "
-          f"{costs[0].total_io:>10.4f}  {t:>10.4f}")
+    cum_stalled = 0.0
 
-    for i in range(len(costs)):
-        comp_i = costs[i].total_compute
-        io_next = costs[i + 1].total_io if i + 1 < len(costs) else 0.0
-        tick = max(comp_i, io_next)
-        t += tick
-        cum_compute += comp_i
-        cum_io += io_next
-        cum_overlap += min(comp_i, io_next) if io_next > 0 else 0.0
-        if i < 6 or i >= len(costs) - 4:
-            label_i = f"compute L{i} || prefetch L{i+1}" if i + 1 < len(costs) else f"compute L{i} (last)"
-            print(f"  {label_i:>20}  {comp_i:>10.4f}  {io_next:>10.4f}  "
-                  f"{tick:>10.4f}  {t:>10.4f}")
-        elif i == 6:
-            print(f"  {'... [middle layers omitted] ...':>20}")
+    for i, c in enumerate(costs):
+        end_io += c.total_io
+        cmp_start = max(end_cmp, end_io)
+        stall = max(0.0, end_io - end_cmp)
+        if i > 0 and stall > 0:
+            cum_stalled += stall
+        end_cmp = cmp_start + c.total_compute
+        cum_compute += c.total_compute
+        note = ("IO-bound" if cmp_start > end_cmp - c.total_compute - 1e-12
+                and end_io > (end_cmp - c.total_compute - 1e-9)
+                else "")
+        # Simpler note: which constraint set cmp_start
+        note = "IO-stall" if end_io > (end_cmp - c.total_compute) + 1e-9 else "compute"
+        if i == 0:
+            note = "cold-IO"
+        if i < 6 or i >= len(costs) - 4 or c.kind == "F":
+            print(f"  {i:>3}  {c.kind:>4}  {c.total_io:>8.4f}  {c.total_compute:>8.4f}  "
+                  f"{end_io:>9.4f}  {cmp_start:>10.4f}  {end_cmp:>9.4f}  {note:>14}")
+    cold = costs[0].total_io
+    io_total = end_io
     print(f"\n  Σ compute        = {cum_compute:>10.4f} ms")
-    print(f"  Σ io (incl cold) = {cum_io:>10.4f} ms")
-    print(f"  Σ overlapped     = {cum_overlap:>10.4f} ms")
-    print(f"  io_exposed       = {cum_io - cum_overlap:>10.4f} ms")
-    print(f"  pipeline total   = {t:>10.4f} ms")
+    print(f"  Σ IO (back-to-back) = {io_total:>10.4f} ms")
+    print(f"  Cold IO (layer 0)   = {cold:>10.4f} ms")
+    print(f"  IO stall after cold = {cum_stalled:>10.4f} ms")
+    print(f"  Total IO exposed    = {(end_cmp - cum_compute):>10.4f} ms")
+    print(f"  Pipeline total      = {end_cmp:>10.4f} ms")
+    print(f"  Identity check: end_cmp == compute_total + io_exposed   "
+          f"({end_cmp:.4f} == {cum_compute + (end_cmp - cum_compute):.4f})")
 
 
 def _check(label: str, lhs: float, rhs: float, tol: float = 1e-6) -> None:
@@ -109,19 +193,12 @@ def _validate_one(mode: str, f_period: int, tables) -> None:
     print("\n  Identity checks:")
     io_total_summed = sum(c.total_io for c in costs)
     cmp_total_summed = sum(c.total_compute for c in costs)
-    io_exposed_closed = costs[0].total_io + sum(
-        max(0.0, (costs[i + 1].total_io if i + 1 < len(costs) else 0.0) - costs[i].total_compute)
-        for i in range(len(costs))
-    )
-
     _check("Σ layer IO == pipe.io_total_ms", io_total_summed, pipe["io_total_ms"])
     _check("Σ layer compute == pipe.compute_total_ms", cmp_total_summed, pipe["compute_total_ms"])
-    _check("io_exposed == io_total - hidden",
-           pipe["io_total_ms"] - pipe["io_hidden_ms"], pipe["io_exposed_ms"])
-    _check("io_exposed == closed-form sum",
-           pipe["io_exposed_ms"], io_exposed_closed)
     _check("pipe_total == compute_total + io_exposed",
            pipe["total_ms"], pipe["compute_total_ms"] + pipe["io_exposed_ms"])
+    _check("io_exposed >= cold_start (cold IO is always exposed)",
+           min(pipe["io_exposed_ms"], pipe["cold_start_ms"]), pipe["cold_start_ms"])
 
     sim = simulate(SEQ_LEN, BATCH_SIZE, mode, f_period, tables=tables)
     _check("simulate() agrees with manual pipe.total_ms",
@@ -132,6 +209,47 @@ def _validate_one(mode: str, f_period: int, tables) -> None:
           f"   ({pipe['total_ms'] / 1000:.4f} s per decode token)")
 
 
+def _e2e_comparison(tables) -> None:
+    """End-to-end DSA vs IndexCache time comparison across regimes."""
+    _print_header("End-to-end DSA vs IndexCache time comparisons (per decode step)")
+    print(f"  Pipeline model: producer/consumer with deep prefetch buffer.")
+    print(f"  Each cell = ms per decode step (single H100 SXM, all 61 layers).\n")
+
+    scenarios = [
+        # (label, seq_len, bs)
+        ("4K  / BS=1",   4 * 1024,         1),
+        ("32K / BS=1",   32 * 1024,        1),
+        ("128K / BS=1",  128 * 1024,       1),
+        ("200K / BS=1",  200 * 1024,       1),
+        ("512K / BS=1",  512 * 1024,       1),
+        ("1M  / BS=1",   1024 * 1024,      1),
+        ("32K / BS=16",  32 * 1024,       16),
+        ("128K / BS=16", 128 * 1024,      16),
+        ("200K / BS=16", 200 * 1024,      16),
+        ("128K / BS=64", 128 * 1024,      64),
+        ("200K / BS=64", 200 * 1024,      64),
+    ]
+
+    for mode in ("hbm", "offload"):
+        print(f"  ── mode = {mode} " + "─" * (76 - len(mode)))
+        print(f"  {'scenario':>14}  | {'DSA pipe':>9}  {'IC pipe':>9}  "
+              f"{'speedup':>8}  | {'DSA io':>8}  {'IC io':>8}  "
+              f"{'compute':>8}  {'IC stall':>9}")
+        print("  " + "-" * 88)
+        for label, sl, bs in scenarios:
+            dsa = simulate(sl, bs, mode, f_period=1, tables=tables)
+            ic = simulate(sl, bs, mode, f_period=4, tables=tables)
+            print(f"  {label:>14}  | "
+                  f"{dsa['ic_pipe_total_ms']:>9.2f}  "
+                  f"{ic['ic_pipe_total_ms']:>9.2f}  "
+                  f"{dsa['ic_pipe_total_ms']/ic['ic_pipe_total_ms']:>7.2f}x  | "
+                  f"{dsa['ic_io_total_ms']:>8.2f}  "
+                  f"{ic['ic_io_total_ms']:>8.2f}  "
+                  f"{ic['ic_compute_total_ms']:>8.2f}  "
+                  f"{ic['ic_io_exposed_ms']:>9.2f}")
+        print()
+
+
 def main() -> None:
     print(f"IndexCache validation — single request, seq_len = 200K ({SEQ_LEN:,} tokens), "
           f"BS = {BATCH_SIZE}")
@@ -139,24 +257,13 @@ def main() -> None:
 
     tables = load_profiles()
 
+    _print_variables(SEQ_LEN, BATCH_SIZE)
+
     for mode in ("hbm", "offload"):
         for fp in (1, 4):
             _validate_one(mode, fp, tables)
 
-    # Final cross-mode summary
-    _print_header("Cross-mode comparison @ 200K, BS=1")
-    print(f"  {'mode':>8}  {'f_period':>8}  {'compute':>9}  {'io_total':>9}  "
-          f"{'io_exposed':>11}  {'pipe_total':>11}  {'speedup':>8}")
-    print("  " + "-" * 80)
-    rows = []
-    for mode in ("hbm", "offload"):
-        for fp in (1, 4):
-            r = simulate(SEQ_LEN, BATCH_SIZE, mode, fp, tables=tables)
-            rows.append(r)
-            print(f"  {mode:>8}  {fp:>8}  {r['ic_compute_total_ms']:>9.3f}  "
-                  f"{r['ic_io_total_ms']:>9.3f}  {r['ic_io_exposed_ms']:>11.3f}  "
-                  f"{r['ic_pipe_total_ms']:>11.3f}  {r['speedup_pipe']:>7.3f}x")
-    print()
+    _e2e_comparison(tables)
 
 
 if __name__ == "__main__":
