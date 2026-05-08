@@ -115,7 +115,7 @@ compute** and is fully overlapped.
 
 ### How much IO can compute hide?
 
-`reports/figures/indexcache/fig_io_exposed_dual.png` shows the **ms of
+![fig1](figures/indexcache/fig_io_exposed_dual.png) shows the **ms of
 IO that compute could not hide**, as a heatmap of (seq_len × BS) for
 each F-period and each placement mode. Three regimes:
 
@@ -132,7 +132,7 @@ each F-period and each placement mode. Three regimes:
 
 ### Speedup heatmap (fp=4, dual stream)
 
-`reports/figures/indexcache/fig_speedup_fp4_dual.png`:
+![fig2](figures/indexcache/fig_speedup_fp4_dual.png):
 
 - **HBM mode**: 1.00–1.74× over DSA. Speedup grows with seq_len because
   even on HBM, a 2 GB indexer read at 1M seq_len + BS=64 takes ~24 ms
@@ -145,7 +145,7 @@ each F-period and each placement mode. Three regimes:
 
 ### Per-step compute vs IO breakdown
 
-`fig_overlap_offload_bs16.png` (BS=16, offload, dual policy) shows that
+![fig3](figures/indexcache/fig_overlap_offload_bs16.png) (BS=16, offload, dual policy) shows that
 at this batch size:
 
 - All-F DSA's IO cost crosses compute at **sl ≈ 32K** and grows linearly
