@@ -6,9 +6,11 @@ We simulate decode on DeepSeek-V3 (61 layers, MLA + DSA + MoE) with the
 **IndexCache** scheme from arXiv:2603.12201, which partitions DSA layers
 into **F (Full)** layers that re-run the lightning indexer and **S
 (Shared)** layers that reuse the most recent F layer's top-k. With
-F:S:S:S (75% indexer skip) and a double-buffered cross-layer prefetch
-schedule, the simulated pipelined decode-step latency on H100 SXM
-improves over the all-F DSA baseline by:
+F:S:S:S (75% indexer skip), a producer/consumer pipeline with a deep
+prefetch buffer (the IO bus runs back-to-back across layers; compute
+waits only when cumulative IO falls behind), and within-layer
+`block_a ‖ block_b` overlap, the simulated decode-step latency on H100
+SXM improves over the all-F DSA baseline by:
 
 | seq_len | BS  | mode    | DSA pipelined | IndexCache pipelined | speedup |
 |--------:|----:|---------|--------------:|---------------------:|--------:|
@@ -253,76 +255,102 @@ extreme corner BS=64/sl=1M with all-F, that's 16 × 64 × 1M × 512 B =
 
 ### How much IO can compute hide?
 
-![fig1](figures/indexcache/fig_io_exposed.png) shows the **ms of
-IO that compute could not hide**, as a heatmap of (seq_len × BS) for
-each F-period and each placement mode. Three regimes:
+![fig1](figures/indexcache/fig_io_exposed.png) shows the **ms of IO
+exposed per decode step** (= `pipeline_total − compute_total`, i.e.
+the time compute spent stalled on IO, including the cold start) as a
+heatmap of (seq_len × BS) for each F-period and each placement mode.
+Three regimes:
 
-1. **All-HBM, any pattern** — IO is well below compute up to ~256K
-   context; exposed IO is sub-millisecond. Pipelining is essentially
-   free.
-2. **Offload + short context (≤16K)** — exposed IO is small even with
-   all-F DSA; IndexCache's gain here is marginal (≤1.02×).
-3. **Offload + long context (≥64K) + non-trivial BS** — DSA's all-F
-   pattern leaves *seconds* of exposed IO per step. IndexCache cuts
-   that exposure by 4× simply by removing 75% of indexer reads, but
-   the remaining indexer reads from F layers grow linearly with
-   `seq_len * BS`, eventually overflowing compute again.
+1. **HBM, any pattern** — exposed IO is dominated by the cold-start
+   prefetch (one F-layer worth, ≈ 0.085 ms at sl=200K BS=1, scaling
+   linearly with `BS × seq_len`). Compute is the bottleneck almost
+   everywhere; pipelining is essentially free.
+2. **Offload + short context (≤16K)** — exposed IO is sub-millisecond
+   even with all-F DSA; IndexCache's gain is marginal or slightly
+   negative (block_a-hide effect, see HBM table).
+3. **Offload + long context (≥128K) + non-trivial BS** — all-F DSA
+   leaves seconds of exposed IO per step. IndexCache F:S:S:S cuts the
+   *total* IO traffic by ~4× (45 of 61 layers no longer pay any
+   indexer-K read), and with the deep prefetch buffer the saved IO is
+   spread across all the S-layer compute slots, so most of the
+   remaining IO stays hidden.
 
 ### Speedup heatmap (fp=4, F:S:S:S)
 
 ![fig2](figures/indexcache/fig_speedup_fp4.png)
 
-- **HBM mode**: 1.00–1.74× over DSA. Speedup grows with seq_len because
-  even on HBM, a 2 GB indexer read at 1M seq_len + BS=64 takes ~24 ms
-  (61 × ~0.4 ms), comparable to compute.
-- **Offload mode**: 1.01× at 4K → 3.65× at 1M. Saturation near 3.7× is
-  the asymptote: with 1 F per 4 layers and IO-bound regime, removing
-  3/4 of the dominant indexer-K traffic gives a hard 4× ceiling on the
-  IO-only cost; the remaining `compute + io_F` keeps the realised
-  speedup just below 4×.
+- **HBM mode**: 0.99–1.02×. At small BS, IndexCache loses the
+  block_a-in-IO hide on S layers and is ~1–5% slower than DSA. At
+  BS≥16 the IO savings overtake the lost overlap and IC pulls ahead
+  by ~1–2%. Either way HBM is compute-bound, so IndexCache neither
+  helps nor hurts much.
+- **Offload mode**: 0.98× at 4K (block_a-hide effect dominates) →
+  ~1.7× at 64K BS=1 → **3.75× at 1M, any BS**. Saturation at
+  `1 / (n_F / N) = 1 / (16/61) = 3.81×` is the F:S:S:S asymptote;
+  the realised 3.75× shaves a small constant for cold-start +
+  last-layer-compute tail.
 
 ### Per-step compute vs IO breakdown
 
-![fig3](figures/indexcache/fig_overlap_offload_bs16.png) (BS=16, offload, IDX+KV share IO bus) shows that
-at this batch size:
+![fig3](figures/indexcache/fig_overlap_offload_bs16.png) (BS=16, offload):
 
-- All-F DSA's IO cost crosses compute at **sl ≈ 32K** and grows linearly
-  past it. Past that point, every additional doubling of context
-  doubles step latency.
-- F:S:S:S pushes the crossover to **sl ≈ 128K** — exactly the 4× shift
-  expected from the indexer-cache reduction.
-- F:S^7 (fp=8) pushes it to **sl ≈ 256K** but with diminishing returns:
-  the F-layer IO is unchanged; we just have fewer F layers per step,
-  and KV gather (which scales with BS but not the F/S split) starts to
-  matter.
+- All-F DSA's *total* IO crosses *total* compute at **sl ≈ 8K** at
+  BS=16 (the `BS × seq_len ≤ 85K` bound from the next section). Past
+  that point, every doubling of context doubles step latency.
+- F:S:S:S extends the crossover to **sl ≈ 32K** at BS=16 (4× the DSA
+  bound, since IC keeps only n_F/N = 16/61 of the DSA IO traffic).
+- F:S^7 extends it to **sl ≈ 64K** but with diminishing returns —
+  KV gather (61 layers' worth, untouched by the F/S split) begins to
+  matter once indexer-K is sufficiently amortised.
 
 ## When does IO fully hide in compute?
 
-IO is fully hidden when, for every F layer, `compute_per_layer ≥
-(idx_io + kv_io)_F`. Equivalently:
+Under the producer/consumer schedule with deep prefetch, IO is fully
+hidden (modulo the unavoidable cold start) iff **total IO ≤ total
+compute** across all 61 layers. The deep buffer absorbs per-layer
+spikes — the old "compute_per_layer ≥ io_per_F_layer" rule was a
+1-layer-lookahead artefact. The correct condition is:
 
 ```
-seq_len * BS  ≤  (compute_per_layer / INDEXER_K_BYTES_PER_TOKEN) * pcie_BW
+n_F · idx_io_F  +  N · kv_io  ≤  Σ_i T_compute_layer_i
 ```
 
-Plugging in `compute ≈ 0.79 ms`, `INDEXER_K = 512 B/token`, and
-`PCIe = 51.5 GB/s`:
+For a fixed F-period `k`, `n_F = ⌈N/k⌉`. Plugging in offload PCIe
+(51.5 GB/s, 512 B/token indexer K), per-layer compute ≈ 0.79 ms, and
+ignoring the small KV gather:
 
-```
-seq_len * BS  ≤  ~83 K tokens   (offload, BS=1 boundary at sl ≈ 80K)
-```
+| variant | `n_F` (of 61) | total compute | bound on `BS × seq_len` |
+|---|---:|---:|---:|
+| DSA (all-F)         | 61 | ~48 ms | **≤ 85 K tokens** |
+| IndexCache F:S:S:S  | 16 | ~46 ms | **≤ 305 K tokens** |
+| IndexCache F:S^7    |  8 | ~46 ms | **≤ 600 K tokens** |
 
-This matches the simulator: at 64K × 1, exposed IO is 0.6 ms (95%
-hidden); at 128K × 1, exposed jumps to 7.7 ms (35% hidden).
+So IndexCache F:S:S:S gives a **3.6× larger fully-hidden region** in
+offload mode — exactly the IO-traffic reduction ratio. Inside the
+region, DSA and IndexCache deliver the same step latency (~46 ms,
+compute-bound). Outside the region, step latency grows linearly with
+`BS × seq_len`, with IndexCache's slope exactly `n_F / N` of DSA's.
 
-In HBM mode the bound shifts to:
+Validation against the simulator at BS=1 offload:
 
-```
-seq_len * BS  ≤  ~2.2 M tokens
-```
+| seq_len | DSA stall | IC stall | regime          |
+|---:|---:|---:|---|
+| 64K  | 0.6 ms (cold)  | 0.7 ms (cold)  | both compute-bound, BS·sl=64K < 85K |
+| 128K | 33.3 ms        | 1.27 ms (cold) | DSA IO-bound (sl > 85K); IC compute-bound (< 305K) |
+| 200K | 75.6 ms        | 1.95 ms (cold) | same |
+| 512K | 256 ms         | 37.6 ms        | both IO-bound (sl > 305K) |
+| 1M   | 552 ms         | 115 ms         | both deeply IO-bound |
 
-so all-HBM placement effectively hides every indexer read until you
-either run out of HBM (~80 GB) or push past 1M context with batch.
+In HBM mode (1384 GB/s) the same calculation gives:
+
+| variant | bound on `BS × seq_len` (HBM) |
+|---|---:|
+| DSA            | **≤ ~2.1 M tokens** |
+| F:S:S:S        | **≤ ~8.2 M tokens** |
+
+At 80 GB HBM you can never hold the full indexer K cache for `BS ×
+seq_len > ~150 M` (just the indexer K alone, ignoring weights and KV)
+so the HBM bandwidth bound essentially never bites in practice.
 
 ## Insights for GPU-initiated IO
 
@@ -353,30 +381,40 @@ stall. The PCIe bandwidth itself is unchanged (one link, IDX and KV
 still serialise), so the savings are exactly the eliminated host
 synchronisation latency, not a parallelisation of IO.
 
-### 3. The right metric for "should I prefetch?" is per-F-layer compute
+### 3. The right metric for "should I prefetch?" is total IO vs total compute
 
-A single S layer has KV-gather IO of a few hundred microseconds, well
-under a per-layer compute of ~3 ms at BS=16. The IO/compute decision
-collapses to the F-layer question alone: can compute of *one* layer
-hide the indexer-K read of *one* F layer? Once per_F_io exceeds
-per_layer_compute, no amount of S-layer slack helps — the F layer is
-on the critical path. This is why the speedup curve flattens at ~3.7×
-(asymptote of 4× minus residual F overhead) rather than continuing to
-improve as seq_len grows.
+With a deep prefetch buffer, S-layer slack accumulates and absorbs
+F-layer IO spikes. The fully-hidden bound is therefore **total IO ≤
+total compute** across all 61 layers, not per-F-layer. Concretely,
+F:S:S:S works at sl=200K BS=1 offload (where F-layer IO of 1.95 ms is
+~2.5× per-layer compute of 0.79 ms) because the three S-layer compute
+slots (~2.18 ms cumulative) cover the next F-layer's prefetch.
 
-A practical implication: the optimal F-period may want to *grow with
-seq_len* — at 4K context, fp=2 is fine; at 1M context, fp=8 is needed
-to keep F-layer IO below per-layer compute. The paper's fixed F:S:S:S
-is a reasonable midpoint but not optimal at the extremes.
+The asymptotic IndexCache speedup is therefore exactly **`1 / (n_F /
+N) = N / n_F`** in the IO-bound limit (here 61/16 ≈ 3.81×, realised
+3.75×). Pushing F-period higher (fp=8 → 4.6×, fp=16 → 7.6×) gives
+correspondingly larger speedup ceilings, at the cost of indexer
+freshness. The paper's fixed F:S:S:S is a reasonable midpoint but for
+1M context one could push fp=8 if the accuracy budget allows.
 
-### 4. Cold start = `io_first`
+### 4. Cold start = one F-layer IO
 
-The pipeline pays one full F-layer IO at step start; this is
-unavoidable without speculative prefetch from a *previous* decode step.
-At 1M context BS=64 offload, this cold start is `idx_io + kv_io ≈ 624
-ms` — worth ~6% of step latency. Cross-step persistent prefetch state
-(reuse the previous step's selected KV when ranks haven't shifted)
-could remove this; we did not model that.
+The pipeline pays exactly **one F-layer's idx_io + kv_io** at step
+start; no preceding compute exists to hide it behind. Concrete numbers
+(F-layer cold-start in offload mode):
+
+| BS × seq_len | idx_io_F | kv_io_F | total cold |
+|---|---:|---:|---:|
+| 1   × 200K  | 1.90 ms  | 0.05 ms | 1.95 ms |
+| 1   × 1M    | 9.71 ms  | 0.05 ms | 9.76 ms |
+| 16  × 200K  | 30.4 ms  | 0.85 ms | 31.2 ms |
+| 64  × 1M    | 621 ms   | 3.4 ms  | 624 ms  |
+
+At small `BS × seq_len` this is sub-ms and irrelevant. At BS=64
+sl=1M the 624 ms cold start is ~6% of the 10 160 ms IndexCache step
+latency. **Cross-step persistent prefetch** — reuse the previous
+step's selected KV positions when the indexer's top-k hasn't shifted
+much — could remove this; we did not model that.
 
 ## Reproducing
 
