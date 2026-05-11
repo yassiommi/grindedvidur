@@ -192,15 +192,131 @@ TP=4 for the 200K/BS=1 corner).
 
 ### PP=4 TP=4 EP=8 — HBM mode
 
+| scenario     | mem/rank | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K / BS=1    |  43.9 GB |   17.92 |   18.38 | 0.98× |  17.92 |  18.38 |   55.8 |   54.4 |
+| 200K / BS=1  |  48.8 GB |   17.98 |   18.44 | 0.98× |  17.98 |  18.44 |   55.6 |   54.2 |
+| 512K / BS=1  |  56.8 GB |   18.09 |   18.55 | 0.98× |  18.09 |  18.55 |   55.3 |   53.9 |
+| 1M   / BS=1  |  69.8 GB |   19.51 |   18.73 | 1.04× |  19.51 |  18.73 |   51.2 |   53.4 |
+| 4K   / BS=8  |  44.6 GB |   75.42 |   75.45 | 1.00× |  75.42 |  75.45 |  106.1 |  106.0 |
+| 32K  / BS=8  |  50.3 GB |   75.49 |   75.52 | 1.00× |  75.49 |  75.52 |  106.0 |  105.9 |
+| 128K / BS=8  |  69.8 GB |   75.76 |   75.79 | 1.00× |  75.76 |  75.79 |  105.6 |  105.6 |
+| 4K   / BS=32 |  47.0 GB |  244.11 |  242.25 | 1.01× | 244.11 | 242.25 |  131.1 |  132.1 |
+| 32K  / BS=32 |  69.8 GB |  244.42 |  242.57 | 1.01× | 244.42 | 242.57 |  130.9 |  131.9 |
+
+HBM mode is *compute-bound everywhere we tested*. The HBM bus reads
+the indexer K and KV-gather fast enough that compute (block_c +
+expert_gemm + ep_comms + …) is always the longer pole. IndexCache
+saves IO that wasn't on the critical path, so the speedup is 1.00×
+at BS≥8 and slightly negative (0.98×) at BS=1 due to the lost
+`block_a‖idx_io` within-layer overlap on the S layers. Only at
+BS=1/sl=1M does HBM IO finally grow large enough for IndexCache to
+nose ahead (1.04×).
+
+### PP=4 TP=2 EP=8 — HBM mode
+
+Same workloads at TP=2:
+
 | scenario     | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
 |--------------|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
-| 4K / BS=1    |   17.92 |   18.38 | 0.98× | 17.92 | 18.38 | 55.8 | 54.4 |
-| 200K / BS=1  |   17.98 |   18.44 | 0.98× | 17.98 | 18.44 | 55.6 | 54.2 |
-| 512K / BS=1  |   18.09 |   18.55 | 0.98× | 18.09 | 18.55 | 55.3 | 53.9 |
-| 1M / BS=1    |   19.51 |   18.73 | 1.04× | 19.51 | 18.73 | 51.2 | 53.4 |
+| 4K   / BS=1  |   28.85 |   29.30 | 0.98× |  28.85 |  29.30 |   34.7 |   34.1 |
+| 200K / BS=1  |   27.36 |   28.95 | 0.94× |  27.36 |  28.95 |   36.6 |   34.5 |
+| 1M   / BS=1  |   27.65 |   29.24 | 0.95× |  27.65 |  29.24 |   36.2 |   34.2 |
+| 4K   / BS=8  |  121.30 |  120.97 | 1.00× | 121.30 | 120.97 |   65.9 |   66.1 |
+| 32K  / BS=8  |  119.88 |  120.65 | 0.99× | 119.88 | 120.65 |   66.7 |   66.3 |
+| 128K / BS=8  |  120.15 |  120.92 | 0.99× | 120.15 | 120.92 |   66.6 |   66.2 |
+| 4K   / BS=32 |  408.72 |  405.01 | 1.01× | 408.72 | 405.01 |   78.3 |   79.0 |
+| 32K  / BS=32 |  409.04 |  405.32 | 1.01× | 409.04 | 405.32 |   78.2 |   78.9 |
 
-HBM mode is compute-bound except at sl≥1M. IndexCache then has nothing
-to save and the lost block_a‖idx_io overlap on S layers costs ~2-3%.
+Same story. The big takeaway: **in HBM mode you don't need
+IndexCache** — compute is the bottleneck regardless of context length
+in the regime that fits an 80 GB H100.
+
+## FP8 path (matches DeepSeek-V3.2-Exp production)
+
+Adding FP8 for weights and KV cache (1 byte/element instead of FP16's
+2). Indexer K is FP8 in both paths (unchanged). Net effect:
+
+- **Per-rank memory roughly halves**: at PP=4 TP=4 EP=8 BS=1 sl=200K,
+  total goes from 48.84 GB → **25.20 GB**. The 21 GB expert weights
+  become 10.5 GB; non-expert weights 1.76 → 0.88 GB; KV 3.52 → 1.76 GB;
+  IDX unchanged at 1.56 GB.
+- **Per-layer compute decreases** since most GEMMs are HBM-weight-read-
+  bound at BS=1 and reads halve. F-layer T_compute at TP=1 drops from
+  0.755 ms (FP16) to 0.467 ms (FP8). The non-halvable floor is
+  `ep_comms + ep_dispatch` (NVLink, 0.080 ms).
+- **Indexer-K IO is unchanged** because it was already FP8. So the
+  *relative* IO/compute ratio goes up under FP8 — IndexCache wins
+  slightly more.
+
+Hand-verified FP8 memory at PP=4 TP=4 EP=8 BS=1 sl=200K (all 5 checks pass):
+
+```
+KV   = 16 layers × 1 × 200K × 576 B = 1.76 GB
+IDX  = 16 layers × 1 × 200K × 512 B = 1.56 GB
+nonW = 16 × 225.25 MB / 4 (TP)       = 0.88 GB
+expW = 16 × 10.5 GB     / 8 (EP)     = 21.00 GB
+Total                                = 25.20 GB
+```
+
+### PP=4 TP=4 EP=8 — FP8 — offload mode
+
+| scenario     | mem/rank | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  22.0 GB |   12.23 |   12.11 | 1.01× |  12.23 |  12.11 |   81.8 |   82.6 |
+| 32K  / BS=1  |  22.4 GB |   14.45 |   12.38 | 1.17× |  14.45 |  12.38 |   69.2 |   80.8 |
+| 128K / BS=1  |  24.0 GB |   29.01 |   14.88 | 1.95× |  29.01 |  14.88 |   34.5 |   67.2 |
+| **200K / BS=1** | **25.2 GB** | **39.94** | **17.61** | **2.27×** | **39.94** | **17.61** | **25.0** | **56.8** |
+| 512K / BS=1  |  30.4 GB |   87.27 |   29.44 | 2.96× |  87.27 |  29.44 |   11.5 |   34.0 |
+| 1M   / BS=1  |  38.9 GB |  164.94 |   48.86 | 3.38× | 164.94 |  48.86 |    6.1 |   20.5 |
+| 4K   / BS=8  |  22.4 GB |   43.92 |   43.42 | 1.01× |  43.92 |  43.42 |  182.1 |  184.3 |
+| 32K  / BS=8  |  26.1 GB |   74.98 |   46.95 | 1.60× |  74.98 |  46.95 |  106.7 |  170.4 |
+| 128K / BS=8  |  38.9 GB |  191.49 |   76.07 | 2.52× | 191.49 |  76.07 |   41.8 |  105.2 |
+| 4K   / BS=32 |  24.0 GB |  138.46 |  136.60 | 1.01× | 138.46 | 136.60 |  231.1 |  234.3 |
+| 32K  / BS=32 |  38.9 GB |  271.85 |  158.00 | 1.72× | 271.85 | 158.00 |  117.7 |  202.5 |
+
+### PP=4 TP=2 EP=8 — FP8 — offload mode
+
+| scenario     | mem/rank | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  22.8 GB |   17.68 |   17.84 | 0.99× |  17.68 |  17.84 |   56.6 |   56.1 |
+| 200K / BS=1  |  26.1 GB |   44.05 |   22.21 | 1.98× |  44.05 |  22.21 |   22.7 |   45.0 |
+| 1M   / BS=1  |  39.8 GB |  169.05 |   53.46 | 3.16× | 169.05 |  53.46 |    5.9 |   18.7 |
+| 32K / BS=8   |  27.0 GB |   94.12 |   70.41 | 1.34× |  94.12 |  70.41 |   85.0 |  113.6 |
+| 128K / BS=8  |  39.8 GB |  210.63 |   96.05 | 2.19× | 210.63 |  96.05 |   38.0 |   83.3 |
+| 32K / BS=32  |  39.8 GB |  342.66 |  237.15 | 1.44× | 342.66 | 237.15 |   93.4 |  134.9 |
+
+### PP=4 TP=4 EP=8 — FP8 — HBM mode
+
+| scenario     | mem/rank | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  22.0 GB |   12.19 |   12.20 | 1.00× |  12.19 |  12.20 |   82.0 |   82.0 |
+| 200K / BS=1  |  25.2 GB |   12.25 |   12.25 | 1.00× |  12.25 |  12.25 |   81.7 |   81.6 |
+| 1M   / BS=1  |  38.9 GB |   15.19 |   12.54 | 1.21× |  15.19 |  12.54 |   65.8 |   79.7 |
+| 4K   / BS=8  |  22.4 GB |   43.44 |   43.05 | 1.01× |  43.44 |  43.05 |  184.2 |  185.8 |
+| 32K  / BS=8  |  26.1 GB |   43.51 |   43.13 | 1.01× |  43.51 |  43.13 |  183.9 |  185.5 |
+| 128K / BS=8  |  38.9 GB |   43.78 |   43.40 | 1.01× |  43.78 |  43.40 |  182.7 |  184.3 |
+| 4K   / BS=32 |  24.0 GB |  136.47 |  134.61 | 1.01× | 136.47 | 134.61 |  234.5 |  237.7 |
+| 32K  / BS=32 |  38.9 GB |  136.78 |  134.93 | 1.01× | 136.78 | 134.93 |  233.9 |  237.2 |
+
+### Key observations under FP8
+
+- **At BS=1 sl=200K**, FP8 speeds up *both* DSA (44.7 → 39.9 ms) and
+  IndexCache (22.6 → 17.6 ms), and IndexCache's relative speedup grows
+  to **2.27×** (FP16 was 1.98×). Why: compute halves but indexer-K IO
+  doesn't, so the IO/compute ratio rises and IC's IO savings matter
+  more.
+- **TPOT for a single BS=1 user at 200K context**: FP16 DSA = 44.7 ms
+  (22 tok/s) → FP8 DSA = 39.9 ms (25 tok/s) → FP8 IC = 17.6 ms
+  (57 tok/s). FP8 + IndexCache together give a **2.5× tok/s lift**
+  over FP16 DSA.
+- **Memory headroom is huge under FP8**: 25.2 GB / rank at BS=1
+  sl=200K vs 48.8 GB / rank under FP16. PP=4 EP=8 FP8 fits BS=1
+  sl=1M comfortably (38.9 GB) — the entire workload could probably
+  drop to PP=2 EP=8 FP8 (which DeepSeek's production stack actually
+  does). At PP=2 EP=8 FP8 BS=1 sl=200K, per-rank ~50 GB — fits cleanly.
+- **HBM mode is compute-bound everywhere** under FP8 too (1.00× IC
+  speedup at BS≥8). Same story as FP16 HBM.
 
 ## Validation summary
 

@@ -55,6 +55,18 @@ GB = 1024 ** 3
 MB = 1024 ** 2
 
 # ─────────────────────────────────────────────────────────────────────
+# Precision (default FP16 baseline; FP8 path used by *_fp8 variants)
+# ─────────────────────────────────────────────────────────────────────
+# Weight bytes per element.
+W_BYTES_FP16 = 2
+W_BYTES_FP8  = 1
+# MLA KV bytes per element (latent + RoPE). DeepSeek-V3.2-Exp uses FP8
+# for the latent, with a small FP16 footprint for the decoupled RoPE
+# key. We model FP8 KV as 1 byte/elem for simplicity (576 B/token).
+KV_BYTES_FP16 = 2
+KV_BYTES_FP8  = 1
+
+# ─────────────────────────────────────────────────────────────────────
 # DeepSeek-V3 architecture constants
 # ─────────────────────────────────────────────────────────────────────
 NUM_LAYERS          = 61
@@ -198,7 +210,8 @@ class AnalyticalLayerCost:
                 + self.moe_ep_comms_ms)
 
 
-def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8) -> AnalyticalLayerCost:
+def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8,
+                       fp8: bool = False) -> AnalyticalLayerCost:
     """One F (Full) decode layer at (seq_len, bs, mode), TP=1 baseline.
 
     Hand-checked at BS=1 sl=200K offload:
@@ -227,23 +240,35 @@ def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8) -> Analyti
         moe_expert_gemm: 84 MB / HBM ≈ 0.058 ms (1 active expert per rank avg)
         moe_ep_comms   : 2 × 8 × 5 us = 0.08 ms
     """
+    # FP8 path: weights, KV cache, decompressed-KV activations halve.
+    # Indexer K is already FP8 in both paths.
+    w_scale = 0.5 if fp8 else 1.0
+    kv_bytes = (KV_LORA_RANK + QK_ROPE) * (1 if fp8 else 2)  # 576 B or 1152 B per token
+
     # --- IO stream ---
     idx_io = io_ms(bs * seq_len * INDEXER_K_BYTES_PER_TOKEN, mode)
-    kv_io  = io_ms(bs * DSA_ATTENDED * MLA_KV_BYTES_PER_TOKEN, mode)
+    kv_io  = io_ms(bs * DSA_ATTENDED * kv_bytes, mode)
 
-    # --- Block A: Q projection on new BS token(s) ---
-    pre_norm = hbm_ms(bs * HIDDEN * 2 * 2)            # read + write
-    q_down   = gemm_ms(bs, HIDDEN, Q_LORA_RANK)
-    q_up     = gemm_ms(bs, Q_LORA_RANK, Q_TOTAL_DIM)
-    rope     = hbm_ms(bs * NUM_HEADS * QK_ROPE * 2 * 2)
-    kv_down  = gemm_ms(bs, HIDDEN, KV_LORA_RANK + QK_ROPE)  # new token's KV
-    block_a  = pre_norm + q_down + q_up + rope + kv_down
+    # --- Block A: Q projection on new BS token(s) (weights × w_scale) ---
+    pre_norm = hbm_ms(bs * HIDDEN * 2 * 2)            # read + write activations (FP16)
+    q_down   = gemm_ms(bs, HIDDEN, Q_LORA_RANK) * w_scale + hbm_ms(0) * (1 - w_scale)
+    # The cleaner expression: GEMM time is max(compute, weight HBM read).
+    # At BS=1 we're memory-bound on weights, so halving weights halves time.
+    # We just multiply the result by w_scale (within the BS=1 regime which is
+    # what all our scenarios fall into for non-attended-token GEMMs).
+    q_down = gemm_ms(bs, HIDDEN, Q_LORA_RANK) * w_scale
+    q_up   = gemm_ms(bs, Q_LORA_RANK, Q_TOTAL_DIM) * w_scale
+    rope   = hbm_ms(bs * NUM_HEADS * QK_ROPE * 2 * 2)
+    kv_down = gemm_ms(bs, HIDDEN, KV_LORA_RANK + QK_ROPE) * w_scale
+    block_a = pre_norm + q_down + q_up + rope + kv_down
 
     # --- Block C: kv_up_proj on attended + attn-core + o_proj ---
-    kv_up    = gemm_ms(bs * DSA_ATTENDED, KV_LORA_RANK, KV_UP_OUT_DIM)
-    decompressed_kv_bytes = bs * DSA_ATTENDED * KV_UP_OUT_DIM * 2
+    # kv_up_proj reads the decompressed KV (also FP8 in FP8 path) and writes
+    # the heads-expanded form. At BS=1 the GEMM is memory-bound on weights too.
+    kv_up = gemm_ms(bs * DSA_ATTENDED, KV_LORA_RANK, KV_UP_OUT_DIM) * w_scale
+    decompressed_kv_bytes = bs * DSA_ATTENDED * KV_UP_OUT_DIM * (1 if fp8 else 2)
     attn_core = hbm_ms(decompressed_kv_bytes)
-    o_proj    = gemm_ms(bs, O_PROJ_IN_DIM, HIDDEN)
+    o_proj    = gemm_ms(bs, O_PROJ_IN_DIM, HIDDEN) * w_scale
     residual  = hbm_ms(bs * HIDDEN * 2 * 2)
     block_c   = kv_up + attn_core + o_proj + residual
 
@@ -253,17 +278,18 @@ def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8) -> Analyti
 
     # --- MoE shardable pieces ---
     moe_norm     = hbm_ms(bs * HIDDEN * 2 * 2)
-    router_gate  = gemm_ms(bs, HIDDEN, NUM_ROUTED_EXPERTS)
+    router_gate  = gemm_ms(bs, HIDDEN, NUM_ROUTED_EXPERTS) * w_scale
     router_sm    = max(0.005, 0.001 * bs)
     router_topk  = max(0.005, 0.04 * bs)
-    shared_exp_w = 3 * HIDDEN * EXPERT_INTERMEDIATE * 2
-    shared_exp   = max(gemm_ms(bs, HIDDEN, 3 * EXPERT_INTERMEDIATE), hbm_ms(shared_exp_w))
+    shared_exp_w = 3 * HIDDEN * EXPERT_INTERMEDIATE * (1 if fp8 else 2)
+    shared_exp_gemm_t = gemm_ms(bs, HIDDEN, 3 * EXPERT_INTERMEDIATE) * w_scale
+    shared_exp   = max(shared_exp_gemm_t, hbm_ms(shared_exp_w))
     moe_resid    = hbm_ms(bs * HIDDEN * 2 * 2)
     moe_shardable = (moe_norm + router_gate + router_sm + router_topk
                      + shared_exp + moe_resid)
 
-    # --- MoE expert GEMM (EP-only) ---
-    moe_expert_gemm = moe_expert_gemm_ms(bs, ep)
+    # --- MoE expert GEMM (EP-only). FP8 halves the weight read. ---
+    moe_expert_gemm = moe_expert_gemm_ms(bs, ep) * w_scale
 
     # --- MoE EP NVLink comms (dispatch + combine, two passes) ---
     # Each pass: NUM_EXPERTS_PER_TOK messages of size BS × HIDDEN × 2 B
@@ -283,14 +309,15 @@ def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8) -> Analyti
     )
 
 
-def analytical_layer_S(seq_len: int, bs: int, mode: str, ep: int = 8) -> AnalyticalLayerCost:
+def analytical_layer_S(seq_len: int, bs: int, mode: str, ep: int = 8,
+                       fp8: bool = False) -> AnalyticalLayerCost:
     """One S (Shared) decode layer. Identical to F minus idx_io and idx_comp.
 
     The MLA-KV gather still happens — S layers attend to the F layer's
     selected top-k positions, so they still need those 2560 tokens of KV
     decompressed.
     """
-    f = analytical_layer_F(seq_len, bs, mode, ep)
+    f = analytical_layer_F(seq_len, bs, mode, ep, fp8=fp8)
     return AnalyticalLayerCost(
         idx_io_ms=0.0, kv_io_ms=f.kv_io_ms,
         block_a_ms=f.block_a_ms, block_c_ms=f.block_c_ms, idx_comp_ms=0.0,
@@ -324,7 +351,8 @@ EXPERT_W_PER_LAYER_B = NUM_ROUTED_EXPERTS * 3 * HIDDEN * EXPERT_INTERMEDIATE * 2
 
 def per_rank_memory_bytes(pp: int, tp: int, ep: int,
                            seq_len: int, bs: int,
-                           n_layers: int = NUM_LAYERS) -> dict:
+                           n_layers: int = NUM_LAYERS,
+                           fp8: bool = False) -> dict:
     """Per-rank HBM footprint with the MLA duplication tax explicit.
 
     - PP shards layers (KV/IDX caches and weights scale /PP).
@@ -334,10 +362,13 @@ def per_rank_memory_bytes(pp: int, tp: int, ep: int,
     """
     import math
     layers_per_stage = math.ceil(n_layers / pp)
-    kv  = layers_per_stage * bs * seq_len * MLA_KV_BYTES_PER_TOKEN
+    # FP8 halves weights and KV cache. Indexer K is FP8 in both paths.
+    w_scale = 1 if not fp8 else 2  # divide weights by this; non-FP8 = no change
+    kv_bytes_per_token = (KV_LORA_RANK + QK_ROPE) * (1 if fp8 else 2)
+    kv  = layers_per_stage * bs * seq_len * kv_bytes_per_token
     idx = layers_per_stage * bs * seq_len * INDEXER_K_BYTES_PER_TOKEN
-    non_expert_w = layers_per_stage * NON_EXPERT_W_PER_LAYER_B // tp
-    expert_w     = layers_per_stage * EXPERT_W_PER_LAYER_B // ep
+    non_expert_w = layers_per_stage * NON_EXPERT_W_PER_LAYER_B // tp // w_scale
+    expert_w     = layers_per_stage * EXPERT_W_PER_LAYER_B // ep // w_scale
     return {
         "layers_per_stage": layers_per_stage,
         "kv": kv, "idx": idx,

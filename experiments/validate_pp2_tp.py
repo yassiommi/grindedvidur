@@ -121,14 +121,15 @@ def schedule_pp(layer_costs: list, pp: int, tp: int, n_layers: int = NUM_LAYERS)
 
 
 def build_pattern(n_layers: int, f_period: int,
-                  seq_len: int, bs: int, mode: str, ep: int) -> list:
+                  seq_len: int, bs: int, mode: str, ep: int,
+                  fp8: bool = False) -> list:
     """F:S:S:...:S layer cost list with the given f_period."""
     costs = []
     for i in range(n_layers):
         if i % f_period == 0:
-            costs.append(analytical_layer_F(seq_len, bs, mode, ep))
+            costs.append(analytical_layer_F(seq_len, bs, mode, ep, fp8=fp8))
         else:
-            costs.append(analytical_layer_S(seq_len, bs, mode, ep))
+            costs.append(analytical_layer_S(seq_len, bs, mode, ep, fp8=fp8))
     return costs
 
 
@@ -328,27 +329,81 @@ def main():
                   f"{dsa['stages'][0]['end']:>10.3f}  "
                   f"{ic['stages'][0]['end']:>10.3f}")
 
-    # Also HBM mode
+    # HBM mode — full scenario list (same memory feasibility as offload).
     hr("STEP 7 — Same scenarios but HBM mode (compute-bound, IO is cheap)")
     for tp in (2, 4):
         ep = 8
         print(f"\n  ── PP=4 TP={tp} EP={ep}  (HBM mode) ──")
-        print(f"  {'scenario':>14}  "
+        print(f"  {'scenario':>14}  {'mem GB':>7} {'fit?':>5}  "
               f"{'DSA step':>9} {'IC step':>9} {'speedup':>8}  "
               f"{'DSA TPOT':>9} {'IC TPOT':>9}  "
               f"{'DSA tok/s':>10} {'IC tok/s':>10}")
-        print("  " + "-" * 90)
-        for label, sl_i, bs_i in [(s[0], s[1], s[2]) for s in scenarios[:6]]:
+        print("  " + "-" * 110)
+        for label, sl_i, bs_i in scenarios:
+            m = per_rank_memory_bytes(4, tp, ep, sl_i, bs_i)
+            fits = m["total"] / GB + 8 <= 80
             dsa_costs = build_pattern(NUM_LAYERS, 1, sl_i, bs_i, "hbm", ep=ep)
             ic_costs  = build_pattern(NUM_LAYERS, 4, sl_i, bs_i, "hbm", ep=ep)
             dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
             ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
             dsa_tput = bs_i * 1000.0 / dsa["total_ms"]
             ic_tput  = bs_i * 1000.0 / ic["total_ms"]
-            print(f"  {label:>14}  {dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
+            print(f"  {label:>14}  {m['total']/GB:>6.2f}   {'YES' if fits else 'NO':>4}   "
+                  f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
                   f"{dsa['total_ms']/ic['total_ms']:>7.2f}x  "
                   f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
                   f"{dsa_tput:>9.1f}  {ic_tput:>9.1f}")
+
+    # ===== STEP 8: FP8 sweep (matches DeepSeek-V3.2-Exp production) =====
+    hr("STEP 8 — FP8 weights + FP8 KV cache (PP=4 EP=8, both modes)")
+    print("  Weights and KV cache at 1 byte/elem. Indexer K is FP8 in both")
+    print("  paths (unchanged). Halves per-rank memory and per-layer compute.")
+    print()
+
+    # Hand-verify a key memory number at PP=4 TP=4 EP=8 FP8 BS=1 sl=200K.
+    m_hand_fp8 = {
+        "kv":  16 * 1 * 200*1024 * (KV_LORA_RANK + QK_ROPE) * 1,  # FP8 KV
+        "idx": 16 * 1 * 200*1024 * INDEXER_K_BYTES_PER_TOKEN,
+        "nW":  16 * (NON_EXPERT_W_PER_LAYER_B // 2) // 4,
+        "eW":  16 * (EXPERT_W_PER_LAYER_B // 2) // 8,
+    }
+    m_hand_fp8["total"] = sum(m_hand_fp8.values())
+    m_model_fp8 = per_rank_memory_bytes(4, 4, 8, 200*1024, 1, fp8=True)
+    print("  Hand-verify FP8 memory at PP=4 TP=4 EP=8 BS=1 sl=200K:")
+    chk("  FP8 KV bytes",          m_model_fp8["kv"],           m_hand_fp8["kv"])
+    chk("  FP8 IDX bytes",         m_model_fp8["idx"],          m_hand_fp8["idx"])
+    chk("  FP8 non-expert W bytes", m_model_fp8["non_expert_w"], m_hand_fp8["nW"])
+    chk("  FP8 expert W bytes",    m_model_fp8["expert_w"],     m_hand_fp8["eW"])
+    chk("  FP8 total bytes",       m_model_fp8["total"],        m_hand_fp8["total"])
+    print(f"    breakdown FP8: KV {m_hand_fp8['kv']/GB:.2f} GB  "
+          f"IDX {m_hand_fp8['idx']/GB:.2f} GB  nonW {m_hand_fp8['nW']/GB:.2f} GB  "
+          f"expW {m_hand_fp8['eW']/GB:.2f} GB  TOTAL {m_hand_fp8['total']/GB:.2f} GB")
+    print()
+
+    for mode_lbl in ("offload", "hbm"):
+        for tp in (2, 4):
+            ep = 8
+            print(f"  ── PP=4 TP={tp} EP={ep}  FP8  ({mode_lbl} mode) ──")
+            print(f"  {'scenario':>14}  {'mem GB':>7} {'fit?':>5}  "
+                  f"{'DSA step':>9} {'IC step':>9} {'speedup':>8}  "
+                  f"{'DSA TPOT':>9} {'IC TPOT':>9}  "
+                  f"{'DSA tok/s':>10} {'IC tok/s':>10}")
+            print("  " + "-" * 110)
+            for label, sl_i, bs_i in scenarios:
+                m = per_rank_memory_bytes(4, tp, ep, sl_i, bs_i, fp8=True)
+                fits = m["total"] / GB + 8 <= 80
+                dsa_costs = build_pattern(NUM_LAYERS, 1, sl_i, bs_i, mode_lbl, ep=ep, fp8=True)
+                ic_costs  = build_pattern(NUM_LAYERS, 4, sl_i, bs_i, mode_lbl, ep=ep, fp8=True)
+                dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
+                ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
+                dsa_tput = bs_i * 1000.0 / dsa["total_ms"]
+                ic_tput  = bs_i * 1000.0 / ic["total_ms"]
+                print(f"  {label:>14}  {m['total']/GB:>6.2f}   {'YES' if fits else 'NO':>4}   "
+                      f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
+                      f"{dsa['total_ms']/ic['total_ms']:>7.2f}x  "
+                      f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
+                      f"{dsa_tput:>9.1f}  {ic_tput:>9.1f}")
+            print()
 
 
 if __name__ == "__main__":
