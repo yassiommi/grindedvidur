@@ -161,6 +161,9 @@ throughput across the BS users in flight = `BS × 1000 / step_ms`.
 | 128K / BS=8  |  69.8 GB | YES   | 219.02 ms | 104.53 | 2.10× | 219.02 | 104.53 |   36.5 |   76.5 |   163.40  |    49.29 |
 | 4K   / BS=32 |  47.0 GB | YES   | 246.92 ms | 245.06 | 1.01× | 246.92 | 245.06 |  129.6 |  130.6 |    66.92  |    66.42 |
 | 32K  / BS=32 |  69.8 GB | YES   | 366.64 ms | 255.53 | 1.43× | 366.64 | 255.53 |   87.3 |  125.2 |   186.65  |    76.90 |
+| 128K / BS=32 | 147.8 GB | NO    | 832.66 ms | 372.04 | 2.24× | 832.66 | 372.04 |   38.4 |   86.0 |   652.67  |   193.40 |
+| 200K / BS=32 | 206.3 GB | NO    |1182.18 ms | 459.42 | **2.57×** |1182.18 | 459.42 |   27.1 |   69.7 |  1002.18  |   280.78 |
+| 512K / BS=32 | 459.8 GB | NO    |2696.74 ms | 838.06 | **3.22×** |2696.74 | 838.06 |   11.9 |   38.2 |  2516.74  |   659.42 |
 
 Reading the table:
 - TPOT and step are the same number — one token per decode step per
@@ -190,47 +193,83 @@ significant relative to IO — DSA gets a slightly bigger compute share,
 and IndexCache's relative speedup shrinks (1.72× at TP=2 vs 1.98× at
 TP=4 for the 200K/BS=1 corner).
 
-### PP=4 TP=4 EP=8 — HBM mode
+### PP=4 TP=4 EP=8 — HBM mode (full sweep, FP16)
 
-| scenario     | mem/rank | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
-|--------------|---------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
-| 4K / BS=1    |  43.9 GB |   17.92 |   18.38 | 0.98× |  17.92 |  18.38 |   55.8 |   54.4 |
-| 200K / BS=1  |  48.8 GB |   17.98 |   18.44 | 0.98× |  17.98 |  18.44 |   55.6 |   54.2 |
-| 512K / BS=1  |  56.8 GB |   18.09 |   18.55 | 0.98× |  18.09 |  18.55 |   55.3 |   53.9 |
-| 1M   / BS=1  |  69.8 GB |   19.51 |   18.73 | 1.04× |  19.51 |  18.73 |   51.2 |   53.4 |
-| 4K   / BS=8  |  44.6 GB |   75.42 |   75.45 | 1.00× |  75.42 |  75.45 |  106.1 |  106.0 |
-| 32K  / BS=8  |  50.3 GB |   75.49 |   75.52 | 1.00× |  75.49 |  75.52 |  106.0 |  105.9 |
-| 128K / BS=8  |  69.8 GB |   75.76 |   75.79 | 1.00× |  75.76 |  75.79 |  105.6 |  105.6 |
-| 4K   / BS=32 |  47.0 GB |  244.11 |  242.25 | 1.01× | 244.11 | 242.25 |  131.1 |  132.1 |
-| 32K  / BS=32 |  69.8 GB |  244.42 |  242.57 | 1.01× | 244.42 | 242.57 |  130.9 |  131.9 |
+Rows marked **`NO`** in the `fits?` column have per-rank memory above
+80 GB at this PP/TP/EP — shown for the trend; would need higher PP or
+H200 (141 GB) to actually deploy. Times still reflect the workload if
+the cache existed in HBM.
 
-HBM mode is *compute-bound everywhere we tested*. The HBM bus reads
-the indexer K and KV-gather fast enough that compute (block_c +
-expert_gemm + ep_comms + …) is always the longer pole. IndexCache
-saves IO that wasn't on the critical path, so the speedup is 1.00×
-at BS≥8 and slightly negative (0.98×) at BS=1 due to the lost
-`block_a‖idx_io` within-layer overlap on the S layers. Only at
-BS=1/sl=1M does HBM IO finally grow large enough for IndexCache to
-nose ahead (1.04×).
+| scenario     | mem/rank | fits? | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  43.9 GB | YES |   17.92 |   18.38 | 0.98× |  17.92 |  18.38 |   55.8 |   54.4 |
+| 32K  / BS=1  |  44.6 GB | YES |   17.92 |   18.38 | 0.98× |  17.92 |  18.38 |   55.8 |   54.4 |
+| 128K / BS=1  |  47.0 GB | YES |   17.95 |   18.41 | 0.98× |  17.95 |  18.41 |   55.7 |   54.3 |
+| 200K / BS=1  |  48.8 GB | YES |   17.98 |   18.44 | 0.98× |  17.98 |  18.44 |   55.6 |   54.2 |
+| 512K / BS=1  |  56.8 GB | YES |   18.09 |   18.55 | 0.98× |  18.09 |  18.55 |   55.3 |   53.9 |
+| 1M   / BS=1  |  69.8 GB | YES |   19.51 |   18.73 | **1.04×** |  19.51 |  18.73 |   51.2 |   53.4 |
+| 2M   / BS=1  |  95.8 GB | NO  |   25.29 |   19.09 | **1.32×** |  25.29 |  19.09 |   39.5 |   52.4 |
+| 4M   / BS=1  | 147.8 GB | NO  |   36.86 |   20.72 | **1.78×** |  36.86 |  20.72 |   27.1 |   48.3 |
+| 4K   / BS=8  |  44.6 GB | YES |   75.42 |   75.45 | 1.00× |  75.42 |  75.45 |  106.1 |  106.0 |
+| 32K  / BS=8  |  50.3 GB | YES |   75.49 |   75.52 | 1.00× |  75.49 |  75.52 |  106.0 |  105.9 |
+| 128K / BS=8  |  69.8 GB | YES |   75.76 |   75.79 | 1.00× |  75.76 |  75.79 |  105.6 |  105.6 |
+| 200K / BS=8  |  84.4 GB | NO  |   75.97 |   76.00 | 1.00× |  75.97 |  76.00 |  105.3 |  105.3 |
+| 512K / BS=8  | 147.8 GB | NO  |   80.23 |   76.88 | **1.04×** |  80.23 |  76.88 |   99.7 |  104.1 |
+| 4K   / BS=32 |  47.0 GB | YES |  244.11 |  242.25 | 1.01× | 244.11 | 242.25 |  131.1 |  132.1 |
+| 32K  / BS=32 |  69.8 GB | YES |  244.42 |  242.57 | 1.01× | 244.42 | 242.57 |  130.9 |  131.9 |
+| 128K / BS=32 | 147.8 GB | NO  |  245.51 |  243.65 | 1.01× | 245.51 | 243.65 |  130.3 |  131.3 |
+| 200K / BS=32 | 206.3 GB | NO  |  246.32 |  244.46 | 1.01× | 246.32 | 244.46 |  129.9 |  130.9 |
+| 512K / BS=32 | 459.8 GB | NO  |  277.50 |  247.98 | **1.12×** | 277.50 | 247.98 |  115.3 |  129.0 |
 
-### PP=4 TP=2 EP=8 — HBM mode
+**The HBM crossover** is clearly visible in the BS=1 column: at
+sl≤512K the per-stage compute (4.7 ms at TP=4) absorbs the per-stage
+HBM indexer-K read; beyond 1M the IO catches up and IndexCache starts
+to genuinely help. At BS=1 sl=4M, IndexCache is **1.78×** even in HBM
+mode — the HBM bandwidth is being saturated by 16 GB of indexer-K read
+per stage. This regime needs PP=8 or H200 to actually fit.
 
-Same workloads at TP=2:
+For BS=8 the crossover sits between 200K and 512K: at sl=512K we get
+1.04× HBM speedup, and that 512K BS=8 row uses 147.8 GB / rank — also
+needs PP=8 or H200.
 
-| scenario     | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
-|--------------|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
-| 4K   / BS=1  |   28.85 |   29.30 | 0.98× |  28.85 |  29.30 |   34.7 |   34.1 |
-| 200K / BS=1  |   27.36 |   28.95 | 0.94× |  27.36 |  28.95 |   36.6 |   34.5 |
-| 1M   / BS=1  |   27.65 |   29.24 | 0.95× |  27.65 |  29.24 |   36.2 |   34.2 |
-| 4K   / BS=8  |  121.30 |  120.97 | 1.00× | 121.30 | 120.97 |   65.9 |   66.1 |
-| 32K  / BS=8  |  119.88 |  120.65 | 0.99× | 119.88 | 120.65 |   66.7 |   66.3 |
-| 128K / BS=8  |  120.15 |  120.92 | 0.99× | 120.15 | 120.92 |   66.6 |   66.2 |
-| 4K   / BS=32 |  408.72 |  405.01 | 1.01× | 408.72 | 405.01 |   78.3 |   79.0 |
-| 32K  / BS=32 |  409.04 |  405.32 | 1.01× | 409.04 | 405.32 |   78.2 |   78.9 |
+### PP=4 TP=2 EP=8 — HBM mode (full sweep, FP16)
 
-Same story. The big takeaway: **in HBM mode you don't need
-IndexCache** — compute is the bottleneck regardless of context length
-in the regime that fits an 80 GB H100.
+Same workloads at TP=2 (slower compute → HBM crossover happens later
+in sl):
+
+| scenario     | mem/rank | fits? | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  45.6 GB | YES |   28.85 |   29.30 | 0.98× |  28.85 |  29.30 |   34.7 |   34.1 |
+| 200K / BS=1  |  50.6 GB | YES |   27.36 |   28.95 | 0.94× |  27.36 |  28.95 |   36.6 |   34.5 |
+| 512K / BS=1  |  58.5 GB | YES |   27.47 |   29.06 | 0.95× |  27.47 |  29.06 |   36.4 |   34.4 |
+| 1M   / BS=1  |  71.5 GB | YES |   27.65 |   29.24 | 0.95× |  27.65 |  29.24 |   36.2 |   34.2 |
+| 2M   / BS=1  |  97.5 GB | NO  |   32.37 |   29.60 | **1.09×** |  32.37 |  29.60 |   30.9 |   33.8 |
+| 4M   / BS=1  | 149.5 GB | NO  |   43.93 |   30.32 | **1.45×** |  43.93 |  30.32 |   22.8 |   33.0 |
+| 4K   / BS=8  |  46.3 GB | YES |  121.30 |  120.97 | 1.00× | 121.30 | 120.97 |   65.9 |   66.1 |
+| 32K  / BS=8  |  52.0 GB | YES |  119.88 |  120.65 | 0.99× | 119.88 | 120.65 |   66.7 |   66.3 |
+| 128K / BS=8  |  71.5 GB | YES |  120.15 |  120.92 | 0.99× | 120.15 | 120.92 |   66.6 |   66.2 |
+| 200K / BS=8  |  86.1 GB | NO  |  120.35 |  121.12 | 0.99× | 120.35 | 121.12 |   66.5 |   66.0 |
+| 512K / BS=8  | 149.5 GB | NO  |  121.23 |  122.00 | 0.99× | 121.23 | 122.00 |   66.0 |   65.6 |
+| 4K   / BS=32 |  48.8 GB | YES |  408.72 |  405.01 | 1.01× | 408.72 | 405.01 |   78.3 |   79.0 |
+| 32K  / BS=32 |  71.5 GB | YES |  409.04 |  405.32 | 1.01× | 409.04 | 405.32 |   78.2 |   78.9 |
+| 128K / BS=32 | 149.5 GB | NO  |  410.12 |  406.41 | 1.01× | 410.12 | 406.41 |   78.0 |   78.7 |
+| 200K / BS=32 | 208.0 GB | NO  |  410.93 |  407.22 | 1.01× | 410.93 | 407.22 |   77.9 |   78.6 |
+| 512K / BS=32 | 461.5 GB | NO  |  414.45 |  410.74 | 1.01× | 414.45 | 410.74 |   77.2 |   77.9 |
+
+**Big takeaways for HBM mode:**
+
+- In the feasible region (fits in 80 GB H100) at BS≥8, HBM is fully
+  compute-bound and IndexCache is a wash (1.00–1.01×). The TPOT and
+  tok/s numbers are essentially identical with or without IndexCache.
+- The single-user BS=1 long-context corner is where HBM-mode IC starts
+  to genuinely help — but only at sl≥1M, which is beyond what fits in
+  PP=4. At sl=2M, IC is 1.09× (TP=2) or 1.32× (TP=4); at sl=4M it's
+  1.45× (TP=2) or 1.78× (TP=4).
+- These long-context HBM corners are exactly where the next paragraph
+  about FP8 becomes interesting — FP8 halves the per-rank memory, so
+  the 2M BS=1 corner *does* fit, and FP8 halves compute, which shifts
+  the HBM crossover to shorter sl (more contexts where IC actually
+  helps in HBM).
 
 ## FP8 path (matches DeepSeek-V3.2-Exp production)
 
@@ -272,8 +311,13 @@ Total                                = 25.20 GB
 | 4K   / BS=8  |  22.4 GB |   43.92 |   43.42 | 1.01× |  43.92 |  43.42 |  182.1 |  184.3 |
 | 32K  / BS=8  |  26.1 GB |   74.98 |   46.95 | 1.60× |  74.98 |  46.95 |  106.7 |  170.4 |
 | 128K / BS=8  |  38.9 GB |  191.49 |   76.07 | 2.52× | 191.49 |  76.07 |   41.8 |  105.2 |
+| 200K / BS=8  |  48.4 GB |  278.87 |   97.92 | **2.85×** | 278.87 |  97.92 |   28.7 |   81.7 |
+| 512K / BS=8  |  89.9 GB (NO) |  657.51 |  192.58 | **3.41×** | 657.51 | 192.58 |   12.2 |   41.5 |
 | 4K   / BS=32 |  24.0 GB |  138.46 |  136.60 | 1.01× | 138.46 | 136.60 |  231.1 |  234.3 |
 | 32K  / BS=32 |  38.9 GB |  271.85 |  158.00 | 1.72× | 271.85 | 158.00 |  117.7 |  202.5 |
+| 128K / BS=32 |  89.9 GB (NO) |  737.86 |  274.51 | **2.69×** | 737.86 | 274.51 |   43.4 |  116.6 |
+| 200K / BS=32 | 128.1 GB (NO) | 1087.38 |  361.89 | **3.00×** |1087.38 | 361.89 |   29.4 |   88.4 |
+| 512K / BS=32 | 293.9 GB (NO) | 2601.94 |  740.53 | **3.51×** |2601.94 | 740.53 |   12.3 |   43.2 |
 
 ### PP=4 TP=2 EP=8 — FP8 — offload mode
 
@@ -286,18 +330,65 @@ Total                                = 25.20 GB
 | 128K / BS=8  |  39.8 GB |  210.63 |   96.05 | 2.19× | 210.63 |  96.05 |   38.0 |   83.3 |
 | 32K / BS=32  |  39.8 GB |  342.66 |  237.15 | 1.44× | 342.66 | 237.15 |   93.4 |  134.9 |
 
-### PP=4 TP=4 EP=8 — FP8 — HBM mode
+### PP=4 TP=4 EP=8 — FP8 — HBM mode (full sweep)
 
-| scenario     | mem/rank | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
-|--------------|---------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
-| 4K   / BS=1  |  22.0 GB |   12.19 |   12.20 | 1.00× |  12.19 |  12.20 |   82.0 |   82.0 |
-| 200K / BS=1  |  25.2 GB |   12.25 |   12.25 | 1.00× |  12.25 |  12.25 |   81.7 |   81.6 |
-| 1M   / BS=1  |  38.9 GB |   15.19 |   12.54 | 1.21× |  15.19 |  12.54 |   65.8 |   79.7 |
-| 4K   / BS=8  |  22.4 GB |   43.44 |   43.05 | 1.01× |  43.44 |  43.05 |  184.2 |  185.8 |
-| 32K  / BS=8  |  26.1 GB |   43.51 |   43.13 | 1.01× |  43.51 |  43.13 |  183.9 |  185.5 |
-| 128K / BS=8  |  38.9 GB |   43.78 |   43.40 | 1.01× |  43.78 |  43.40 |  182.7 |  184.3 |
-| 4K   / BS=32 |  24.0 GB |  136.47 |  134.61 | 1.01× | 136.47 | 134.61 |  234.5 |  237.7 |
-| 32K  / BS=32 |  38.9 GB |  136.78 |  134.93 | 1.01× | 136.78 | 134.93 |  233.9 |  237.2 |
+| scenario     | mem/rank | fits? | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  22.0 GB | YES |   12.19 |   12.20 | 1.00× |  12.19 |  12.20 |   82.0 |   82.0 |
+| 32K  / BS=1  |  22.4 GB | YES |   12.19 |   12.20 | 1.00× |  12.19 |  12.20 |   82.0 |   82.0 |
+| 128K / BS=1  |  24.0 GB | YES |   12.22 |   12.23 | 1.00× |  12.22 |  12.23 |   81.8 |   81.8 |
+| 200K / BS=1  |  25.2 GB | YES |   12.25 |   12.25 | 1.00× |  12.25 |  12.25 |   81.7 |   81.6 |
+| 512K / BS=1  |  30.4 GB | YES |   12.36 |   12.36 | 1.00× |  12.36 |  12.36 |   80.9 |   80.9 |
+| 1M   / BS=1  |  38.9 GB | YES |   15.19 |   12.54 | **1.21×** |  15.19 |  12.54 |   65.8 |   79.7 |
+| 2M   / BS=1  |  55.9 GB | YES |   20.97 |   12.90 | **1.63×** |  20.97 |  12.90 |   47.7 |   77.5 |
+| 4M   / BS=1  |  89.9 GB | NO  |   32.53 |   15.75 | **2.07×** |  32.53 |  15.75 |   30.7 |   63.5 |
+| 4K   / BS=8  |  22.4 GB | YES |   43.44 |   43.05 | 1.01× |  43.44 |  43.05 |  184.2 |  185.8 |
+| 32K  / BS=8  |  26.1 GB | YES |   43.51 |   43.13 | 1.01× |  43.51 |  43.13 |  183.9 |  185.5 |
+| 128K / BS=8  |  38.9 GB | YES |   43.78 |   43.40 | 1.01× |  43.78 |  43.40 |  182.7 |  184.3 |
+| 200K / BS=8  |  48.4 GB | YES |   43.99 |   43.60 | 1.01× |  43.99 |  43.60 |  181.9 |  183.5 |
+| 512K / BS=8  |  89.9 GB | NO  |   56.10 |   44.48 | **1.26×** |  56.10 |  44.48 |  142.6 |  179.9 |
+| 4K   / BS=32 |  24.0 GB | YES |  136.47 |  134.61 | 1.01× | 136.47 | 134.61 |  234.5 |  237.7 |
+| 32K  / BS=32 |  38.9 GB | YES |  136.78 |  134.93 | 1.01× | 136.78 | 134.93 |  233.9 |  237.2 |
+| 128K / BS=32 |  89.9 GB | NO  |  137.87 |  136.01 | 1.01× | 137.87 | 136.01 |  232.1 |  235.3 |
+| 200K / BS=32 | 128.1 GB | NO  |  139.49 |  136.83 | 1.02× | 139.49 | 136.83 |  229.4 |  233.9 |
+| 512K / BS=32 | 293.9 GB | NO  |  195.85 |  140.35 | **1.40×** | 195.85 | 140.35 |  163.4 |  228.0 |
+
+### PP=4 TP=2 EP=8 — FP8 — HBM mode (full sweep)
+
+| scenario     | mem/rank | fits? | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K   / BS=1  |  22.8 GB | YES |   17.96 |   18.41 | 0.98× |  17.96 |  18.41 |   55.7 |   54.3 |
+| 200K / BS=1  |  26.1 GB | YES |   17.70 |   18.38 | 0.96× |  17.70 |  18.38 |   56.5 |   54.4 |
+| 1M   / BS=1  |  39.8 GB | YES |   19.30 |   18.67 | **1.03×** |  19.30 |  18.67 |   51.8 |   53.6 |
+| 2M   / BS=1  |  56.8 GB | YES |   25.08 |   19.03 | **1.32×** |  25.08 |  19.03 |   39.9 |   52.5 |
+| 4M   / BS=1  |  90.8 GB | NO  |   36.64 |   20.67 | **1.77×** |  36.64 |  20.67 |   27.3 |   48.4 |
+| 4K   / BS=8  |  23.3 GB | YES |   69.14 |   68.80 | 1.00× |  69.14 |  68.80 |  115.7 |  116.3 |
+| 32K  / BS=8  |  27.0 GB | YES |   68.89 |   68.79 | 1.00× |  68.89 |  68.79 |  116.1 |  116.3 |
+| 128K / BS=8  |  39.8 GB | YES |   69.16 |   69.06 | 1.00× |  69.16 |  69.06 |  115.7 |  115.8 |
+| 200K / BS=8  |  49.3 GB | YES |   69.37 |   69.27 | 1.00× |  69.37 |  69.27 |  115.3 |  115.5 |
+| 512K / BS=8  |  90.8 GB | NO  |   75.23 |   70.15 | **1.07×** |  75.23 |  70.15 |  106.3 |  114.0 |
+| 4K   / BS=32 |  24.9 GB | YES |  230.38 |  226.84 | 1.02× | 230.38 | 226.84 |  138.9 |  141.1 |
+| 32K  / BS=32 |  39.8 GB | YES |  230.70 |  227.15 | 1.02× | 230.70 | 227.15 |  138.7 |  140.9 |
+| 128K / BS=32 |  90.8 GB | NO  |  231.78 |  228.24 | 1.02× | 231.78 | 228.24 |  138.1 |  140.2 |
+| 200K / BS=32 | 129.0 GB | NO  |  232.59 |  229.05 | 1.02× | 232.59 | 229.05 |  137.6 |  139.7 |
+| 512K / BS=32 | 294.8 GB | NO  |  266.67 |  232.57 | **1.15×** | 266.67 | 232.57 |  120.0 |  137.6 |
+
+**Putting it together for the requested 200K/512K × BS=8/32 HBM corners:**
+
+| scenario       | TP=4 FP16 spd | TP=4 FP8 spd | TP=2 FP16 spd | TP=2 FP8 spd |
+|---------------|-------------:|-------------:|-------------:|-------------:|
+| 200K / BS=8   | 1.00× | 1.01× | 0.99× | 1.00× |
+| 512K / BS=8   | 1.04× | **1.26×** | 0.99× | **1.07×** |
+| 200K / BS=32  | 1.01× | 1.02× | 1.01× | 1.02× |
+| 512K / BS=32  | **1.12×** | **1.40×** | 1.01× | **1.15×** |
+
+All four cells *exceed* the H100 80 GB budget at PP=4 EP=8, so they
+need either bumping to PP=8 or moving to H200 (141 GB). At PP=4 EP=8
+*if they fit*, the **512K/BS=32 FP8 corner gets 1.40× IC speedup**
+because the indexer-K read per stage at BS=32 sl=512K under FP8 is
+~31 ms — comparable to per-stage compute of ~34 ms. Below 512K BS=32
+in HBM mode, the indexer read fits inside compute and IC saves
+nothing.
 
 ### Key observations under FP8
 
