@@ -303,10 +303,14 @@ def main():
     for tp in (2, 4):
         ep = 8
         print(f"\n  ── PP=4 TP={tp} EP={ep}  (offload mode) ──")
+        print(f"  TPOT = step time = time per output token, per user.")
+        print(f"  Throughput = BS × 1000 / step_ms  (aggregate tokens/sec across all BS users on this cluster).\n")
         print(f"  {'scenario':>14}  {'mem GB':>7} {'fit?':>5}  "
               f"{'DSA step':>9} {'IC step':>9} {'speedup':>8}  "
-              f"{'DSA io_tot':>10} {'IC io_tot':>9} {'compute':>8}  {'DSA-stage0':>11} {'IC-stage0':>10}")
-        print("  " + "-" * 116)
+              f"{'DSA TPOT':>9} {'IC TPOT':>9}  "
+              f"{'DSA tok/s':>10} {'IC tok/s':>10}  "
+              f"{'DSA stage0':>11} {'IC stage0':>10}")
+        print("  " + "-" * 137)
         for label, sl_i, bs_i in scenarios:
             m = per_rank_memory_bytes(4, tp, ep, sl_i, bs_i)
             fits = m["total"] / GB + 8 <= 80
@@ -314,28 +318,37 @@ def main():
             ic_costs  = build_pattern(NUM_LAYERS, 4, sl_i, bs_i, "offload", ep=ep)
             dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
             ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
+            dsa_tput = bs_i * 1000.0 / dsa["total_ms"]
+            ic_tput  = bs_i * 1000.0 / ic["total_ms"]
             print(f"  {label:>14}  {m['total']/GB:>6.2f}   {'YES' if fits else 'NO':>4}   "
                   f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
                   f"{dsa['total_ms']/ic['total_ms']:>7.2f}x  "
-                  f"{dsa['io_total_ms']:>10.3f} {ic['io_total_ms']:>9.3f} "
-                  f"{ic['compute_total_ms']:>8.3f}  "
+                  f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
+                  f"{dsa_tput:>9.1f}  {ic_tput:>9.1f}  "
                   f"{dsa['stages'][0]['end']:>10.3f}  "
                   f"{ic['stages'][0]['end']:>10.3f}")
 
-    # Also HBM mode at sl=200K BS=1 to show compute-bound regime
+    # Also HBM mode
     hr("STEP 7 — Same scenarios but HBM mode (compute-bound, IO is cheap)")
     for tp in (2, 4):
         ep = 8
         print(f"\n  ── PP=4 TP={tp} EP={ep}  (HBM mode) ──")
-        print(f"  {'scenario':>14}  {'DSA step':>9} {'IC step':>9} {'speedup':>8}")
-        print("  " + "-" * 50)
+        print(f"  {'scenario':>14}  "
+              f"{'DSA step':>9} {'IC step':>9} {'speedup':>8}  "
+              f"{'DSA TPOT':>9} {'IC TPOT':>9}  "
+              f"{'DSA tok/s':>10} {'IC tok/s':>10}")
+        print("  " + "-" * 90)
         for label, sl_i, bs_i in [(s[0], s[1], s[2]) for s in scenarios[:6]]:
             dsa_costs = build_pattern(NUM_LAYERS, 1, sl_i, bs_i, "hbm", ep=ep)
             ic_costs  = build_pattern(NUM_LAYERS, 4, sl_i, bs_i, "hbm", ep=ep)
             dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
             ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
+            dsa_tput = bs_i * 1000.0 / dsa["total_ms"]
+            ic_tput  = bs_i * 1000.0 / ic["total_ms"]
             print(f"  {label:>14}  {dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
-                  f"{dsa['total_ms']/ic['total_ms']:>7.2f}x")
+                  f"{dsa['total_ms']/ic['total_ms']:>7.2f}x  "
+                  f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
+                  f"{dsa_tput:>9.1f}  {ic_tput:>9.1f}")
 
 
 if __name__ == "__main__":

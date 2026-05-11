@@ -144,36 +144,46 @@ IndexCache F:S:S:S (16 F + 45 S):
 
 ### PP=4 TP=4 EP=8 — offload mode
 
-| scenario     | mem/rank | fits? | DSA step | IC step | speedup | DSA io_tot | IC io_tot | compute | DSA stage 0 | IC stage 0 |
-|--------------|---------:|------:|---------:|--------:|--------:|-----------:|----------:|--------:|------------:|-----------:|
-| 4K   / BS=1  |  43.9 GB | YES   |  17.99 ms |  17.87 | 1.01× |     5.57 |    3.86 |  17.78 |     4.79  |     4.76 |
-| 32K  / BS=1  |  44.6 GB | YES   |  19.20 ms |  18.14 | 1.06× |    21.76 |    8.11 |  17.78 |     6.00  |     5.02 |
-| 128K / BS=1  |  47.0 GB | YES   |  33.76 ms |  19.83 | 1.70× |    77.28 |   22.67 |  17.78 |    20.56  |     6.71 |
-| **200K / BS=1** | **48.8 GB** | **YES** | **44.69 ms** | **22.56** | **1.98×** | **118.92** | **33.59** | **17.78** | **31.49** | **9.44** |
-| 512K / BS=1  |  56.8 GB | YES   |  92.02 ms |  34.39 | 2.68× |   299.37 |   80.92 |  17.78 |    78.82  |    21.28 |
-| 1M   / BS=1  |  69.8 GB | YES   | 169.69 ms |  53.81 | 3.15× |   595.49 |  158.59 |  17.78 |   156.49  |    40.69 |
-| 4K   / BS=8  |  44.6 GB | YES   |  76.12 ms |  75.61 | 1.01× |    44.53 |   30.88 |  74.88 |    20.50  |    20.37 |
-| 32K  / BS=8  |  50.3 GB | YES   | 102.51 ms |  77.74 | 1.32× |   174.08 |   64.86 |  74.88 |    46.90  |    22.49 |
-| 128K / BS=8  |  69.8 GB | YES   | 219.02 ms | 104.53 | 2.10× |   618.26 |  181.37 |  74.88 |   163.40  |    49.29 |
-| 4K   / BS=32 |  47.0 GB | YES   | 246.92 ms | 245.06 | 1.01× |   178.13 |  123.52 | 242.14 |    66.92  |    66.42 |
-| 32K  / BS=32 |  69.8 GB | YES   | 366.64 ms | 255.53 | 1.43× |   696.34 |  259.44 | 242.14 |   186.65  |    76.90 |
+`TPOT` = time per output token, per user (= step time, since each
+user receives one token per decode step). `tok/s` = aggregate
+throughput across the BS users in flight = `BS × 1000 / step_ms`.
 
-The "DSA stage 0" column is the bottleneck — it's the slowest stage
-because stage 0 includes the cold start (1.95 ms) and is typically the
-most IO-loaded. When DSA stage 0 ≫ IC stage 0, IndexCache wins
-proportionally.
+| scenario     | mem/rank | fits? | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s | DSA stage 0 | IC stage 0 |
+|--------------|---------:|------:|---------:|--------:|--------:|---------:|--------:|----------:|---------:|------------:|-----------:|
+| 4K   / BS=1  |  43.9 GB | YES   |  17.99 ms |  17.87 | 1.01× |  17.99 |  17.87 |   55.6 |   56.0 |     4.79  |     4.76 |
+| 32K  / BS=1  |  44.6 GB | YES   |  19.20 ms |  18.14 | 1.06× |  19.20 |  18.14 |   52.1 |   55.1 |     6.00  |     5.02 |
+| 128K / BS=1  |  47.0 GB | YES   |  33.76 ms |  19.83 | 1.70× |  33.76 |  19.83 |   29.6 |   50.4 |    20.56  |     6.71 |
+| **200K / BS=1** | **48.8 GB** | **YES** | **44.69 ms** | **22.56** | **1.98×** | **44.69** | **22.56** | **22.4** | **44.3** | **31.49** | **9.44** |
+| 512K / BS=1  |  56.8 GB | YES   |  92.02 ms |  34.39 | 2.68× |  92.02 |  34.39 |   10.9 |   29.1 |    78.82  |    21.28 |
+| 1M   / BS=1  |  69.8 GB | YES   | 169.69 ms |  53.81 | 3.15× | 169.69 |  53.81 |    5.9 |   18.6 |   156.49  |    40.69 |
+| 4K   / BS=8  |  44.6 GB | YES   |  76.12 ms |  75.61 | 1.01× |  76.12 |  75.61 |  105.1 |  105.8 |    20.50  |    20.37 |
+| 32K  / BS=8  |  50.3 GB | YES   | 102.51 ms |  77.74 | 1.32× | 102.51 |  77.74 |   78.0 |  102.9 |    46.90  |    22.49 |
+| 128K / BS=8  |  69.8 GB | YES   | 219.02 ms | 104.53 | 2.10× | 219.02 | 104.53 |   36.5 |   76.5 |   163.40  |    49.29 |
+| 4K   / BS=32 |  47.0 GB | YES   | 246.92 ms | 245.06 | 1.01× | 246.92 | 245.06 |  129.6 |  130.6 |    66.92  |    66.42 |
+| 32K  / BS=32 |  69.8 GB | YES   | 366.64 ms | 255.53 | 1.43× | 366.64 | 255.53 |   87.3 |  125.2 |   186.65  |    76.90 |
+
+Reading the table:
+- TPOT and step are the same number — one token per decode step per
+  user. Lower TPOT = each user perceives faster generation.
+- At BS=1 sl=200K, IndexCache cuts per-user TPOT from 44.7 ms to
+  22.6 ms — **22.4 tok/s → 44.3 tok/s for that single user**.
+- At BS=8 sl=128K the cluster's *aggregate* throughput grows from
+  36.5 tok/s (DSA) to 76.5 tok/s (IC); each of the 8 users still
+  waits ~105 ms vs ~219 ms between their tokens.
+- The "DSA stage 0" column is the IO-bound bottleneck stage; when
+  DSA stage 0 ≫ IC stage 0, IndexCache's speedup is that ratio.
 
 ### PP=4 TP=2 EP=8 — offload mode
 
 Same workloads at TP=2 (slower compute, same IO):
 
-| scenario     | DSA step | IC step | speedup |
-|--------------|---------:|--------:|--------:|
-| 4K / BS=1    |   27.36 |   27.23 | 1.00× |
-| 200K / BS=1  |   51.76 |   30.08 | 1.72× |
-| 1M / BS=1    |  176.76 |   61.33 | 2.88× |
-| 32K / BS=8   |  135.98 |  121.61 | 1.12× |
-| 128K / BS=8  |  252.48 |  139.78 | 1.81× |
+| scenario     | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K / BS=1    |   27.36 |   27.23 | 1.00× |  27.36 |  27.23 | 36.6 | 36.7 |
+| 200K / BS=1  |   51.76 |   30.08 | 1.72× |  51.76 |  30.08 | 19.3 | 33.2 |
+| 1M / BS=1    |  176.76 |   61.33 | 2.88× | 176.76 |  61.33 |  5.7 | 16.3 |
+| 32K / BS=8   |  135.98 |  121.61 | 1.12× | 135.98 | 121.61 | 58.8 | 65.8 |
+| 128K / BS=8  |  252.48 |  139.78 | 1.81× | 252.48 | 139.78 | 31.7 | 57.2 |
 
 TP=2 doubles compute, which makes the per-stage compute slightly more
 significant relative to IO — DSA gets a slightly bigger compute share,
@@ -182,12 +192,12 @@ TP=4 for the 200K/BS=1 corner).
 
 ### PP=4 TP=4 EP=8 — HBM mode
 
-| scenario     | DSA step | IC step | speedup |
-|--------------|---------:|--------:|--------:|
-| 4K / BS=1    |   17.92 |   18.38 | 0.98× |
-| 200K / BS=1  |   17.98 |   18.44 | 0.98× |
-| 512K / BS=1  |   18.09 |   18.55 | 0.98× |
-| 1M / BS=1    |   19.51 |   18.73 | 1.04× |
+| scenario     | DSA step | IC step | speedup | DSA TPOT | IC TPOT | DSA tok/s | IC tok/s |
+|--------------|---------:|--------:|--------:|---------:|--------:|----------:|---------:|
+| 4K / BS=1    |   17.92 |   18.38 | 0.98× | 17.92 | 18.38 | 55.8 | 54.4 |
+| 200K / BS=1  |   17.98 |   18.44 | 0.98× | 17.98 | 18.44 | 55.6 | 54.2 |
+| 512K / BS=1  |   18.09 |   18.55 | 0.98× | 18.09 | 18.55 | 55.3 | 53.9 |
+| 1M / BS=1    |   19.51 |   18.73 | 1.04× | 19.51 | 18.73 | 51.2 | 53.4 |
 
 HBM mode is compute-bound except at sl≥1M. IndexCache then has nothing
 to save and the lost block_a‖idx_io overlap on S layers costs ~2-3%.
