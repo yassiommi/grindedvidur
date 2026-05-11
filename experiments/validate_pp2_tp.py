@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Validate DSA vs IndexCache at PP=2 TP={2,4} EP=16 with analytical compute.
+"""Validate DSA vs IndexCache at PP=4 TP={2,4} EP=8 with analytical compute.
+
+EP=8 is the realistic shard (1 active expert per rank per token at BS=1
+when 8 active out of 256 experts and 8 EP groups). EP=16 over-shards
+(0.5 active per rank, half idle). With EP=8 + FP16, per-rank expert
+weights are 21 GB/layer × layers_per_stage / 8 = 2.625 GB × layers.
+At PP=2 (31 layers/stage) that's 81 GB — exceeds H100 80 GB. So we
+bump to PP=4 (16 layers/stage, 42 GB expert weights per rank), which
+fits comfortably with KV + IDX + non-expert weights.
 
 Steps (everything hand-derived alongside the model):
-  1. Per-rank memory at PP=2 TP=2 EP=16 and PP=2 TP=4 EP=16
+  1. Per-rank memory at PP=4 TP=2 EP=8 and PP=4 TP=4 EP=8
   2. Per-piece per-layer cost hand-derived from HBM/PCIe bandwidth
   3. TP-scaled per-layer compute at TP=2 and TP=4
   4. Per-stage PP pipeline derivation (stage 0 producer/consumer; stages
@@ -126,11 +134,11 @@ def build_pattern(n_layers: int, f_period: int,
 
 # ─────────────────────────────────────────────────────────────────────
 def main():
-    print("DSA vs IndexCache at PP=2, TP={2,4}, EP=16  (analytical, BS=1 sl=200K offload)")
+    print("DSA vs IndexCache at PP=4, TP={2,4}, EP=8  (analytical, BS=1 sl=200K offload)")
     print("All numbers hand-derived from HBM/PCIe peak BW and FLOPS peak.\n")
 
     # ===== STEP 1: per-rank memory =====
-    hr("STEP 1 — Per-rank memory (PP=2 TP=2/4 EP=16, BS=1 sl=200K)")
+    hr("STEP 1 — Per-rank memory (PP=4 TP=2/4 EP=8, BS=1 sl=200K)")
     print(f"  Constants:")
     print(f"    non-expert weights / layer  = {NON_EXPERT_W_PER_LAYER_B / MB:.2f} MB (FP16)")
     print(f"    expert weights / layer      = {EXPERT_W_PER_LAYER_B / GB:.2f} GB (FP16, 256 × 84 MB)")
@@ -138,8 +146,8 @@ def main():
     print(f"    total expert     (61 lyr)   = {NUM_LAYERS * EXPERT_W_PER_LAYER_B / GB:.2f} GB")
     print(f"    total weights               = {NUM_LAYERS * (NON_EXPERT_W_PER_LAYER_B + EXPERT_W_PER_LAYER_B) / GB:.2f} GB")
     print()
-    for pp, tp, ep, label in [(2, 2, 16, "PP=2 TP=2 EP=16"),
-                              (2, 4, 16, "PP=2 TP=4 EP=16")]:
+    for pp, tp, ep, label in [(4, 2, 8, "PP=4 TP=2 EP=8"),
+                              (4, 4, 8, "PP=4 TP=4 EP=8")]:
         m = per_rank_memory_bytes(pp, tp, ep, 200*1024, 1)
         layers = math.ceil(NUM_LAYERS / pp)
         kv_h  = layers * 1 * 200 * 1024 * MLA_KV_BYTES_PER_TOKEN
@@ -160,8 +168,8 @@ def main():
 
     # ===== STEP 2: per-piece layer cost hand-derivation =====
     hr("STEP 2 — Per-piece F-layer cost (BS=1 sl=200K offload, TP=1 baseline)")
-    F = analytical_layer_F(200 * 1024, 1, "offload", ep=16)
-    S = analytical_layer_S(200 * 1024, 1, "offload", ep=16)
+    F = analytical_layer_F(200 * 1024, 1, "offload", ep=8)
+    S = analytical_layer_S(200 * 1024, 1, "offload", ep=8)
     print(f"  F-layer pieces (from model):")
     print(f"    idx_io   = {F.idx_io_ms:>8.5f} ms   (100 MB / 51.5 GB/s PCIe)")
     print(f"    kv_io    = {F.kv_io_ms:>8.5f} ms   (2.81 MB / 51.5 GB/s PCIe)")
@@ -169,7 +177,7 @@ def main():
     print(f"    block_c  = {F.block_c_ms:>8.5f} ms")
     print(f"    idx_comp = {F.idx_comp_ms:>8.5f} ms")
     print(f"    moe shardable = {F.moe_shardable_ms:>8.5f} ms")
-    print(f"    moe expert_gemm = {F.moe_expert_gemm_ms:>8.5f} ms (EP=16, 16 local exp avg 0.5 unique/tok)")
+    print(f"    moe expert_gemm = {F.moe_expert_gemm_ms:>8.5f} ms (EP=8, 32 local exp avg 1.0 unique/tok)")
     print(f"    moe ep_comms = {F.moe_ep_comms_ms:>8.5f} ms")
     print(f"    TOTAL T_compute (TP=1) = {F.total_compute_ms(tp=1):>8.5f} ms")
     print()
@@ -212,8 +220,8 @@ def main():
     print(f"               = {hand_tF_tp2:.4f} ms")
     chk("T_F_compute TP=2 vs hand", F.total_compute_ms(tp=2), hand_tF_tp2, tol_rel=1e-12)
 
-    # ===== STEP 4: PP=2 step time at TP=2 / TP=4 =====
-    hr("STEP 4 — PP=2 step time for DSA and IndexCache F:S:S:S")
+    # ===== STEP 4: PP=4 step time at TP=2 / TP=4 =====
+    hr("STEP 4 — PP=4 step time for DSA and IndexCache F:S:S:S")
 
     sl, bs, mode = 200 * 1024, 1, "offload"
     print(f"  Workload: sl={sl//1024}K, BS={bs}, mode={mode}")
@@ -221,11 +229,11 @@ def main():
 
     for tp in (2, 4):
         print(f"  ── TP={tp} ──")
-        dsa_costs = build_pattern(NUM_LAYERS, 1, sl, bs, mode, ep=16)
-        ic_costs  = build_pattern(NUM_LAYERS, 4, sl, bs, mode, ep=16)
+        dsa_costs = build_pattern(NUM_LAYERS, 1, sl, bs, mode, ep=8)
+        ic_costs  = build_pattern(NUM_LAYERS, 4, sl, bs, mode, ep=8)
 
-        dsa = schedule_pp(dsa_costs, pp=2, tp=tp)
-        ic  = schedule_pp(ic_costs,  pp=2, tp=tp)
+        dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
+        ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
 
         for stage_idx, st in enumerate(dsa["stages"]):
             print(f"    DSA stage {stage_idx}: {st['layers']:>2} layers  "
@@ -246,7 +254,7 @@ def main():
 
     # ===== STEP 5: Verify producer/consumer at stage 0 by hand =====
     hr("STEP 5 — Hand-verify stage 0 producer/consumer (DSA, TP=2)")
-    layers = math.ceil(NUM_LAYERS / 2)  # 31
+    layers = math.ceil(NUM_LAYERS / 4)  # 16 (PP=4)
     print(f"  Stage 0 has {layers} F-layers.")
     print(f"  Each layer:")
     print(f"    T_io      = {F.total_io_ms():.4f} ms")
@@ -269,13 +277,13 @@ def main():
         end_comp = max(end_comp, cum_io) + F.total_compute_ms(tp=2)
     print(f"    layer {layers-1} end_comp = {end_comp:.4f} ms")
     # Compare to model
-    dsa_costs = build_pattern(NUM_LAYERS, 1, sl, bs, mode, ep=16)
-    dsa_sched = schedule_pp(dsa_costs, pp=2, tp=2)
+    dsa_costs = build_pattern(NUM_LAYERS, 1, sl, bs, mode, ep=8)
+    dsa_sched = schedule_pp(dsa_costs, pp=4, tp=2)
     chk("Stage 0 end_compute (DSA TP=2) vs hand",
         dsa_sched["stages"][0]["end"], end_comp, tol_rel=1e-9)
 
     # ===== STEP 6: Fine-grained sweep across corners =====
-    hr("STEP 6 — DSA vs IndexCache sweep across feasible corners (PP=2 TP=2/4 EP=16)")
+    hr("STEP 6 — DSA vs IndexCache sweep across feasible corners (PP=4 TP=2/4 EP=8)")
 
     scenarios = [
         # (label, sl, bs)
@@ -293,19 +301,19 @@ def main():
     ]
 
     for tp in (2, 4):
-        ep = 16
-        print(f"\n  ── PP=2 TP={tp} EP={ep}  (offload mode) ──")
+        ep = 8
+        print(f"\n  ── PP=4 TP={tp} EP={ep}  (offload mode) ──")
         print(f"  {'scenario':>14}  {'mem GB':>7} {'fit?':>5}  "
               f"{'DSA step':>9} {'IC step':>9} {'speedup':>8}  "
               f"{'DSA io_tot':>10} {'IC io_tot':>9} {'compute':>8}  {'DSA-stage0':>11} {'IC-stage0':>10}")
         print("  " + "-" * 116)
         for label, sl_i, bs_i in scenarios:
-            m = per_rank_memory_bytes(2, tp, ep, sl_i, bs_i)
+            m = per_rank_memory_bytes(4, tp, ep, sl_i, bs_i)
             fits = m["total"] / GB + 8 <= 80
             dsa_costs = build_pattern(NUM_LAYERS, 1, sl_i, bs_i, "offload", ep=ep)
             ic_costs  = build_pattern(NUM_LAYERS, 4, sl_i, bs_i, "offload", ep=ep)
-            dsa = schedule_pp(dsa_costs, pp=2, tp=tp)
-            ic  = schedule_pp(ic_costs,  pp=2, tp=tp)
+            dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
+            ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
             print(f"  {label:>14}  {m['total']/GB:>6.2f}   {'YES' if fits else 'NO':>4}   "
                   f"{dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
                   f"{dsa['total_ms']/ic['total_ms']:>7.2f}x  "
@@ -317,15 +325,15 @@ def main():
     # Also HBM mode at sl=200K BS=1 to show compute-bound regime
     hr("STEP 7 — Same scenarios but HBM mode (compute-bound, IO is cheap)")
     for tp in (2, 4):
-        ep = 16
-        print(f"\n  ── PP=2 TP={tp} EP={ep}  (HBM mode) ──")
+        ep = 8
+        print(f"\n  ── PP=4 TP={tp} EP={ep}  (HBM mode) ──")
         print(f"  {'scenario':>14}  {'DSA step':>9} {'IC step':>9} {'speedup':>8}")
         print("  " + "-" * 50)
         for label, sl_i, bs_i in [(s[0], s[1], s[2]) for s in scenarios[:6]]:
             dsa_costs = build_pattern(NUM_LAYERS, 1, sl_i, bs_i, "hbm", ep=ep)
             ic_costs  = build_pattern(NUM_LAYERS, 4, sl_i, bs_i, "hbm", ep=ep)
-            dsa = schedule_pp(dsa_costs, pp=2, tp=tp)
-            ic  = schedule_pp(ic_costs,  pp=2, tp=tp)
+            dsa = schedule_pp(dsa_costs, pp=4, tp=tp)
+            ic  = schedule_pp(ic_costs,  pp=4, tp=tp)
             print(f"  {label:>14}  {dsa['total_ms']:>8.3f}  {ic['total_ms']:>8.3f}  "
                   f"{dsa['total_ms']/ic['total_ms']:>7.2f}x")
 
