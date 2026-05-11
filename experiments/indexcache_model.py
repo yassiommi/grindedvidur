@@ -67,19 +67,130 @@ Care taken (lessons learned)
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from experiments.dsa_layer_analyzer import analyze_layer_bs
 from experiments.dsa_timing_model import (
     DSA_ATTENDED,
+    EXPERT_INTERMEDIATE_SIZE,
+    EXPERT_WEIGHT_BYTES,
+    HIDDEN_SIZE,
     INDEXER_K_BYTES_PER_TOKEN,
+    KV_LORA_RANK,
     MLA_KV_BYTES_PER_TOKEN,
+    NUM_HEADS,
     NUM_LAYERS,
+    NUM_ROUTED_EXPERTS,
+    Q_LORA_RANK,
+    QK_NOPE_HEAD_DIM,
+    QK_ROPE_HEAD_DIM,
+    V_HEAD_DIM,
     ProfileTables,
     io_read_ms,
     load_profiles,
 )
+
+GB = 1024 ** 3
+MB = 1024 ** 2
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Parallelism config — with MLA duplication tax explicit
+# ─────────────────────────────────────────────────────────────────────
+@dataclass
+class ParallelismConfig:
+    """Multi-GPU sharding config.
+
+    Critically: MLA's compressed latent KV cache (and the FP8 indexer K
+    cache, which is similarly a single-vector-per-token store) cannot be
+    cleanly sharded across TP. Standard TP implementations replicate the
+    latent across the TP group, so KV/IDX storage per rank does NOT shrink
+    with TP. PP (and CP, if modelled) is the only sharding that helps the
+    caches.
+
+    Storage per rank:
+      KV       = (N_layers / PP) × BS × seq_len × MLA_KV_BYTES_PER_TOKEN
+      IDX      = (N_layers / PP) × BS × seq_len × INDEXER_K_BYTES_PER_TOKEN
+      W_nonExpert = TOTAL_NON_EXPERT_W / TP / PP
+      W_expert    = TOTAL_EXPERT_W / EP / PP
+    (No TP factor on KV/IDX; MLA duplication tax.)
+
+    Time impact (decode of one token):
+      - Compute: sequential through all 61 layers regardless of PP.
+        Per-layer compute scales by TP for the TP-shardable pieces.
+      - IO: PP gives each stage its own IO bus that can prefetch in
+        parallel with prior stages' compute, so total IO *wall* time
+        ≈ total_IO_sequential / PP (assuming sufficient prefetch).
+      - Step time ≈ max(total_io / PP, total_compute) + cold_start
+        where cold_start = first F-layer's IO (stage 0).
+    """
+    pp: int = 1
+    tp: int = 1
+    ep: int = 8
+    n_layers: int = NUM_LAYERS
+
+    def __post_init__(self):
+        assert self.pp >= 1 and self.tp >= 1 and self.ep >= 1
+        assert NUM_ROUTED_EXPERTS % self.ep == 0, \
+            f"ep={self.ep} must divide NUM_ROUTED_EXPERTS={NUM_ROUTED_EXPERTS}"
+
+    @property
+    def layers_per_stage(self) -> int:
+        return math.ceil(self.n_layers / self.pp)
+
+    @property
+    def total_gpus(self) -> int:
+        """Total GPU count.
+
+        EP and TP overlap on the same physical GPUs within a PP stage
+        (they shard orthogonal dimensions of the same set of ranks). So:
+            total_GPUs = PP × max(TP, EP)
+        when EP and TP are arranged compatibly (typical). For TP=1 EP=8,
+        this is PP × 8.
+        """
+        return self.pp * max(self.tp, self.ep)
+
+
+# Total weights (FP16) — DeepSeek-V3, hand-derived:
+#   non-expert per layer: q_down + q_up + kv_down + kv_up + o_proj + indexer_K_proj
+#                          + moe_router_gate + shared_expert ≈ 450.5 MB
+#   expert per layer: 256 experts × 3 × HIDDEN × INTERMEDIATE × FP16 ≈ 21.00 GB
+NON_EXPERT_W_PER_LAYER_B = (
+    HIDDEN_SIZE * Q_LORA_RANK                                           # q_down
+    + Q_LORA_RANK * NUM_HEADS * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)   # q_up
+    + HIDDEN_SIZE * KV_LORA_RANK                                        # kv_down
+    + KV_LORA_RANK * NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)        # kv_up
+    + NUM_HEADS * V_HEAD_DIM * HIDDEN_SIZE                              # o_proj
+    + HIDDEN_SIZE * KV_LORA_RANK                                        # indexer K-projection
+    + HIDDEN_SIZE * 256                                                 # moe router gate
+    + 3 * HIDDEN_SIZE * EXPERT_INTERMEDIATE_SIZE                        # shared expert
+) * 2  # FP16
+
+EXPERT_W_PER_LAYER_B = NUM_ROUTED_EXPERTS * EXPERT_WEIGHT_BYTES  # ~21.0 GB
+
+
+def per_rank_memory_bytes(cfg: ParallelismConfig, seq_len: int, bs: int) -> Dict[str, int]:
+    """Per-rank HBM footprint, FP16 weights + FP16 KV + FP8 IDX."""
+    layers = cfg.layers_per_stage
+    kv  = layers * bs * seq_len * MLA_KV_BYTES_PER_TOKEN
+    idx = layers * bs * seq_len * INDEXER_K_BYTES_PER_TOKEN
+    non_expert_w = layers * NON_EXPERT_W_PER_LAYER_B // cfg.tp
+    expert_w     = layers * EXPERT_W_PER_LAYER_B    // cfg.ep
+    return {
+        "kv": kv,
+        "idx": idx,
+        "non_expert_w": non_expert_w,
+        "expert_w": expert_w,
+        "total": kv + idx + non_expert_w + expert_w,
+    }
+
+
+def fits_in_hbm(cfg: ParallelismConfig, seq_len: int, bs: int,
+                hbm_gb: float = 80.0, headroom_gb: float = 8.0) -> bool:
+    """Per-rank memory + headroom (activations + intermediates) ≤ HBM."""
+    return per_rank_memory_bytes(cfg, seq_len, bs)["total"] / GB + headroom_gb <= hbm_gb
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -217,6 +328,85 @@ def schedule_sequential(costs: List[LayerCost]) -> Dict[str, float]:
     return {"total_ms": total}
 
 
+def schedule_pipelined_pp(
+    costs: List[LayerCost],
+    cfg: ParallelismConfig,
+) -> Dict[str, float]:
+    """PP-aware step time for one decode token.
+
+    Decode of a single token is *sequential* across the PP stages
+    (token must be processed by stage 1, then stage 2, etc.).
+    Compute therefore can NOT be parallelised across PP — total compute
+    on the critical path = Σ T_compute_i.
+
+    However, each PP stage has its own IO bus (its own HBM and its own
+    PCIe lane). While stage 1's compute is running, stages 2..PP are
+    idle on their compute units but CAN prefetch their layers' IO. In
+    the optimistic (deep buffer) limit, all stages' IO is parallelised:
+        total_io_wall ≈ Σ T_io_i / PP
+
+    Stage 0 runs producer/consumer through its layers (its own IO bus +
+    its own compute, with cold start). Each subsequent stage k ≥ 1
+    starts compute at:
+
+        compute_start_k = max(end_compute_{k-1}, stage_k_io_total)
+
+    where stage_k_io_total has been prefetching on rank k's IO bus from
+    t = 0. Typically stage_k_io ≤ end_compute_{k-1} so the max picks the
+    compute term (IO has been hidden during stage 0's runtime).
+    """
+    if not costs:
+        return {"total_ms": 0.0, "io_total_ms": 0.0, "compute_total_ms": 0.0,
+                "io_wall_ms": 0.0, "cold_start_ms": 0.0,
+                "io_exposed_ms": 0.0, "io_hidden_ms": 0.0, "bottleneck": "n/a"}
+
+    pp = max(cfg.pp, 1)
+    n_layers = len(costs)
+    layers_per_stage = math.ceil(n_layers / pp)
+    stages: List[List[LayerCost]] = []
+    for i in range(pp):
+        chunk = costs[i * layers_per_stage:(i + 1) * layers_per_stage]
+        if chunk:
+            stages.append(chunk)
+
+    total_io   = sum(c.total_io for c in costs)
+    total_comp = sum(c.total_compute for c in costs)
+
+    # Stage 0: full producer/consumer (includes cold start).
+    stage_0 = schedule_pipelined(stages[0])
+    end_compute = stage_0["total_ms"]
+    cold = stages[0][0].total_io
+
+    # Stages 1..PP-1: their IO has been prefetching on their own IO bus
+    # since t=0. Stage k compute starts at max(prev end, stage_k_io).
+    for s_idx in range(1, len(stages)):
+        stage = stages[s_idx]
+        stage_io_total      = sum(c.total_io for c in stage)
+        stage_compute_total = sum(c.total_compute for c in stage)
+        compute_start = max(end_compute, stage_io_total)
+        end_compute = compute_start + stage_compute_total
+
+    step_time = end_compute
+
+    # Per-stage stats (for diagnostics): max stage IO across stages.
+    io_wall = max(sum(c.total_io for c in s) for s in stages)
+    stage_0_comp = sum(c.total_compute for c in stages[0])
+    bottleneck = "io" if io_wall > stage_0_comp + cold else "compute"
+
+    return {
+        "total_ms":          step_time,
+        "io_total_ms":       total_io,
+        "io_wall_ms":        io_wall,
+        "compute_total_ms":  total_comp,
+        "cold_start_ms":     cold,
+        "io_exposed_ms":     step_time - total_comp,
+        "io_hidden_ms":      total_io - (step_time - total_comp),
+        "bottleneck":        bottleneck,
+        "stage_0_ms":        stage_0["total_ms"],
+        "n_stages":          len(stages),
+    }
+
+
 def schedule_pipelined(costs: List[LayerCost]) -> Dict[str, float]:
     """Producer/consumer pipeline with deep prefetch buffer.
 
@@ -286,6 +476,72 @@ def schedule_pipelined(costs: List[LayerCost]) -> Dict[str, float]:
 # ─────────────────────────────────────────────────────────────────────
 # Top-level scenario runner
 # ─────────────────────────────────────────────────────────────────────
+def simulate_pp(
+    seq_len: int,
+    batch_size: int,
+    mode: str,
+    f_period: int,
+    cfg: ParallelismConfig,
+    n_layers: int = NUM_LAYERS,
+    tables: ProfileTables = None,
+) -> Dict[str, float]:
+    """Multi-GPU simulation under a ParallelismConfig.
+
+    Compute scaling (TP > 1) is NOT yet applied — this assumes TP=1 for
+    compute. Use only with cfg.tp == 1 to keep numbers honest. The PP
+    handling is rigorous (parallel IO buses, sequential compute).
+
+    Returns dict including DSA and IndexCache step times under the
+    parallelism config, per-rank memory, and feasibility.
+    """
+    if tables is None:
+        tables = load_profiles()
+    if cfg.tp != 1:
+        raise NotImplementedError(
+            "TP scaling of compute is not modelled here. Use cfg.tp=1; "
+            "we recommend PP-only sharding (no MLA duplication tax)."
+        )
+
+    costs    = build_layer_costs(seq_len, batch_size, mode, f_period, tables, n_layers)
+    ref_costs = build_layer_costs(seq_len, batch_size, mode, 1, tables, n_layers)
+
+    pipe_ic  = schedule_pipelined_pp(costs, cfg)
+    pipe_dsa = schedule_pipelined_pp(ref_costs, cfg)
+
+    mem = per_rank_memory_bytes(cfg, seq_len, batch_size)
+    feasible = fits_in_hbm(cfg, seq_len, batch_size)
+
+    return {
+        "seq_len": seq_len, "batch_size": batch_size, "mode": mode,
+        "f_period": f_period,
+        "pp": cfg.pp, "tp": cfg.tp, "ep": cfg.ep,
+        "layers_per_stage": cfg.layers_per_stage,
+        # IndexCache
+        "ic_step_ms":      pipe_ic["total_ms"],
+        "ic_io_total_ms":  pipe_ic["io_total_ms"],
+        "ic_io_wall_ms":   pipe_ic["io_wall_ms"],
+        "ic_compute_ms":   pipe_ic["compute_total_ms"],
+        "ic_cold_ms":      pipe_ic["cold_start_ms"],
+        "ic_bottleneck":   pipe_ic["bottleneck"],
+        # DSA
+        "dsa_step_ms":     pipe_dsa["total_ms"],
+        "dsa_io_total_ms": pipe_dsa["io_total_ms"],
+        "dsa_io_wall_ms":  pipe_dsa["io_wall_ms"],
+        "dsa_compute_ms":  pipe_dsa["compute_total_ms"],
+        "dsa_cold_ms":     pipe_dsa["cold_start_ms"],
+        "dsa_bottleneck":  pipe_dsa["bottleneck"],
+        # speedup
+        "speedup": pipe_dsa["total_ms"] / pipe_ic["total_ms"] if pipe_ic["total_ms"] > 0 else 0,
+        # memory
+        "per_rank_kv_gb": mem["kv"] / GB,
+        "per_rank_idx_gb": mem["idx"] / GB,
+        "per_rank_nonexp_w_gb": mem["non_expert_w"] / GB,
+        "per_rank_exp_w_gb": mem["expert_w"] / GB,
+        "per_rank_total_gb": mem["total"] / GB,
+        "feasible": feasible,
+    }
+
+
 def simulate(
     seq_len: int,
     batch_size: int,

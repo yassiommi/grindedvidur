@@ -1,5 +1,72 @@
 # IndexCache for DeepSeek Sparse Attention — Simulation Report
 
+## Update: corrected parallelism model
+
+Earlier versions of this report treated the simulation as single-rank.
+DeepSeek-V3 has **1.3 TB of FP16 weights** (dominated by 1.28 TB of
+MoE experts) and can't run on one GPU at any meaningful (BS, seq_len).
+A realistic deployment shards weights and layers across many GPUs.
+
+**Chosen config: PP=8, TP=1, EP=8 (64 H100s, 8 nodes × 8 GPUs).**
+The TP=1 choice is deliberate: as
+[Goyal-style analyses note](https://arxiv.org/abs/2412.19437),
+MLA's compressed latent KV cache cannot be cleanly sharded across TP —
+TP duplicates it across the TP group, wasting memory. PP is the only
+sharding that actually divides the KV/IDX caches.
+
+Two changes follow from this correction:
+
+1. **Per-rank memory is now realistic.** At BS=1 sl=200K under PP=8
+   TP=1 EP=8, per-rank state = 27 GB (KV 1.76 GB + IDX 0.78 GB +
+   non-expert weights 3.52 GB + expert weights 21 GB), well within
+   80 GB H100.
+2. **IO is parallelised across PP stages.** Each rank has its own
+   HBM and PCIe bus. While stage 0 runs producer/consumer through
+   its 8 layers, stages 1..7 prefetch their layers' IO on their
+   own buses. Step time becomes:
+
+   ```
+   step = stage_0_pipeline + Σ_{k≥1} max(stage_k_compute, stage_k_io_to_be_prefetched - end_compute_{k-1})
+   ```
+
+   In practice stage_k_io ≪ end_compute_{k-1}, so subsequent stages
+   are compute-bound, and `step ≈ stage_0_pipeline + (PP−1) ×
+   per_stage_compute`.
+
+**IndexCache's value drops sharply at production PP**, because PP
+already gives most of the IO-hiding benefit. Concrete numbers at BS=1
+sl=200K offload:
+
+| PP | DSA step | IC step | speedup |
+|---:|---------:|--------:|--------:|
+|  1 |  119.6 ms |  46.0 ms | **2.60×** |
+|  2 |   82.5 ms |  46.0 ms | **1.79×** |
+|  4 |   63.9 ms |  46.0 ms | **1.39×** |
+|  8 |   54.0 ms |  46.0 ms | **1.17×** |
+| 16 |   49.0 ms |  46.0 ms | **1.07×** |
+| 32 |   46.5 ms |  46.0 ms | **1.01×** |
+
+IndexCache only meaningfully helps under PP=8 at the long-context
+corner where even one stage's IO exceeds its compute:
+
+| BS / sl   | DSA step | IC step | speedup | regime |
+|-----------|---------:|--------:|--------:|--------|
+| 1 / 200K  |   54.0 ms |  46.0 ms | 1.17× | stage 0 is IO-bound; rest compute-bound |
+| 1 / 512K  |   77.6 ms |  51.1 ms | **1.52×** | DSA stage 0 IO ≫ compute |
+| 1 / 1M    |  116.5 ms |  60.8 ms | **1.91×** | DSA strongly IO-bound |
+| 8 / 128K  |  188.9 ms | 133.5 ms | **1.42×** | F-layer IO scales with BS |
+| 64 / 32K  |  713.7 ms | 608.1 ms |   1.17× | dominated by MoE compute at BS=64 |
+
+The previous "3.7× asymptote" was a single-rank artefact. **Realistic
+production speedups are 1.1–1.9×**, and only in IO-bound corners.
+
+All numbers in this update are produced by
+`python -m experiments.validate_parallelism`, which hand-derives every
+component and runs 18 identity checks (model vs. hand) — all pass to
+floating-point precision.
+
+---
+
 ## TL;DR
 
 We simulate decode on DeepSeek-V3 (61 layers, MLA + DSA + MoE) with the
