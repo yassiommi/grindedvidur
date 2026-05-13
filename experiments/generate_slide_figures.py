@@ -328,6 +328,156 @@ def fig_pipeline_timeline():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Figure 4b — PP=4 FP8 pipeline timeline
+# ─────────────────────────────────────────────────────────────────────
+
+def fig_pipeline_timeline_pp4_fp8():
+    """HBM-mode pipeline Gantt for PP=4 FP8: DSA vs IndexCache.
+
+    4 GPU ranks, each holding 4 layers (illustrative: actual PP=4 has ~15/rank).
+    Real per-layer costs from analytical_layer at BS=1 sl=4M FP8 HBM.
+    """
+    f = analytical_layer_F(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=True)
+    s = analytical_layer_S(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=True)
+    F_io  = f.total_io_ms()
+    S_io  = s.total_io_ms()
+    F_cmp = f.total_compute_ms(tp=1)
+    S_cmp = s.total_compute_ms(tp=1)
+
+    # 4 GPUs × 4 layers each = 16 layers total, F:S:S:S repeating
+    dsa_pattern = ["F"] * 4
+    ic_pattern  = ["F", "S", "S", "S"]
+
+    def simulate_pp4(pat):
+        """PP=4: GPU 0 runs producer/consumer; GPUs 1-3 each start compute
+        at max(prev_gpu_done, this_gpu_io_done). All IO buses run from t=0."""
+        # GPU 0: interleaved IO + compute
+        cum_io, end_cmp = 0.0, 0.0
+        gpu_io = [[]]
+        gpu_cmp = [[]]
+        gpu_io_ends = []
+        for kind in pat:
+            dt_io  = F_io  if kind == "F" else S_io
+            dt_cmp = F_cmp if kind == "F" else S_cmp
+            gpu_io[0].append((cum_io, dt_io, kind))
+            cum_io += dt_io
+            cmp_start = max(end_cmp, cum_io)
+            gpu_cmp[0].append((cmp_start, dt_cmp, kind))
+            end_cmp = cmp_start + dt_cmp
+        gpu_io_ends.append(cum_io)
+        prev_end = end_cmp
+
+        # GPUs 1-3: IO prefetches from t=0 on independent buses
+        for _ in range(1, 4):
+            io_bars = []
+            cum_io = 0.0
+            for kind in pat:
+                dt_io = F_io if kind == "F" else S_io
+                io_bars.append((cum_io, dt_io, kind))
+                cum_io += dt_io
+            gpu_io.append(io_bars)
+            gpu_io_ends.append(cum_io)
+
+            cmp_t = max(prev_end, cum_io)
+            cmp_bars = []
+            for kind in pat:
+                dt_cmp = F_cmp if kind == "F" else S_cmp
+                cmp_bars.append((cmp_t, dt_cmp, kind))
+                cmp_t += dt_cmp
+            gpu_cmp.append(cmp_bars)
+            prev_end = cmp_t
+
+        return gpu_io, gpu_cmp, gpu_io_ends, prev_end
+
+    dsa_io, dsa_cmp, dsa_io_ends, dsa_total = simulate_pp4(dsa_pattern)
+    ic_io,  ic_cmp,  ic_io_ends,  ic_total  = simulate_pp4(ic_pattern)
+    speedup = dsa_total / ic_total
+
+    cF_io  = "#c44e52"
+    cS_io  = "#e8b554"
+    cF_cmp = "#2a4a8b"
+    cS_cmp = "#7aa3d0"
+
+    n_lanes = 8  # 4 GPUs × (IO + Compute)
+    lane_labels = []
+    for i in range(4):
+        lane_labels += [f"GPU {i} · IO bus", f"GPU {i} · Compute"]
+    # y positions: GPU 0 at top (y=7,6), GPU 1 (y=5,4), etc.
+    y_io  = [7, 5, 3, 1]
+    y_cmp = [6, 4, 2, 0]
+    y_all = sorted(y_io + y_cmp, reverse=True)
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 9), sharex=True,
+                              gridspec_kw={"hspace": 0.45})
+    titles = [
+        f"DSA  ·  all 16 layers are F  ·  TPOT = {dsa_total:.2f} ms",
+        f"IndexCache F:S:S:S  ·  4 F + 12 S  ·  TPOT = {ic_total:.2f} ms",
+    ]
+    max_t = max(dsa_total, ic_total) * 1.12
+
+    for ax, g_io, g_cmp, g_io_ends, total in [
+        (axes[0], dsa_io, dsa_cmp, dsa_io_ends, dsa_total),
+        (axes[1], ic_io,  ic_cmp,  ic_io_ends,  ic_total),
+    ]:
+        for i in range(4):
+            for (t0, dt, kind) in g_io[i]:
+                ax.barh(y_io[i], dt, left=t0,
+                        color=(cF_io if kind == "F" else cS_io),
+                        height=0.62, edgecolor="white", linewidth=0.8)
+            for (t0, dt, kind) in g_cmp[i]:
+                ax.barh(y_cmp[i], dt, left=t0,
+                        color=(cF_cmp if kind == "F" else cS_cmp),
+                        height=0.62, edgecolor="white", linewidth=0.8)
+            # Dotted line: when GPU i-1 finishes (GPU i compute start gate)
+            if i > 0:
+                prev_end = g_cmp[i-1][-1][0] + g_cmp[i-1][-1][1]
+                ax.axvline(prev_end, color="#aaa", linestyle=":", linewidth=0.9, alpha=0.7)
+                ax.text(prev_end, y_io[i] + 0.5,
+                        f"GPU {i-1} done\n@ {prev_end:.2f}",
+                        fontsize=7, color="#666", ha="center", va="bottom")
+
+        ax.set_yticks(y_all)
+        ax.set_yticklabels(lane_labels, fontsize=9)
+        ax.set_xlim(0, max_t)
+        ax.set_ylim(-0.6, 8.6)
+        ax.grid(axis="x", alpha=0.25)
+        ax.set_title(titles[0] if ax is axes[0] else titles[1],
+                     fontsize=11, loc="left", pad=4)
+
+        ax.axvline(total, color="#222", linestyle="--", linewidth=1.2, alpha=0.8)
+        ax.text(total + 0.15, 3.5, f"step ends\n{total:.2f} ms",
+                fontsize=10, color="#222", fontweight="bold",
+                va="center", ha="left")
+
+    axes[1].set_xlabel("time (ms)", fontsize=11)
+
+    fig.text(0.5, 0.498, f"IndexCache:  {speedup:.2f}× faster",
+             ha="center", va="center", fontsize=13, fontweight="bold",
+             color="#1e6e1e",
+             bbox=dict(boxstyle="round,pad=0.4", facecolor="#e8f3e8",
+                       edgecolor="#1e6e1e", linewidth=1.2))
+
+    handles = [
+        mpatches.Patch(color=cF_io,  label="IO — F layer (indexer-K + KV)"),
+        mpatches.Patch(color=cS_io,  label="IO — S layer (KV only)"),
+        mpatches.Patch(color=cF_cmp, label="Compute — F layer"),
+        mpatches.Patch(color=cS_cmp, label="Compute — S layer"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=10,
+               frameon=False, bbox_to_anchor=(0.5, -0.005))
+
+    fig.suptitle("Decode-step schedule — PP=4 FP8 HBM mode  "
+                 "(illustrative: 4 GPU ranks × 4 layers each, BS=1 sl=4M)",
+                 fontsize=13, y=0.99)
+
+    plt.tight_layout(rect=(0, 0.05, 1, 0.95))
+    path = os.path.join(OUT, "fig_pipeline_timeline_pp4_fp8.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"  wrote {path}")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Figure 5 — F/S layer-pattern schematic (61 layers, F:S:S:S)
 # ─────────────────────────────────────────────────────────────────────
 def fig_fs_schematic():
@@ -366,5 +516,6 @@ if __name__ == "__main__":
     fig_fs_schematic()
     fig_f_vs_s_breakdown()
     fig_pipeline_timeline()
+    fig_pipeline_timeline_pp4_fp8()
     fig_tpot_vs_sl()
     fig_speedup_hbm_vs_offload()
