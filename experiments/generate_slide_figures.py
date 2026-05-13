@@ -203,20 +203,21 @@ def fig_pipeline_timeline():
     so the bars are visually informative). Cartoon PP=2 with 8 layers
     per stage so the F:S:S:S structure draws cleanly.
     """
+    TP = 2
     f = analytical_layer_F(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=False)
     s = analytical_layer_S(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=False)
     F_io  = f.total_io_ms()
     S_io  = s.total_io_ms()
-    F_cmp = f.total_compute_ms(tp=1)
-    S_cmp = s.total_compute_ms(tp=1)
+    F_cmp = f.total_compute_ms(tp=TP)
+    S_cmp = s.total_compute_ms(tp=TP)
 
     dsa_pattern = ["F"] * 8
     ic_pattern  = ["F", "S", "S", "S", "F", "S", "S", "S"]
 
     def simulate_pp2(pat):
-        """Two stages, each with its own IO bus (independent prefetch).
-        Stage 0 interleaves its own IO and compute. Stage 1 starts
-        compute at max(stage 0 compute end, stage 1 IO end)."""
+        """Two PP stages; each stage has TP GPUs working in parallel.
+        Stage 0 interleaves IO and (TP-sharded) compute. Stage 1 starts
+        compute at max(stage 0 done, stage 1 IO done)."""
         # Stage 0
         cum_io, end_cmp = 0.0, 0.0
         s0_io, s0_cmp = [], []
@@ -262,8 +263,8 @@ def fig_pipeline_timeline():
         f"IndexCache F:S:S:S  ·  4 F + 12 S  ·  total = {ic_total:.2f} ms",
     ]
     max_t = max(dsa_total, ic_total) * 1.10
-    lane_labels = ["GPU 0 · IO bus", "GPU 0 · Compute",
-                   "GPU 1 · IO bus", "GPU 1 · Compute"]
+    lane_labels = ["PP stage 0 (2×TP) · IO", "PP stage 0 (2×TP) · Compute",
+                   "PP stage 1 (2×TP) · IO", "PP stage 1 (2×TP) · Compute"]
     y_pos = [3, 2, 1, 0]
 
     for ax, run, title in zip(axes, [dsa, ic], titles):
@@ -295,7 +296,7 @@ def fig_pipeline_timeline():
 
         # Stage 0 end marker (when stage 1 compute can begin)
         ax.axvline(s0_end, color="#888", linestyle=":", linewidth=1, alpha=0.6)
-        ax.text(s0_end, 3.7, f"GPU 0 done @ {s0_end:.2f} ↓",
+        ax.text(s0_end, 3.7, f"stage 0 done @ {s0_end:.2f} ↓",
                 fontsize=8, color="#555", ha="center", va="bottom")
 
     axes[1].set_xlabel("time (ms)", fontsize=11)
@@ -316,9 +317,9 @@ def fig_pipeline_timeline():
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=10,
                frameon=False, bbox_to_anchor=(0.5, -0.005))
 
-    fig.suptitle("Decode-step schedule — HBM mode  "
-                 "(illustrative: 2 GPU ranks × 8 layers each, BS=1 sl=4M FP16)",
-                 fontsize=13, y=0.99)
+    fig.suptitle("Decode-step schedule — PP=2 TP=2 HBM FP16  "
+                 "(illustrative: 2 PP stages × 8 layers, each stage = 2 TP GPUs, BS=1 sl=4M)",
+                 fontsize=12, y=0.99)
 
     plt.tight_layout(rect=(0, 0.05, 1, 0.95))
     path = os.path.join(OUT, "fig_pipeline_timeline.png")
@@ -332,25 +333,28 @@ def fig_pipeline_timeline():
 # ─────────────────────────────────────────────────────────────────────
 
 def fig_pipeline_timeline_pp4_fp8():
-    """HBM-mode pipeline Gantt for PP=4 FP8: DSA vs IndexCache.
+    """HBM-mode pipeline Gantt for PP=4 TP=4 FP8: DSA vs IndexCache.
 
-    4 GPU ranks, each holding 4 layers (illustrative: actual PP=4 has ~15/rank).
+    4 PP stages × 4 layers each (illustrative: actual PP=4 has ~15/stage).
+    Within each PP stage, 4 TP GPUs work in parallel — compute is TP-sharded.
     Real per-layer costs from analytical_layer at BS=1 sl=4M FP8 HBM.
     """
+    TP = 4
     f = analytical_layer_F(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=True)
     s = analytical_layer_S(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=True)
     F_io  = f.total_io_ms()
     S_io  = s.total_io_ms()
-    F_cmp = f.total_compute_ms(tp=1)
-    S_cmp = s.total_compute_ms(tp=1)
+    F_cmp = f.total_compute_ms(tp=TP)
+    S_cmp = s.total_compute_ms(tp=TP)
 
-    # 4 GPUs × 4 layers each = 16 layers total, F:S:S:S repeating
+    # 4 PP stages × 4 layers each = 16 layers total, F:S:S:S repeating
     dsa_pattern = ["F"] * 4
     ic_pattern  = ["F", "S", "S", "S"]
 
     def simulate_pp4(pat):
-        """PP=4: GPU 0 runs producer/consumer; GPUs 1-3 each start compute
-        at max(prev_gpu_done, this_gpu_io_done). All IO buses run from t=0."""
+        """PP=4: stage 0 interleaves IO and (TP-sharded) compute.
+        Stages 1-3 each start compute at max(prev_stage_done, this_stage_io_done).
+        All IO buses prefetch from t=0 on independent HBM buses."""
         # GPU 0: interleaved IO + compute
         cum_io, end_cmp = 0.0, 0.0
         gpu_io = [[]]
@@ -398,10 +402,10 @@ def fig_pipeline_timeline_pp4_fp8():
     cF_cmp = "#2a4a8b"
     cS_cmp = "#7aa3d0"
 
-    n_lanes = 8  # 4 GPUs × (IO + Compute)
+    n_lanes = 8  # 4 PP stages × (IO + Compute); each stage = 4 TP GPUs in parallel
     lane_labels = []
     for i in range(4):
-        lane_labels += [f"GPU {i} · IO bus", f"GPU {i} · Compute"]
+        lane_labels += [f"PP stage {i} (4×TP) · IO", f"PP stage {i} (4×TP) · Compute"]
     # y positions: GPU 0 at top (y=7,6), GPU 1 (y=5,4), etc.
     y_io  = [7, 5, 3, 1]
     y_cmp = [6, 4, 2, 0]
@@ -433,7 +437,7 @@ def fig_pipeline_timeline_pp4_fp8():
                 prev_end = g_cmp[i-1][-1][0] + g_cmp[i-1][-1][1]
                 ax.axvline(prev_end, color="#aaa", linestyle=":", linewidth=0.9, alpha=0.7)
                 ax.text(prev_end, y_io[i] + 0.5,
-                        f"GPU {i-1} done\n@ {prev_end:.2f}",
+                        f"stage {i-1} done\n@ {prev_end:.2f}",
                         fontsize=7, color="#666", ha="center", va="bottom")
 
         ax.set_yticks(y_all)
@@ -466,8 +470,8 @@ def fig_pipeline_timeline_pp4_fp8():
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=10,
                frameon=False, bbox_to_anchor=(0.5, -0.005))
 
-    fig.suptitle("Decode-step schedule — PP=4 FP8 HBM mode  "
-                 "(illustrative: 4 GPU ranks × 4 layers each, BS=1 sl=4M)",
+    fig.suptitle("Decode-step schedule — PP=4 TP=4 FP8 HBM  "
+                 "(illustrative: 4 PP stages × 4 layers, each stage = 4 TP GPUs, BS=1 sl=4M)",
                  fontsize=13, y=0.99)
 
     plt.tight_layout(rect=(0, 0.05, 1, 0.95))
