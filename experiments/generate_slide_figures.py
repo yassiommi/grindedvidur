@@ -193,109 +193,136 @@ def fig_f_vs_s_breakdown():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Figure 4 — Pipeline timeline schematic (PP=2, 8 layers per stage, F:S:S:S)
+# Figure 4 — Pipeline Gantt: DSA vs IndexCache in HBM mode
 # ─────────────────────────────────────────────────────────────────────
 def fig_pipeline_timeline():
-    """Illustrate the producer/consumer pipeline across PP stages.
+    """HBM-mode pipeline Gantt: DSA all-F vs IndexCache F:S:S:S side by side.
 
-    Uses BS=1 sl=200K offload (so IO bars are visible) at PP=2 EP=8 TP=1.
-    For visual clarity we synthesise stylised proportions, not exact times.
+    Real numbers from analytical_layer at BS=1 sl=4M FP16 HBM (a regime
+    where the indexer-K HBM read is comparable to per-layer compute,
+    so the bars are visually informative). Cartoon PP=2 with 8 layers
+    per stage so the F:S:S:S structure draws cleanly.
     """
-    fig, ax = plt.subplots(figsize=(9, 4.2))
+    f = analytical_layer_F(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=False)
+    s = analytical_layer_S(4 * 1024 * 1024, 1, "hbm", ep=8, fp8=False)
+    F_io  = f.total_io_ms()
+    S_io  = s.total_io_ms()
+    F_cmp = f.total_compute_ms(tp=1)
+    S_cmp = s.total_compute_ms(tp=1)
 
-    # Each PP stage gets its own IO bar and its own COMPUTE bar.
-    # Numbers are illustrative — IO blocks are wider than compute (offload mode).
-    pp = 2
-    n_per_stage = 8  # 8 layers per stage in this cartoon
-    io_F = 1.95   # ms
-    io_S = 0.05
-    cmp_layer = 0.78
+    dsa_pattern = ["F"] * 8
+    ic_pattern  = ["F", "S", "S", "S", "F", "S", "S", "S"]
 
-    pattern = ['F','S','S','S','F','S','S','S']  # one stage
-    # Each stage has its OWN IO bus → both start prefetching at t=0.
-    stage_rows = []
-    for stage_idx in range(pp):
-        t = 0.0
-        ios = []
-        for kind in pattern:
-            dt = io_F if kind == 'F' else io_S
-            ios.append((t, dt, kind))
-            t += dt
-        stage_rows.append(ios)
+    def simulate_pp2(pat):
+        """Two stages, each with its own IO bus (independent prefetch).
+        Stage 0 interleaves its own IO and compute. Stage 1 starts
+        compute at max(stage 0 compute end, stage 1 IO end)."""
+        # Stage 0
+        cum_io, end_cmp = 0.0, 0.0
+        s0_io, s0_cmp = [], []
+        for kind in pat:
+            dt_io  = F_io  if kind == "F" else S_io
+            dt_cmp = F_cmp if kind == "F" else S_cmp
+            s0_io.append((cum_io, dt_io, kind))
+            cum_io += dt_io
+            cmp_start = max(end_cmp, cum_io)
+            s0_cmp.append((cmp_start, dt_cmp, kind))
+            end_cmp = cmp_start + dt_cmp
+        s0_end = end_cmp
+        # Stage 1
+        s1_io = []
+        cum_io = 0.0
+        for kind in pat:
+            dt_io = F_io if kind == "F" else S_io
+            s1_io.append((cum_io, dt_io, kind))
+            cum_io += dt_io
+        s1_io_end = cum_io
+        cmp_t = max(s0_end, s1_io_end)
+        s1_cmp = []
+        for kind in pat:
+            dt_cmp = F_cmp if kind == "F" else S_cmp
+            s1_cmp.append((cmp_t, dt_cmp, kind))
+            cmp_t += dt_cmp
+        return s0_io, s0_cmp, s1_io, s1_cmp, cmp_t, s0_end, s1_io_end
 
-    # Compute timelines (sequential, producer/consumer within stage 0; stage 1 starts after stage 0)
-    cum_io = 0.0
-    end_comp = 0.0
-    s0_compute = []
-    for kind in pattern:
-        cum_io += io_F if kind == 'F' else io_S
-        cmp_start = max(end_comp, cum_io)
-        s0_compute.append((cmp_start, cmp_layer, kind))
-        end_comp = cmp_start + cmp_layer
+    dsa = simulate_pp2(dsa_pattern)
+    ic  = simulate_pp2(ic_pattern)
+    dsa_total, ic_total = dsa[4], ic[4]
+    speedup = dsa_total / ic_total
 
-    # Stage 1 compute starts at max(end_comp, stage_1_io_total)
-    stage_1_io_end = sum(io_F if k == 'F' else io_S for k in pattern)
-    s1_start = max(end_comp, stage_1_io_end)
-    s1_compute = []
-    cur = s1_start
-    for kind in pattern:
-        s1_compute.append((cur, cmp_layer, kind))
-        cur += cmp_layer
+    cF_io  = "#c44e52"
+    cS_io  = "#e8b554"
+    cF_cmp = "#2a4a8b"
+    cS_cmp = "#7aa3d0"
 
-    color_F_io = "#c44e52"
-    color_S_io = "#e0a14a"
-    color_cmp_F = "#3b6bb0"
-    color_cmp_S = "#4c8bb0"
-
-    rows = [
-        ("Stage 0 IO",      stage_rows[0],  None,  None),
-        ("Stage 0 Compute", None,           s0_compute, None),
-        ("Stage 1 IO",      stage_rows[1],  None,  None),
-        ("Stage 1 Compute", None,           s1_compute, None),
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6.5), sharex=True,
+                              gridspec_kw={"hspace": 0.55})
+    titles = [
+        f"DSA  ·  all 16 layers are F  ·  total = {dsa_total:.2f} ms",
+        f"IndexCache F:S:S:S  ·  4 F + 12 S  ·  total = {ic_total:.2f} ms",
     ]
-    y_positions = list(range(len(rows)-1, -1, -1))  # top to bottom
+    max_t = max(dsa_total, ic_total) * 1.10
+    lane_labels = ["Stage 0 IO bus", "Stage 0 Compute",
+                   "Stage 1 IO bus", "Stage 1 Compute"]
+    y_pos = [3, 2, 1, 0]
 
-    for y, (label, io_blocks, cmp_blocks, _) in zip(y_positions, rows):
-        if io_blocks is not None:
-            for (t0, dt, kind) in io_blocks:
-                ax.barh(y, dt, left=t0, color=(color_F_io if kind=='F' else color_S_io),
-                        height=0.55, edgecolor="white", linewidth=0.6)
-        if cmp_blocks is not None:
-            for (t0, dt, kind) in cmp_blocks:
-                ax.barh(y, dt, left=t0, color=(color_cmp_F if kind=='F' else color_cmp_S),
-                        height=0.55, edgecolor="white", linewidth=0.6)
+    for ax, run, title in zip(axes, [dsa, ic], titles):
+        s0_io, s0_cmp, s1_io, s1_cmp, total, s0_end, s1_io_end = run
+        for (t0, dt, kind) in s0_io:
+            ax.barh(y_pos[0], dt, left=t0, color=(cF_io if kind=="F" else cS_io),
+                    height=0.62, edgecolor="white", linewidth=0.8)
+        for (t0, dt, kind) in s0_cmp:
+            ax.barh(y_pos[1], dt, left=t0, color=(cF_cmp if kind=="F" else cS_cmp),
+                    height=0.62, edgecolor="white", linewidth=0.8)
+        for (t0, dt, kind) in s1_io:
+            ax.barh(y_pos[2], dt, left=t0, color=(cF_io if kind=="F" else cS_io),
+                    height=0.62, edgecolor="white", linewidth=0.8)
+        for (t0, dt, kind) in s1_cmp:
+            ax.barh(y_pos[3], dt, left=t0, color=(cF_cmp if kind=="F" else cS_cmp),
+                    height=0.62, edgecolor="white", linewidth=0.8)
 
-    ax.set_yticks(y_positions)
-    ax.set_yticklabels([r[0] for r in rows])
-    ax.set_xlabel("time (ms)")
-    ax.set_title("Producer / consumer pipeline (cartoon, PP=2, F:S:S:S, offload IO)",
-                 pad=14)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(lane_labels, fontsize=10)
+        ax.set_xlim(0, max_t)
+        ax.set_ylim(-0.6, 4.1)
+        ax.grid(axis="x", alpha=0.25)
+        ax.set_title(title, fontsize=12, loc="left", pad=4)
 
-    # Legend
+        # End-of-pipeline marker
+        ax.axvline(total, color="#222", linestyle="--", linewidth=1.2, alpha=0.8)
+        ax.text(total + 0.25, 1.5, f"step ends\n{total:.2f} ms", fontsize=10,
+                color="#222", fontweight="bold", va="center", ha="left")
+
+        # Stage 0 end marker (when stage 1 compute can begin)
+        ax.axvline(s0_end, color="#888", linestyle=":", linewidth=1, alpha=0.6)
+        ax.text(s0_end, 3.7, f"stage 0 ends @ {s0_end:.2f} ↓",
+                fontsize=8, color="#555", ha="center", va="bottom")
+
+    axes[1].set_xlabel("time (ms)", fontsize=11)
+
+    # Speedup badge between panels
+    fig.text(0.5, 0.498, f"IndexCache:  {speedup:.2f}× faster",
+             ha="center", va="center", fontsize=13, fontweight="bold",
+             color="#1e6e1e",
+             bbox=dict(boxstyle="round,pad=0.4", facecolor="#e8f3e8",
+                       edgecolor="#1e6e1e", linewidth=1.2))
+
     handles = [
-        mpatches.Patch(color=color_F_io,  label="IO — F layer (idx + KV)"),
-        mpatches.Patch(color=color_S_io,  label="IO — S layer (KV only)"),
-        mpatches.Patch(color=color_cmp_F, label="Compute — F layer"),
-        mpatches.Patch(color=color_cmp_S, label="Compute — S layer"),
+        mpatches.Patch(color=cF_io,  label="IO — F layer (indexer-K + KV)"),
+        mpatches.Patch(color=cS_io,  label="IO — S layer (KV only)"),
+        mpatches.Patch(color=cF_cmp, label="Compute — F layer"),
+        mpatches.Patch(color=cS_cmp, label="Compute — S layer"),
     ]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.18),
-              fontsize=9, ncol=4, frameon=False)
-    ax.set_xlim(0, max(s1_compute[-1][0] + s1_compute[-1][1], 16) * 1.05)
-    ax.grid(axis="x", alpha=0.2)
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=10,
+               frameon=False, bbox_to_anchor=(0.5, -0.005))
 
-    # Vertical line marking stage 0 end
-    ax.axvline(end_comp, color="#666", linestyle=":", linewidth=1, alpha=0.7)
-    ax.text(end_comp + 0.1, len(rows) - 0.5, "stage 0 done",
-            fontsize=9, color="#444", ha="left")
-    # Annotate that stage 1 IO finished before stage 1 compute starts
-    stage_1_io_end_t = sum(io_F if k=='F' else io_S for k in pattern)
-    ax.axvline(stage_1_io_end_t, color="#aa3333", linestyle=":", linewidth=1, alpha=0.5)
-    ax.text(stage_1_io_end_t + 0.1, 0.5, "stage 1 IO\nprefetched",
-            fontsize=8, color="#aa3333", ha="left")
+    fig.suptitle("Pipeline schedule — HBM mode "
+                 "(cartoon: PP=2, 8 layers/stage, BS=1 sl=4M FP16)",
+                 fontsize=13, y=0.99)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0.05, 1, 0.95))
     path = os.path.join(OUT, "fig_pipeline_timeline.png")
-    plt.savefig(path, dpi=160)
+    plt.savefig(path, dpi=160, bbox_inches="tight")
     plt.close()
     print(f"  wrote {path}")
 
