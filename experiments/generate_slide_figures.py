@@ -193,21 +193,15 @@ def fig_f_vs_s_breakdown():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Figure 4 — Pipeline Gantt: DSA vs IndexCache, per-GPU lanes
+# Figure 4 — Pipeline Gantt: one IO + one Compute lane per PP stage
+# (TP is abstracted away — compute uses TP-sharded times)
 # ─────────────────────────────────────────────────────────────────────
-def _simulate_pp_stages(pat, pp, F_io, S_io, F_cmp, S_cmp):
-    """Compute per-PP-stage layer-by-layer schedule.
-
-    Returns (stages, total_time). stages[stage_idx] is a list of
-    (kind, cmp_start, cmp_end, io_start, io_end) tuples — one per layer.
-    Stage 0 interleaves IO and compute (producer/consumer). Stages
-    1..PP-1 start their compute at max(prev_stage_end, this_stage_io_end);
-    their IO prefetches from t=0 on independent HBM buses.
-    TP GPUs within a stage all have identical timing (drawn separately).
-    """
+def _simulate_pp_layers(pat, pp, F_io, S_io, F_cmp, S_cmp):
+    """Per-stage layer schedule. Stage 0 interleaves IO+compute.
+    Stages 1..PP-1 start compute at max(prev_stage_end, this_io_end).
+    Returns (stages, total) where stages[s] is list of
+    (kind, cmp_s, cmp_e, io_s, io_e)."""
     stages = []
-
-    # Stage 0: interleaved
     cum_io, end_cmp = 0.0, 0.0
     s0 = []
     for kind in pat:
@@ -221,8 +215,6 @@ def _simulate_pp_stages(pat, pp, F_io, S_io, F_cmp, S_cmp):
         s0.append((kind, cmp_s, cmp_e, io_s, io_e))
     stages.append(s0)
     prev_end = end_cmp
-
-    # Stages 1..PP-1
     for _ in range(1, pp):
         cum_io = 0.0
         io_list = []
@@ -230,9 +222,7 @@ def _simulate_pp_stages(pat, pp, F_io, S_io, F_cmp, S_cmp):
             dt_io = F_io if kind == "F" else S_io
             io_list.append((cum_io, cum_io + dt_io))
             cum_io += dt_io
-        stage_io_end = cum_io
-
-        cmp_t = max(prev_end, stage_io_end)
+        cmp_t = max(prev_end, cum_io)
         sk = []
         for i, kind in enumerate(pat):
             dt_cmp = F_cmp if kind == "F" else S_cmp
@@ -241,90 +231,56 @@ def _simulate_pp_stages(pat, pp, F_io, S_io, F_cmp, S_cmp):
             cmp_t += dt_cmp
         stages.append(sk)
         prev_end = cmp_t
-
     return stages, prev_end
 
 
-def _draw_gantt(ax, stages, total, pp, tp, max_t, title):
-    """One lane per GPU. TP GPUs within a PP stage have identical bars."""
-    cF_io  = "#c44e52"
-    cS_io  = "#e8b554"
-    cF_cmp = "#2a4a8b"
-    cS_cmp = "#7aa3d0"
-    cF_idle_bg = "#fafafa"
-    cP_band    = ["#f4f6fb", "#ffffff"]  # alternating PP-group shading
+def _draw_pp_gantt(ax, stages, total, pp, max_t, title):
+    cF_io, cS_io  = "#c44e52", "#e8b554"
+    cF_cmp, cS_cmp = "#2a4a8b", "#7aa3d0"
 
-    row_h    = 1.0
-    gap_pp   = 0.6   # vertical gap between PP groups
-    bar_h    = 0.50
-    io_h     = 0.16
-    io_dy    = -0.34  # IO bar offset below compute centerline
+    # Two lanes per PP stage: IO (top) and Compute (bottom).
+    # PP0 lanes at top of figure.
+    def lane_y(stage, kind):  # kind="io" or "cmp"
+        base = (pp - 1 - stage) * 2.5
+        return base + (1.0 if kind == "io" else 0.0)
 
-    # y position for GPU(stage, tp_rank). GPU 0 (PP0,TP0) at the top.
-    def gpu_y(stage, tp_rank):
-        group_top_y = (pp - 1 - stage) * (tp * row_h + gap_pp)
-        within      = (tp - 1 - tp_rank) * row_h
-        return group_top_y + within
-
-    # Alternating background bands per PP stage so groupings are visible
-    for stage in range(pp):
-        y_top = gpu_y(stage, 0) + 0.5
-        y_bot = gpu_y(stage, tp - 1) - 0.5
-        ax.axhspan(y_bot, y_top,
-                   color=cP_band[stage % 2], alpha=0.7, zorder=0)
-
-    # Draw bars: for each PP stage, replicate the same layer schedule
-    # across all tp GPUs in that stage
+    bar_h = 0.7
     for stage_idx, layers in enumerate(stages):
         for (kind, cmp_s, cmp_e, io_s, io_e) in layers:
-            for t in range(tp):
-                y = gpu_y(stage_idx, t)
-                # Compute bar (thick, centered on lane)
-                ax.barh(y, cmp_e - cmp_s, left=cmp_s,
-                        color=(cF_cmp if kind == "F" else cS_cmp),
-                        height=bar_h, edgecolor="white", linewidth=0.6,
-                        zorder=3)
-                # IO bar (thin, below compute)
-                ax.barh(y + io_dy, io_e - io_s, left=io_s,
-                        color=(cF_io if kind == "F" else cS_io),
-                        height=io_h, edgecolor="none", zorder=2)
+            ax.barh(lane_y(stage_idx, "io"), io_e - io_s, left=io_s,
+                    color=cF_io if kind == "F" else cS_io,
+                    height=bar_h, edgecolor="white", linewidth=0.6)
+            ax.barh(lane_y(stage_idx, "cmp"), cmp_e - cmp_s, left=cmp_s,
+                    color=cF_cmp if kind == "F" else cS_cmp,
+                    height=bar_h, edgecolor="white", linewidth=0.6)
 
-    # Y-tick labels — one per GPU
     yticks, ylabels = [], []
     for stage in range(pp):
-        for t in range(tp):
-            gpu_id = stage * tp + t
-            yticks.append(gpu_y(stage, t))
-            ylabels.append(f"GPU{gpu_id:2d}  PP{stage}·TP{t}")
+        yticks += [lane_y(stage, "io"), lane_y(stage, "cmp")]
+        ylabels += [f"PP{stage} · IO", f"PP{stage} · Compute"]
     pairs = sorted(zip(yticks, ylabels), key=lambda p: -p[0])
     ax.set_yticks([p[0] for p in pairs])
-    ax.set_yticklabels([p[1] for p in pairs],
-                       fontsize=9, family="monospace")
+    ax.set_yticklabels([p[1] for p in pairs], fontsize=10)
 
-    y_min = gpu_y(pp - 1, tp - 1) - 0.8
-    y_max = gpu_y(0, 0) + 0.8
-    ax.set_ylim(y_min, y_max)
+    ax.set_ylim(-0.7, lane_y(0, "io") + 0.9)
     ax.set_xlim(0, max_t)
-    ax.grid(axis="x", alpha=0.25, zorder=1)
+    ax.grid(axis="x", alpha=0.25)
     ax.set_title(title, loc="left", fontsize=11.5, pad=4)
 
-    # PP hand-off dotted lines
     for stage in range(pp - 1):
         stage_end = stages[stage][-1][2]
         ax.axvline(stage_end, color="#888", linestyle=":",
-                   linewidth=0.9, alpha=0.75, zorder=2)
+                   linewidth=0.9, alpha=0.75)
 
-    # TPOT marker
     ax.axvline(total, color="#222", linestyle="--",
-               linewidth=1.3, alpha=0.9, zorder=4)
-    ax.text(total + max_t * 0.006, (y_min + y_max) / 2,
+               linewidth=1.3, alpha=0.9)
+    ax.text(total + max_t * 0.006, lane_y(0, "io") / 2,
             f"TPOT\n{total:.2f} ms",
-            fontsize=9.5, color="#222", fontweight="bold",
+            fontsize=10, color="#222", fontweight="bold",
             va="center", ha="left")
 
 
-def _save_pipeline_fig(pp, tp, fp8, layers_per_stage, sl, bs, fname, label):
-    """Build both panels (DSA / IndexCache) and save the figure."""
+def _save_pp_pipeline(pp, tp, fp8, layers_per_stage, sl, bs, fname, label):
     f = analytical_layer_F(sl, bs, "hbm", ep=8, fp8=fp8)
     s = analytical_layer_S(sl, bs, "hbm", ep=8, fp8=fp8)
     F_io, S_io = f.total_io_ms(), s.total_io_ms()
@@ -334,25 +290,23 @@ def _save_pipeline_fig(pp, tp, fp8, layers_per_stage, sl, bs, fname, label):
     dsa_pat = ["F"] * layers_per_stage
     ic_pat  = (["F", "S", "S", "S"] * ((layers_per_stage + 3) // 4))[:layers_per_stage]
 
-    dsa_stages, dsa_total = _simulate_pp_stages(dsa_pat, pp, F_io, S_io, F_cmp, S_cmp)
-    ic_stages,  ic_total  = _simulate_pp_stages(ic_pat,  pp, F_io, S_io, F_cmp, S_cmp)
+    dsa_stages, dsa_total = _simulate_pp_layers(dsa_pat, pp, F_io, S_io, F_cmp, S_cmp)
+    ic_stages,  ic_total  = _simulate_pp_layers(ic_pat,  pp, F_io, S_io, F_cmp, S_cmp)
     speedup = dsa_total / ic_total
 
-    total_layers = pp * layers_per_stage
-    n_F_ic = sum(1 for x in ic_pat if x == "F") * pp
-    n_S_ic = total_layers - n_F_ic
-
-    # Figure size scales with number of GPU lanes
-    n_lanes = pp * tp
-    fig_h = max(5.5, 0.42 * n_lanes * 2 + 2.0)
-    fig, axes = plt.subplots(2, 1, figsize=(13, fig_h), sharex=True,
-                              gridspec_kw={"hspace": 0.42})
+    n_total = pp * layers_per_stage
+    n_F_ic  = sum(1 for x in ic_pat if x == "F") * pp
+    n_S_ic  = n_total - n_F_ic
 
     max_t = max(dsa_total, ic_total) * 1.14
-    _draw_gantt(axes[0], dsa_stages, dsa_total, pp, tp, max_t,
-                f"DSA  ·  all {total_layers} layers F  ·  TPOT = {dsa_total:.2f} ms")
-    _draw_gantt(axes[1], ic_stages,  ic_total,  pp, tp, max_t,
-                f"IndexCache F:S:S:S  ·  {n_F_ic} F + {n_S_ic} S  ·  TPOT = {ic_total:.2f} ms")
+    fig_h = max(5.5, 0.55 * pp * 2 + 3.0)
+    fig, axes = plt.subplots(2, 1, figsize=(12, fig_h), sharex=True,
+                              gridspec_kw={"hspace": 0.5})
+
+    _draw_pp_gantt(axes[0], dsa_stages, dsa_total, pp, max_t,
+                   f"DSA  ·  all {n_total} layers F  ·  TPOT = {dsa_total:.2f} ms")
+    _draw_pp_gantt(axes[1], ic_stages, ic_total, pp, max_t,
+                   f"IndexCache F:S:S:S  ·  {n_F_ic} F + {n_S_ic} S  ·  TPOT = {ic_total:.2f} ms")
     axes[1].set_xlabel("time (ms)", fontsize=11)
 
     fig.text(0.5, 0.498, f"IndexCache:  {speedup:.2f}× faster",
@@ -364,18 +318,17 @@ def _save_pipeline_fig(pp, tp, fp8, layers_per_stage, sl, bs, fname, label):
     cF_io, cS_io  = "#c44e52", "#e8b554"
     cF_cmp, cS_cmp = "#2a4a8b", "#7aa3d0"
     handles = [
-        mpatches.Patch(color=cF_cmp, label="Compute (F layer)"),
-        mpatches.Patch(color=cS_cmp, label="Compute (S layer)"),
         mpatches.Patch(color=cF_io,  label="IO — F (indexer-K + KV)"),
         mpatches.Patch(color=cS_io,  label="IO — S (KV only)"),
+        mpatches.Patch(color=cF_cmp, label="Compute — F layer"),
+        mpatches.Patch(color=cS_cmp, label="Compute — S layer"),
     ]
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=10,
                frameon=False, bbox_to_anchor=(0.5, 0.0))
 
-    note = ("TP GPUs in the same PP stage share identical bars "
-            "(they work on the same layers in parallel via all-reduce). "
-            "PP stages are sequential — stage k waits for stage k-1 to finish.")
-    fig.suptitle(f"Decode-step schedule — {label}\n" + note,
+    fig.suptitle(f"Decode-step schedule — {label}\n"
+                 f"(Each PP lane = group of {tp} TP GPUs working in parallel; "
+                 "see separate TP figure)",
                  fontsize=11.5, y=0.995)
 
     plt.tight_layout(rect=(0, 0.04, 1, 0.95))
@@ -386,19 +339,84 @@ def _save_pipeline_fig(pp, tp, fp8, layers_per_stage, sl, bs, fname, label):
 
 
 def fig_pipeline_timeline():
-    """PP=2 TP=2 FP16 HBM Gantt, BS=1 sl=4M. 4 GPU lanes."""
-    _save_pipeline_fig(pp=2, tp=2, fp8=False, layers_per_stage=4,
-                       sl=4 * 1024 * 1024, bs=1,
-                       fname="fig_pipeline_timeline.png",
-                       label="PP=2 TP=2 FP16 HBM  (illustrative: 4 layers/stage, BS=1 sl=4M)")
+    """PP=2 FP16 HBM, BS=1 sl=4M."""
+    _save_pp_pipeline(pp=2, tp=2, fp8=False, layers_per_stage=4,
+                      sl=4 * 1024 * 1024, bs=1,
+                      fname="fig_pipeline_timeline.png",
+                      label="PP=2 TP=2 FP16 HBM  (illustrative: 4 layers/stage, BS=1 sl=4M)")
 
 
 def fig_pipeline_timeline_pp4_fp8():
-    """PP=4 TP=4 FP8 HBM Gantt, BS=1 sl=4M. 16 GPU lanes."""
-    _save_pipeline_fig(pp=4, tp=4, fp8=True, layers_per_stage=4,
-                       sl=4 * 1024 * 1024, bs=1,
-                       fname="fig_pipeline_timeline_pp4_fp8.png",
-                       label="PP=4 TP=4 FP8 HBM  (illustrative: 4 layers/stage, BS=1 sl=4M)")
+    """PP=4 FP8 HBM, BS=1 sl=4M."""
+    _save_pp_pipeline(pp=4, tp=4, fp8=True, layers_per_stage=4,
+                      sl=4 * 1024 * 1024, bs=1,
+                      fname="fig_pipeline_timeline_pp4_fp8.png",
+                      label="PP=4 TP=4 FP8 HBM  (illustrative: 4 layers/stage, BS=1 sl=4M)")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Figure 4c — Tensor Parallelism (TP) visualization
+# ─────────────────────────────────────────────────────────────────────
+def fig_tp_visualization():
+    """Show how TP=4 GPUs cooperate on one layer in parallel.
+
+    Inside one PP stage, TP GPUs all execute the same layer at the same
+    time, each holding 1/TP of the weight shards. They synchronize at
+    all-reduce boundaries (after Q/K/V proj, after attention out-proj,
+    after MoE).
+    """
+    TP = 4
+    # Per-piece timing (FP8, BS=1 sl=4M, scaled by 1/TP for shardable parts)
+    # Numbers picked illustratively from analytical_layer F-layer breakdown.
+    pieces = [
+        ("block_a (Q proj)",   0.20, True,  "#4c8bb0"),
+        ("AllReduce",          0.04, False, "#aaaaaa"),
+        ("Attention + o_proj", 0.60, True,  "#5a9c5e"),
+        ("AllReduce",          0.04, False, "#aaaaaa"),
+        ("MoE shardable",      0.30, True,  "#8ac270"),
+        ("MoE expert + EP",    0.28, False, "#7568b0"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(11, 4.2))
+    bar_h = 0.55
+    y_positions = list(range(TP - 1, -1, -1))  # GPU 0 at top
+
+    t = 0.0
+    for name, dt, sharded, color in pieces:
+        for y in y_positions:
+            ax.barh(y, dt, left=t, color=color,
+                    height=bar_h, edgecolor="white", linewidth=0.7)
+        if dt > 0.06:
+            ax.text(t + dt / 2, TP - 0.3, name,
+                    ha="center", va="bottom", fontsize=9, color="#333")
+            if sharded:
+                ax.text(t + dt / 2, -0.6, "(÷TP)",
+                        ha="center", va="top", fontsize=8, color="#666",
+                        fontstyle="italic")
+        t += dt
+
+    total = t
+    ax.axvline(total, color="#222", linestyle="--", linewidth=1.3)
+    ax.text(total + 0.02, TP / 2 - 0.5, f"layer end\n{total:.2f} ms",
+            fontsize=10, fontweight="bold", color="#222", va="center")
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([f"GPU {i}  (TP rank {i})" for i in range(TP)],
+                       fontsize=10, family="monospace")
+    ax.set_xlabel("time within one layer (ms)", fontsize=11)
+    ax.set_xlim(0, total * 1.18)
+    ax.set_ylim(-1.1, TP + 0.6)
+    ax.grid(axis="x", alpha=0.25)
+    ax.set_title("Tensor Parallelism — TP=4 GPUs cooperate on one layer\n"
+                 "All 4 GPUs run the same pieces at the same time. "
+                 "Shardable pieces are divided by TP; AllReduce after each block.",
+                 fontsize=11, loc="left", pad=8)
+
+    plt.tight_layout()
+    path = os.path.join(OUT, "fig_tp_visualization.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"  wrote {path}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -441,5 +459,6 @@ if __name__ == "__main__":
     fig_f_vs_s_breakdown()
     fig_pipeline_timeline()
     fig_pipeline_timeline_pp4_fp8()
+    fig_tp_visualization()
     fig_tpot_vs_sl()
     fig_speedup_hbm_vs_offload()
