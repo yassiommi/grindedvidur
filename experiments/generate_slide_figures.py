@@ -262,8 +262,8 @@ def fig_pipeline_timeline():
         f"IndexCache F:S:S:S  ·  4 F + 12 S  ·  total = {ic_total:.2f} ms",
     ]
     max_t = max(dsa_total, ic_total) * 1.10
-    lane_labels = ["Stage 0 IO bus", "Stage 0 Compute",
-                   "Stage 1 IO bus", "Stage 1 Compute"]
+    lane_labels = ["GPU 0 · IO bus", "GPU 0 · Compute",
+                   "GPU 1 · IO bus", "GPU 1 · Compute"]
     y_pos = [3, 2, 1, 0]
 
     for ax, run, title in zip(axes, [dsa, ic], titles):
@@ -295,7 +295,7 @@ def fig_pipeline_timeline():
 
         # Stage 0 end marker (when stage 1 compute can begin)
         ax.axvline(s0_end, color="#888", linestyle=":", linewidth=1, alpha=0.6)
-        ax.text(s0_end, 3.7, f"stage 0 ends @ {s0_end:.2f} ↓",
+        ax.text(s0_end, 3.7, f"GPU 0 done @ {s0_end:.2f} ↓",
                 fontsize=8, color="#555", ha="center", va="bottom")
 
     axes[1].set_xlabel("time (ms)", fontsize=11)
@@ -316,8 +316,8 @@ def fig_pipeline_timeline():
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=10,
                frameon=False, bbox_to_anchor=(0.5, -0.005))
 
-    fig.suptitle("Pipeline schedule — HBM mode "
-                 "(cartoon: PP=2, 8 layers/stage, BS=1 sl=4M FP16)",
+    fig.suptitle("Decode-step schedule — HBM mode  "
+                 "(illustrative: 2 GPU ranks × 8 layers each, BS=1 sl=4M FP16)",
                  fontsize=13, y=0.99)
 
     plt.tight_layout(rect=(0, 0.05, 1, 0.95))
