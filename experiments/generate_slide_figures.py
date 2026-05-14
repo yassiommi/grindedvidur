@@ -142,7 +142,7 @@ def fig_tpot_three_regimes():
 
     regimes = [
         ("HBM",                  "#1f7a3d", lambda sl, bs: tpot_hbm_offload("hbm", sl, bs)),
-        ("KV-on-SSD (7 GB/s)",   "#c47a00", lambda sl, bs: tpot_ssd(sl, bs, 7.0)),
+        ("KV-on-SSD (28 GB/s)",  "#c47a00", lambda sl, bs: tpot_ssd(sl, bs, 28.0)),
         ("PCIe offload (51.5 GB/s)", "#a02828",
                                               lambda sl, bs: tpot_hbm_offload("offload", sl, bs)),
     ]
