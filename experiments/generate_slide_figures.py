@@ -203,6 +203,83 @@ def fig_tpot_three_regimes():
     print(f"  wrote {path}")
 
 
+def fig_kv_ssd_pp2_vs_pp4():
+    """Slope chart: KV-on-SSD (28 GB/s) comparing PP=2/TP=2 (16 GPUs)
+    vs PP=4/TP=2 (32 GPUs), both FP8 EP=8.
+
+    Each scenario shows two arrow pairs (PP=2 and PP=4), each from DSA
+    TPOT to IC TPOT. Log y-axis.
+    """
+    from experiments.dsa_vs_ic_kv_ssd import (
+        build_pattern as build_ssd, schedule_pp as sched_ssd)
+
+    SSD_BW = 28.0
+    EP, FP8 = 8, True
+
+    scenarios = [
+        ("200K\nBS=1",  200*1024,        1),
+        ("1M\nBS=1",    1024*1024,       1),
+        ("4M\nBS=1",    4*1024*1024,     1),
+        ("200K\nBS=8",  200*1024,        8),
+        ("512K\nBS=8",  512*1024,        8),
+        ("1M\nBS=8",    1024*1024,       8),
+        ("2M\nBS=8",    2*1024*1024,     8),
+        ("200K\nBS=32", 200*1024,       32),
+        ("512K\nBS=32", 512*1024,       32),
+    ]
+
+    configs = [
+        ("PP=2 · 16 GPUs", 2, 2, "#1f7a3d"),
+        ("PP=4 · 32 GPUs", 4, 2, "#a02828"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(13.5, 6.2))
+    x_base = np.arange(len(scenarios), dtype=float)
+    sub_offsets = np.linspace(-0.18, 0.18, len(configs))
+
+    for c_idx, (name, pp, tp, color) in enumerate(configs):
+        xs = x_base + sub_offsets[c_idx]
+        for xi, (_, sl, bs) in zip(xs, scenarios):
+            dsa = sched_ssd(build_ssd("DSA", sl, bs, tp, FP8, EP, SSD_BW), pp)
+            ic  = sched_ssd(build_ssd("IC",  sl, bs, tp, FP8, EP, SSD_BW), pp)
+            ax.annotate("", xy=(xi, ic), xytext=(xi, dsa),
+                        arrowprops=dict(arrowstyle="->", color=color, lw=1.8,
+                                        shrinkA=0, shrinkB=0))
+            ax.plot([xi], [dsa], "o", color=color, markersize=6,
+                    markerfacecolor="white", markeredgewidth=1.6)
+            ax.plot([xi], [ic],  "o", color=color, markersize=6)
+            mid = (dsa * ic) ** 0.5
+            ax.text(xi + 0.04, mid, f"{dsa/ic:.2f}×",
+                    fontsize=7.5, color=color, va="center")
+
+    handles = []
+    for name, _, _, color in configs:
+        handles.append(plt.Line2D([], [], color=color, lw=2.2, marker="o",
+                                  markerfacecolor=color, label=name))
+    handles.append(plt.Line2D([], [], color="gray", lw=0, marker="o",
+                              markerfacecolor="white", markeredgewidth=1.6,
+                              markersize=7, label="DSA (arrow tail)"))
+    handles.append(plt.Line2D([], [], color="gray", lw=0, marker="o",
+                              markerfacecolor="gray", markersize=7,
+                              label="IndexCache (arrow head)"))
+    ax.legend(handles=handles, loc="upper left", fontsize=9, framealpha=0.95)
+
+    ax.set_yscale("log")
+    ax.set_xticks(x_base)
+    ax.set_xticklabels([s[0] for s in scenarios], fontsize=9)
+    ax.set_ylabel("TPOT (ms / output token, log scale)")
+    ax.grid(axis="y", which="both", alpha=0.25)
+    ax.set_title("KV-on-SSD (28 GB/s): PP=2 vs PP=4  ·  TP=2 EP=8 FP8\n"
+                 "(arrow tail = DSA, arrow head = IndexCache; label = IC speedup)",
+                 fontsize=12)
+
+    plt.tight_layout()
+    path = os.path.join(OUT, "fig_kv_ssd_pp2_vs_pp4.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"  wrote {path}")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Figure 3 — F vs S layer cost breakdown (stacked bar)
 # ─────────────────────────────────────────────────────────────────────
@@ -517,3 +594,4 @@ if __name__ == "__main__":
     fig_tp_visualization()
     fig_tpot_vs_sl()
     fig_tpot_three_regimes()
+    fig_kv_ssd_pp2_vs_pp4()
