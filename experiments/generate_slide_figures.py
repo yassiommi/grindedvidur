@@ -453,6 +453,101 @@ def fig_fs_schematic():
     print(f"  wrote {path}")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Figure 6 — KV-on-SSD speedup bars  (PP=2 TP=2 EP=8 FP8)
+# ─────────────────────────────────────────────────────────────────────
+def _kv_ssd_speedup(seq_len, bs, ssd_bw):
+    from experiments.dsa_vs_ic_kv_ssd import (
+        build_pattern as build_ssd, schedule_pp as sched_ssd)
+    dsa = sched_ssd(build_ssd("DSA", seq_len, bs, 2, True, 8, ssd_bw), 2)
+    ic  = sched_ssd(build_ssd("IC",  seq_len, bs, 2, True, 8, ssd_bw), 2)
+    return dsa / ic, dsa, ic
+
+
+def fig_speedup_kv_ssd():
+    """Grouped bars: IC speedup with KV-on-SSD at 7 GB/s vs 28 GB/s."""
+    corners = [
+        ("200K\nBS=1",  200*1024,        1),
+        ("1M\nBS=1",    1024*1024,       1),
+        ("2M\nBS=1",    2*1024*1024,     1),
+        ("4M\nBS=1",    4*1024*1024,     1),
+        ("128K\nBS=8",  128*1024,        8),
+        ("200K\nBS=8",  200*1024,        8),
+        ("512K\nBS=8",  512*1024,        8),
+        ("1M\nBS=8",    1024*1024,       8),
+        ("2M\nBS=8",    2*1024*1024,     8),
+        ("200K\nBS=32", 200*1024,       32),
+        ("512K\nBS=32", 512*1024,       32),
+    ]
+    sp_7,  sp_28 = [], []
+    for _, sl, bs in corners:
+        sp_7.append (_kv_ssd_speedup(sl, bs,  7.0)[0])
+        sp_28.append(_kv_ssd_speedup(sl, bs, 28.0)[0])
+    labels = [c[0] for c in corners]
+
+    x = np.arange(len(labels))
+    w = 0.36
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    bars_a = ax.bar(x - w/2, sp_7,  w, label="Gen4 single NVMe (7 GB/s)",  color="#bf6b3a")
+    bars_b = ax.bar(x + w/2, sp_28, w, label="4× Gen4 NVMe RAID (28 GB/s)", color="#3b6bb0")
+    ax.axhline(1.0, color="#666", linestyle="--", linewidth=1, alpha=0.7)
+    ax.text(len(labels) - 0.5, 1.05, "1.0× = no change",
+            color="#666", fontsize=9, ha="right")
+
+    for bars in (bars_a, bars_b):
+        for b in bars:
+            ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.03,
+                    f"{b.get_height():.2f}×", ha="center", fontsize=8.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("IndexCache speedup  (DSA TPOT / IC TPOT)")
+    ax.set_title("KV-on-SSD: IndexCache speedup vs DSA  ·  PP=2 TP=2 EP=8 FP8")
+    ax.set_ylim(0.9, max(max(sp_7), max(sp_28)) * 1.12)
+    ax.legend(loc="upper left", fontsize=10)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    path = os.path.join(OUT, "fig_speedup_kv_ssd.png")
+    plt.savefig(path, dpi=160)
+    plt.close()
+    print(f"  wrote {path}")
+
+
+def fig_tpot_vs_sl_kv_ssd():
+    """TPOT vs seq_len at BS=8 for KV-on-SSD; one panel each per SSD speed."""
+    sls = [32*1024, 128*1024, 200*1024, 512*1024, 1024*1024, 2*1024*1024]
+    sl_lbls = ["32K", "128K", "200K", "512K", "1M", "2M"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.4), sharey=True)
+    for ax, (bw, ttl) in zip(axes, [(7.0, "Gen4 NVMe single drive (7 GB/s)"),
+                                    (28.0, "4× Gen4 NVMe RAID (28 GB/s)")]):
+        dsa_y, ic_y = [], []
+        for sl in sls:
+            _, dsa, ic = _kv_ssd_speedup(sl, 8, bw)
+            dsa_y.append(dsa)
+            ic_y.append(ic)
+        ax.plot(sls, dsa_y, "o--", color="#c44e52",
+                label="DSA",        linewidth=2.2, markersize=7)
+        ax.plot(sls, ic_y,  "o-",  color="#2a4a8b",
+                label="IndexCache", linewidth=2.5, markersize=7)
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(sls)
+        ax.set_xticklabels(sl_lbls)
+        ax.set_xlabel("seq_len (log scale)")
+        ax.set_title(ttl, fontsize=11)
+        ax.grid(True, which="both", alpha=0.25)
+        ax.legend(loc="upper left", fontsize=10)
+
+    axes[0].set_ylabel("TPOT (ms / output token)")
+    fig.suptitle("KV-on-SSD TPOT vs seq_len at BS=8  ·  PP=2 TP=2 EP=8 FP8",
+                 fontsize=12.5, y=1.02)
+    plt.tight_layout()
+    path = os.path.join(OUT, "fig_tpot_vs_sl_kv_ssd_bs8.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"  wrote {path}")
+
+
 if __name__ == "__main__":
     print(f"Writing slide figures to {OUT}/")
     fig_fs_schematic()
@@ -462,3 +557,5 @@ if __name__ == "__main__":
     fig_tp_visualization()
     fig_tpot_vs_sl()
     fig_speedup_hbm_vs_offload()
+    fig_speedup_kv_ssd()
+    fig_tpot_vs_sl_kv_ssd()
