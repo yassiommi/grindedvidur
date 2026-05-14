@@ -101,49 +101,90 @@ def fig_tpot_vs_sl():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Figure 2 — Speedup bars: HBM vs offload at key corners
+# Figure 2 — TPOT across three storage regimes (HBM / PCIe / KV-on-SSD)
 # ─────────────────────────────────────────────────────────────────────
-def fig_speedup_hbm_vs_offload():
-    corners = [
-        ("200K\nBS=1\nFP16",  200*1024,  1, False),
-        ("1M\nBS=1\nFP16",    1024*1024, 1, False),
-        ("200K\nBS=8\nFP16",  200*1024,  8, False),
-        ("512K\nBS=32\nFP8",  512*1024, 32, True),
-        ("1M\nBS=1\nFP8",     1024*1024, 1, True),
-        ("4M\nBS=1\nFP8",     4*1024*1024,1, True),
+def fig_tpot_three_regimes():
+    """One figure, three side-by-side panels (one per storage regime).
+    Per scenario, two bars (DSA vs IndexCache). Y-axis = TPOT (ms).
+    Bar labels = the TPOT value.
+
+    Same parallelism config across all three regimes for a fair compare:
+    PP=2, TP=2, EP=8, FP8.
+    """
+    from experiments.dsa_vs_ic_kv_ssd import (
+        build_pattern as build_ssd, schedule_pp as sched_ssd)
+
+    PP, TP, FP8 = 2, 2, True
+
+    # Scenarios shown in every panel
+    scenarios = [
+        ("200K\nBS=1",  200*1024,         1),
+        ("1M\nBS=1",    1024*1024,        1),
+        ("4M\nBS=1",    4*1024*1024,      1),
+        ("200K\nBS=8",  200*1024,         8),
+        ("200K\nBS=32", 200*1024,        32),
     ]
-    hbm_speedups, off_speedups = [], []
-    labels = []
-    for label, sl, bs, fp8 in corners:
-        labels.append(label)
-        for mode, store in (("hbm", hbm_speedups), ("offload", off_speedups)):
-            dsa = schedule_pp(build_pattern(NUM_LAYERS, 1, sl, bs, mode, ep=8, fp8=fp8), pp=4, tp=4)
-            ic  = schedule_pp(build_pattern(NUM_LAYERS, 4, sl, bs, mode, ep=8, fp8=fp8), pp=4, tp=4)
-            store.append(dsa / ic)
 
-    x = np.arange(len(labels))
-    w = 0.36
-    fig, ax = plt.subplots(figsize=(9, 4.6))
-    bars_h = ax.bar(x - w/2, hbm_speedups, w, label="HBM mode",     color="#3b6bb0")
-    bars_o = ax.bar(x + w/2, off_speedups, w, label="Offload (PCIe)", color="#bf6b3a")
-    ax.axhline(1.0, color="#666", linestyle="--", linewidth=1, alpha=0.7)
-    ax.text(len(labels)-0.5, 1.05, "1.0× = no change", color="#666", fontsize=9, ha="right")
+    def tpot_hbm_offload(mode, sl, bs):
+        dsa = schedule_pp(build_pattern(NUM_LAYERS, 1, sl, bs, mode,
+                                        ep=8, fp8=FP8), pp=PP, tp=TP)
+        ic  = schedule_pp(build_pattern(NUM_LAYERS, 4, sl, bs, mode,
+                                        ep=8, fp8=FP8), pp=PP, tp=TP)
+        return dsa, ic
 
-    for bars in (bars_h, bars_o):
-        for b in bars:
-            ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.04,
-                    f"{b.get_height():.2f}×", ha="center", fontsize=9)
+    def tpot_ssd(sl, bs, bw):
+        dsa = sched_ssd(build_ssd("DSA", sl, bs, TP, FP8, 8, bw), PP)
+        ic  = sched_ssd(build_ssd("IC",  sl, bs, TP, FP8, 8, bw), PP)
+        return dsa, ic
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9)
-    ax.set_ylabel("IndexCache speedup (DSA TPOT / IC TPOT)")
-    ax.set_title("IndexCache speedup: HBM vs Offload  ·  PP=4 TP=4 EP=8")
-    ax.set_ylim(0.9, max(off_speedups) * 1.12)
-    ax.legend(loc="upper left")
-    ax.grid(axis="y", alpha=0.25)
+    regimes = [
+        ("HBM",                 lambda sl, bs: tpot_hbm_offload("hbm", sl, bs)),
+        ("PCIe offload (51.5 GB/s)",
+                                lambda sl, bs: tpot_hbm_offload("offload", sl, bs)),
+        ("KV-on-SSD (7 GB/s)",  lambda sl, bs: tpot_ssd(sl, bs, 7.0)),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))
+
+    cDSA = "#c44e52"
+    cIC  = "#2a4a8b"
+
+    for ax, (title, fn) in zip(axes, regimes):
+        dsas, ics = [], []
+        labels = []
+        for lbl, sl, bs in scenarios:
+            labels.append(lbl)
+            dsa, ic = fn(sl, bs)
+            dsas.append(dsa)
+            ics.append(ic)
+
+        x = np.arange(len(scenarios))
+        w = 0.36
+        b1 = ax.bar(x - w/2, dsas, w, label="DSA",        color=cDSA)
+        b2 = ax.bar(x + w/2, ics,  w, label="IndexCache", color=cIC)
+
+        top = max(max(dsas), max(ics)) * 1.18
+        ax.set_ylim(0, top)
+
+        for bars in (b1, b2):
+            for b in bars:
+                ax.text(b.get_x() + b.get_width() / 2,
+                        b.get_height() + top * 0.012,
+                        f"{b.get_height():.1f}", ha="center", fontsize=8.5)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=9)
+        ax.set_title(title, fontsize=12)
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_ylabel("TPOT (ms / output token)")
+        ax.legend(loc="upper left", fontsize=9)
+
+    fig.suptitle("DSA vs IndexCache TPOT across storage regimes  ·  "
+                 "PP=2 TP=2 EP=8 FP8",
+                 fontsize=13, y=1.02)
     plt.tight_layout()
-    path = os.path.join(OUT, "fig_speedup_hbm_vs_offload.png")
-    plt.savefig(path, dpi=160)
+    path = os.path.join(OUT, "fig_tpot_three_regimes.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight")
     plt.close()
     print(f"  wrote {path}")
 
@@ -453,101 +494,6 @@ def fig_fs_schematic():
     print(f"  wrote {path}")
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Figure 6 — KV-on-SSD speedup bars  (PP=2 TP=2 EP=8 FP8)
-# ─────────────────────────────────────────────────────────────────────
-def _kv_ssd_speedup(seq_len, bs, ssd_bw):
-    from experiments.dsa_vs_ic_kv_ssd import (
-        build_pattern as build_ssd, schedule_pp as sched_ssd)
-    dsa = sched_ssd(build_ssd("DSA", seq_len, bs, 2, True, 8, ssd_bw), 2)
-    ic  = sched_ssd(build_ssd("IC",  seq_len, bs, 2, True, 8, ssd_bw), 2)
-    return dsa / ic, dsa, ic
-
-
-def fig_speedup_kv_ssd():
-    """Grouped bars: IC speedup with KV-on-SSD at 7 GB/s vs 28 GB/s."""
-    corners = [
-        ("200K\nBS=1",  200*1024,        1),
-        ("1M\nBS=1",    1024*1024,       1),
-        ("2M\nBS=1",    2*1024*1024,     1),
-        ("4M\nBS=1",    4*1024*1024,     1),
-        ("128K\nBS=8",  128*1024,        8),
-        ("200K\nBS=8",  200*1024,        8),
-        ("512K\nBS=8",  512*1024,        8),
-        ("1M\nBS=8",    1024*1024,       8),
-        ("2M\nBS=8",    2*1024*1024,     8),
-        ("200K\nBS=32", 200*1024,       32),
-        ("512K\nBS=32", 512*1024,       32),
-    ]
-    sp_7,  sp_28 = [], []
-    for _, sl, bs in corners:
-        sp_7.append (_kv_ssd_speedup(sl, bs,  7.0)[0])
-        sp_28.append(_kv_ssd_speedup(sl, bs, 28.0)[0])
-    labels = [c[0] for c in corners]
-
-    x = np.arange(len(labels))
-    w = 0.36
-    fig, ax = plt.subplots(figsize=(11, 4.8))
-    bars_a = ax.bar(x - w/2, sp_7,  w, label="Gen4 single NVMe (7 GB/s)",  color="#bf6b3a")
-    bars_b = ax.bar(x + w/2, sp_28, w, label="4× Gen4 NVMe RAID (28 GB/s)", color="#3b6bb0")
-    ax.axhline(1.0, color="#666", linestyle="--", linewidth=1, alpha=0.7)
-    ax.text(len(labels) - 0.5, 1.05, "1.0× = no change",
-            color="#666", fontsize=9, ha="right")
-
-    for bars in (bars_a, bars_b):
-        for b in bars:
-            ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.03,
-                    f"{b.get_height():.2f}×", ha="center", fontsize=8.5)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9)
-    ax.set_ylabel("IndexCache speedup  (DSA TPOT / IC TPOT)")
-    ax.set_title("KV-on-SSD: IndexCache speedup vs DSA  ·  PP=2 TP=2 EP=8 FP8")
-    ax.set_ylim(0.9, max(max(sp_7), max(sp_28)) * 1.12)
-    ax.legend(loc="upper left", fontsize=10)
-    ax.grid(axis="y", alpha=0.25)
-    plt.tight_layout()
-    path = os.path.join(OUT, "fig_speedup_kv_ssd.png")
-    plt.savefig(path, dpi=160)
-    plt.close()
-    print(f"  wrote {path}")
-
-
-def fig_tpot_vs_sl_kv_ssd():
-    """TPOT vs seq_len at BS=8 for KV-on-SSD; one panel each per SSD speed."""
-    sls = [32*1024, 128*1024, 200*1024, 512*1024, 1024*1024, 2*1024*1024]
-    sl_lbls = ["32K", "128K", "200K", "512K", "1M", "2M"]
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.4), sharey=True)
-    for ax, (bw, ttl) in zip(axes, [(7.0, "Gen4 NVMe single drive (7 GB/s)"),
-                                    (28.0, "4× Gen4 NVMe RAID (28 GB/s)")]):
-        dsa_y, ic_y = [], []
-        for sl in sls:
-            _, dsa, ic = _kv_ssd_speedup(sl, 8, bw)
-            dsa_y.append(dsa)
-            ic_y.append(ic)
-        ax.plot(sls, dsa_y, "o--", color="#c44e52",
-                label="DSA",        linewidth=2.2, markersize=7)
-        ax.plot(sls, ic_y,  "o-",  color="#2a4a8b",
-                label="IndexCache", linewidth=2.5, markersize=7)
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(sls)
-        ax.set_xticklabels(sl_lbls)
-        ax.set_xlabel("seq_len (log scale)")
-        ax.set_title(ttl, fontsize=11)
-        ax.grid(True, which="both", alpha=0.25)
-        ax.legend(loc="upper left", fontsize=10)
-
-    axes[0].set_ylabel("TPOT (ms / output token)")
-    fig.suptitle("KV-on-SSD TPOT vs seq_len at BS=8  ·  PP=2 TP=2 EP=8 FP8",
-                 fontsize=12.5, y=1.02)
-    plt.tight_layout()
-    path = os.path.join(OUT, "fig_tpot_vs_sl_kv_ssd_bs8.png")
-    plt.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close()
-    print(f"  wrote {path}")
-
-
 if __name__ == "__main__":
     print(f"Writing slide figures to {OUT}/")
     fig_fs_schematic()
@@ -556,6 +502,4 @@ if __name__ == "__main__":
     fig_pipeline_timeline_pp4_fp8()
     fig_tp_visualization()
     fig_tpot_vs_sl()
-    fig_speedup_hbm_vs_offload()
-    fig_speedup_kv_ssd()
-    fig_tpot_vs_sl_kv_ssd()
+    fig_tpot_three_regimes()
