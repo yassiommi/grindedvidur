@@ -104,25 +104,28 @@ def fig_tpot_vs_sl():
 # Figure 2 — TPOT across three storage regimes (HBM / PCIe / KV-on-SSD)
 # ─────────────────────────────────────────────────────────────────────
 def fig_tpot_three_regimes():
-    """One figure, three side-by-side panels (one per storage regime).
-    Per scenario, two bars (DSA vs IndexCache). Y-axis = TPOT (ms).
-    Bar labels = the TPOT value.
+    """Slope chart: for each (scenario, regime) draw an arrow from DSA TPOT
+    down to IC TPOT. Three arrows per scenario, color-coded by regime.
+    Log y-axis so HBM (~10s ms), KV-on-SSD (~100s ms), and PCIe offload
+    (~1000s ms) all coexist.
 
-    Same parallelism config across all three regimes for a fair compare:
-    PP=2, TP=2, EP=8, FP8.
+    Config: PP=2 TP=2 EP=8 FP8 (same across all regimes for fair compare).
     """
     from experiments.dsa_vs_ic_kv_ssd import (
         build_pattern as build_ssd, schedule_pp as sched_ssd)
 
     PP, TP, FP8 = 2, 2, True
 
-    # Scenarios shown in every panel
     scenarios = [
         ("200K\nBS=1",  200*1024,         1),
         ("1M\nBS=1",    1024*1024,        1),
         ("4M\nBS=1",    4*1024*1024,      1),
         ("200K\nBS=8",  200*1024,         8),
+        ("512K\nBS=8",  512*1024,         8),
+        ("1M\nBS=8",    1024*1024,        8),
+        ("2M\nBS=8",    2*1024*1024,      8),
         ("200K\nBS=32", 200*1024,        32),
+        ("512K\nBS=32", 512*1024,        32),
     ]
 
     def tpot_hbm_offload(mode, sl, bs):
@@ -138,50 +141,61 @@ def fig_tpot_three_regimes():
         return dsa, ic
 
     regimes = [
-        ("HBM",                 lambda sl, bs: tpot_hbm_offload("hbm", sl, bs)),
-        ("PCIe offload (51.5 GB/s)",
-                                lambda sl, bs: tpot_hbm_offload("offload", sl, bs)),
-        ("KV-on-SSD (7 GB/s)",  lambda sl, bs: tpot_ssd(sl, bs, 7.0)),
+        ("HBM",                  "#1f7a3d", lambda sl, bs: tpot_hbm_offload("hbm", sl, bs)),
+        ("KV-on-SSD (7 GB/s)",   "#c47a00", lambda sl, bs: tpot_ssd(sl, bs, 7.0)),
+        ("PCIe offload (51.5 GB/s)", "#a02828",
+                                              lambda sl, bs: tpot_hbm_offload("offload", sl, bs)),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))
+    fig, ax = plt.subplots(figsize=(13.5, 6.2))
 
-    cDSA = "#c44e52"
-    cIC  = "#2a4a8b"
+    n = len(scenarios)
+    x_base = np.arange(n, dtype=float)
+    sub_offsets = np.linspace(-0.26, 0.26, len(regimes))
 
-    for ax, (title, fn) in zip(axes, regimes):
-        dsas, ics = [], []
-        labels = []
-        for lbl, sl, bs in scenarios:
-            labels.append(lbl)
+    for r_idx, (name, color, fn) in enumerate(regimes):
+        xs = x_base + sub_offsets[r_idx]
+        for xi, (lbl, sl, bs) in zip(xs, scenarios):
             dsa, ic = fn(sl, bs)
-            dsas.append(dsa)
-            ics.append(ic)
+            # arrow from DSA (top) to IC (bottom). For 0.96-1.00× cases,
+            # arrow may go slightly up — still draw with same head.
+            ax.annotate(
+                "", xy=(xi, ic), xytext=(xi, dsa),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.8,
+                                shrinkA=0, shrinkB=0))
+            ax.plot([xi], [dsa], "o", color=color, markersize=6,
+                    markerfacecolor="white", markeredgewidth=1.6)
+            ax.plot([xi], [ic],  "o", color=color, markersize=6)
+            # speedup label on the arrow
+            sp = dsa / ic
+            mid = (dsa * ic) ** 0.5  # geometric mid (log axis)
+            ax.text(xi + 0.04, mid, f"{sp:.2f}×",
+                    fontsize=7.5, color=color, va="center")
 
-        x = np.arange(len(scenarios))
-        w = 0.36
-        b1 = ax.bar(x - w/2, dsas, w, label="DSA",        color=cDSA)
-        b2 = ax.bar(x + w/2, ics,  w, label="IndexCache", color=cIC)
+    # Legend entries
+    handles = []
+    for name, color, _ in regimes:
+        handles.append(plt.Line2D([], [], color=color, lw=2.2, marker="o",
+                                  markerfacecolor=color, label=name))
+    handles.append(plt.Line2D([], [], color="gray", lw=0, marker="o",
+                              markerfacecolor="white", markeredgewidth=1.6,
+                              markersize=7, label="DSA (arrow tail)"))
+    handles.append(plt.Line2D([], [], color="gray", lw=0, marker="o",
+                              markerfacecolor="gray",
+                              markersize=7, label="IndexCache (arrow head)"))
+    ax.legend(handles=handles, loc="upper left", fontsize=9, framealpha=0.95)
 
-        top = max(max(dsas), max(ics)) * 1.18
-        ax.set_ylim(0, top)
+    ax.set_yscale("log")
+    ax.set_xticks(x_base)
+    ax.set_xticklabels([s[0] for s in scenarios], fontsize=9)
+    ax.set_ylabel("TPOT (ms / output token, log scale)")
+    ax.grid(axis="y", which="both", alpha=0.25)
+    ax.set_title("DSA → IndexCache TPOT across storage regimes  ·  "
+                 "PP=2 TP=2 EP=8 FP8\n"
+                 "(arrow tail = DSA, arrow head = IndexCache; "
+                 "label = IC speedup)",
+                 fontsize=12)
 
-        for bars in (b1, b2):
-            for b in bars:
-                ax.text(b.get_x() + b.get_width() / 2,
-                        b.get_height() + top * 0.012,
-                        f"{b.get_height():.1f}", ha="center", fontsize=8.5)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=9)
-        ax.set_title(title, fontsize=12)
-        ax.grid(axis="y", alpha=0.25)
-        ax.set_ylabel("TPOT (ms / output token)")
-        ax.legend(loc="upper left", fontsize=9)
-
-    fig.suptitle("DSA vs IndexCache TPOT across storage regimes  ·  "
-                 "PP=2 TP=2 EP=8 FP8",
-                 fontsize=13, y=1.02)
     plt.tight_layout()
     path = os.path.join(OUT, "fig_tpot_three_regimes.png")
     plt.savefig(path, dpi=160, bbox_inches="tight")
