@@ -280,6 +280,104 @@ def fig_kv_ssd_pp2_vs_pp4():
     print(f"  wrote {path}")
 
 
+def fig_kv_ssd_pp2_vs_pp4_bars():
+    """Grouped bar chart: KV-on-SSD (28 GB/s), PP=2 vs PP=4, FP8.
+    4 bars per scenario: PP2-DSA, PP2-IC, PP4-DSA, PP4-IC.
+    TPOT labeled on top of each bar; speedup (IC/DSA) annotated with bracket.
+    """
+    from experiments.dsa_vs_ic_kv_ssd import (
+        build_pattern as build_ssd, schedule_pp as sched_ssd)
+
+    SSD_BW, EP, FP8 = 28.0, 8, True
+
+    scenarios = [
+        ("200K\nBS=1",  200*1024,        1),
+        ("1M\nBS=1",    1024*1024,       1),
+        ("4M\nBS=1",    4*1024*1024,     1),
+        ("200K\nBS=8",  200*1024,        8),
+        ("512K\nBS=8",  512*1024,        8),
+        ("1M\nBS=8",    1024*1024,       8),
+        ("2M\nBS=8",    2*1024*1024,     8),
+        ("200K\nBS=32", 200*1024,       32),
+        ("512K\nBS=32", 512*1024,       32),
+    ]
+
+    configs = [
+        ("PP=2 DSA", 2, 2, "#e07070", "//"),
+        ("PP=2 IC",  2, 2, "#c44e52", ""),
+        ("PP=4 DSA", 4, 2, "#7090d0", "//"),
+        ("PP=4 IC",  4, 2, "#2a4a8b", ""),
+    ]
+
+    n = len(scenarios)
+    x = np.arange(n)
+    total_w = 0.72
+    w = total_w / len(configs)
+
+    fig, ax = plt.subplots(figsize=(14, 5.5))
+
+    bar_sets = []
+    for i, (label, pp, tp, color, hatch) in enumerate(configs):
+        vals = []
+        for _, sl, bs in scenarios:
+            scheme = "DSA" if "DSA" in label else "IC"
+            v = sched_ssd(build_ssd(scheme, sl, bs, tp, FP8, EP, SSD_BW), pp)
+            vals.append(v)
+        offset = (i - (len(configs) - 1) / 2) * w
+        bars = ax.bar(x + offset, vals, w, label=label, color=color,
+                      hatch=hatch, edgecolor="white", linewidth=0.6)
+        bar_sets.append((bars, vals))
+
+    # TPOT labels on top of each bar
+    top_all = max(v for _, vs in bar_sets for v in vs)
+    ax.set_ylim(0, top_all * 1.22)
+    for bars, vals in bar_sets:
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2,
+                    b.get_height() + top_all * 0.008,
+                    f"{v:.0f}", ha="center", va="bottom", fontsize=7,
+                    rotation=90)
+
+    # Speedup brackets: one for PP=2, one for PP=4
+    pp2_dsa_bars, pp2_dsa_vals = bar_sets[0]
+    pp2_ic_bars,  pp2_ic_vals  = bar_sets[1]
+    pp4_dsa_bars, pp4_dsa_vals = bar_sets[2]
+    pp4_ic_bars,  pp4_ic_vals  = bar_sets[3]
+
+    bracket_y = top_all * 1.12
+    for xi, (d2, i2, d4, i4) in enumerate(
+            zip(pp2_dsa_vals, pp2_ic_vals, pp4_dsa_vals, pp4_ic_vals)):
+        # PP=2 speedup above the PP=2 pair
+        cx2 = (pp2_dsa_bars[xi].get_x() + pp2_dsa_bars[xi].get_width() / 2 +
+               pp2_ic_bars[xi].get_x()  + pp2_ic_bars[xi].get_width()  / 2) / 2
+        ax.text(cx2, bracket_y, f"{d2/i2:.2f}×",
+                ha="center", va="bottom", fontsize=8, color="#c44e52",
+                fontweight="bold")
+        # PP=4 speedup above the PP=4 pair
+        cx4 = (pp4_dsa_bars[xi].get_x() + pp4_dsa_bars[xi].get_width() / 2 +
+               pp4_ic_bars[xi].get_x()  + pp4_ic_bars[xi].get_width()  / 2) / 2
+        ax.text(cx4, bracket_y, f"{d4/i4:.2f}×",
+                ha="center", va="bottom", fontsize=8, color="#2a4a8b",
+                fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([s[0] for s in scenarios], fontsize=9)
+    ax.set_ylabel("TPOT (ms / output token)")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="upper left", fontsize=9, framealpha=0.95)
+    ax.set_title("KV-on-SSD (28 GB/s): PP=2 (16 GPUs) vs PP=4 (32 GPUs)  ·  "
+                 "TP=2 EP=8 FP8\n"
+                 "Hatched = DSA · Solid = IndexCache · "
+                 "Bold label = IC speedup over DSA",
+                 fontsize=11)
+
+    plt.tight_layout()
+    path = os.path.join(OUT, "fig_kv_ssd_pp2_vs_pp4_bars.png")
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
+    print(f"  wrote {path}")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Figure 3 — F vs S layer cost breakdown (stacked bar)
 # ─────────────────────────────────────────────────────────────────────
@@ -595,3 +693,4 @@ if __name__ == "__main__":
     fig_tpot_vs_sl()
     fig_tpot_three_regimes()
     fig_kv_ssd_pp2_vs_pp4()
+    fig_kv_ssd_pp2_vs_pp4_bars()
