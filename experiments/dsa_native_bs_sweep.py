@@ -47,7 +47,7 @@ SEQ_LEN = 128 * 1024
 HBM_PER_GPU_GB = 80
 HBM_USABLE_FRAC = 0.90
 CUDA_SCRATCH_GB = 3
-BATCH_SIZES = [1, 2, 4, 6, 8, 12, 16, 24]
+BATCH_SIZES = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24]
 SSD_FLOOR_MS = 0.050    # ~50 us OS + driver overhead per read submission
 SSD_BW_OPTIONS = [
     ("4× Gen4 RAID", 28.0),
@@ -143,21 +143,29 @@ def fits(total_gb: float) -> bool:
 
 def print_header(label: str):
     print()
-    print("=" * 100)
+    print("=" * 110)
     print(f" DSA-native BS sweep · {label} · PP={PP} TP={TP} EP={EP} FP8 · "
           f"sl={SEQ_LEN // 1024}K · MLA absorption ON")
-    print("=" * 100)
-    print(f"{'BS':>3}  {'Exp W':>7} {'Dense':>7} {'KV':>7} {'IDX':>7}"
+    print("=" * 110)
+    print(f"  Terminology:")
+    print(f"    BS/rank      = requests served by ONE attention rank")
+    print(f"    BS cluster   = total concurrent requests across all DP_attn={EP//TP} attention groups")
+    print(f"                 = DP_attn × BS/rank  (independent batches in parallel)")
+    print("-" * 110)
+    print(f"{'BS/rank':>8} {'BS cluster':>11}  "
+          f"{'Exp W':>7} {'Dense':>7} {'KV':>7} {'IDX':>7}"
           f" {'Scratch':>8} {'Total':>7} {'Fits?':>6}"
           f"  {'TPOT':>10} {'tok/s/rank':>11} {'cluster tok/s':>14}")
-    print("-" * 100)
+    print("-" * 110)
 
 
 def print_row(bs: int, mem: dict, tpot_ms: float):
     tps_per_rank = bs / tpot_ms * 1000
     dp_attn = EP // TP
     cluster_tps = dp_attn * tps_per_rank
-    print(f"{bs:>3}  {mem['expert_w']:>6.1f}G {mem['non_expert_w']:>6.2f}G "
+    bs_cluster = bs * dp_attn
+    print(f"{bs:>8} {bs_cluster:>11}  "
+          f"{mem['expert_w']:>6.1f}G {mem['non_expert_w']:>6.2f}G "
           f"{mem['kv']:>6.2f}G {mem['idx']:>6.2f}G "
           f"{mem['cuda_scratch']:>7.1f}G {mem['total']:>6.1f}G "
           f"{'✓' if fits(mem['total']) else '✗':>6}  "
@@ -185,44 +193,53 @@ def run_kv_on_ssd(label: str, ssd_bw: float):
 
 def print_side_by_side():
     print()
-    print("=" * 100)
-    print(" Side-by-side TPOT comparison (ms / output token)")
-    print("=" * 100)
-    head = f"{'BS':>3}  {'HBM':>10}  " + "  ".join(
-        f"{'SSD-' + lbl:>14}" for lbl, _ in SSD_BW_OPTIONS)
+    print("=" * 110)
+    print(" Side-by-side TPOT comparison (ms / output token, per-request latency)")
+    print("=" * 110)
+    head = (f"{'BS/rank':>8} {'BS cluster':>11}  {'HBM':>11}  "
+            + "  ".join(f"{'SSD-' + lbl:>14}" for lbl, _ in SSD_BW_OPTIONS))
     print(head)
-    print("-" * 100)
+    print("-" * 110)
+    dp_attn = EP // TP
     for bs in BATCH_SIZES:
         hbm_layers = [layer_cost_hbm(SEQ_LEN, bs) for _ in range(NUM_LAYERS)]
         hbm_tpot = schedule_pp(hbm_layers, pp=PP)
-        row = f"{bs:>3}  {hbm_tpot:>9.2f}ms  "
+        hbm_mem  = memory_breakdown(bs, kv_on_ssd=False)
+        hbm_str  = f"{hbm_tpot:>9.2f}ms" if fits(hbm_mem['total']) else "  overflow"
+        row = f"{bs:>8} {bs * dp_attn:>11}  {hbm_str:>11}  "
         for _, bw in SSD_BW_OPTIONS:
             ssd_layers = [layer_cost_kv_on_ssd(SEQ_LEN, bs, bw)
                           for _ in range(NUM_LAYERS)]
             ssd_tpot = schedule_pp(ssd_layers, pp=PP)
-            row += f"{ssd_tpot:>11.2f}ms   "
+            ssd_mem  = memory_breakdown(bs, kv_on_ssd=True)
+            ssd_str  = f"{ssd_tpot:>9.2f}ms" if fits(ssd_mem['total']) else "  overflow"
+            row += f"  {ssd_str:>12}  "
         print(row)
 
 
 def print_memory_headroom_ssd():
     print()
-    print("=" * 100)
-    print(" Memory headroom with KV-on-SSD: max BS at sl=128K")
-    print("=" * 100)
+    print("=" * 110)
+    print(" Memory headroom with KV-on-SSD: max BS/rank at sl=128K")
+    print("=" * 110)
     print("  KV no longer in HBM → only Expert W + Dense W + IDX + scratch consume HBM.")
+    print("  All BS columns here are PER-RANK (multiply by DP_attn=4 for cluster BS).")
     print()
-    print(f"{'BS':>3}  {'Exp W':>7} {'Dense':>7} {'KV(SSD)':>9} {'IDX(HBM)':>10}"
+    print(f"{'BS/rank':>8} {'BS cluster':>11}  "
+          f"{'Exp W':>7} {'Dense':>7} {'KV(SSD)':>9} {'IDX(HBM)':>10}"
           f" {'Scratch':>8} {'HBM tot':>9} {'Fits?':>6}"
-          f"  {'SSD usage / req':>16}")
-    print("-" * 100)
+          f"  {'SSD use/req':>13}")
+    print("-" * 110)
+    dp_attn = EP // TP
     for bs in BATCH_SIZES + [32, 48, 64]:
         mem = memory_breakdown(bs, kv_on_ssd=True)
         kv_gb_ssd = per_rank_memory_bytes(PP, TP, EP, SEQ_LEN, bs, fp8=FP8)["kv"] / GB
-        print(f"{bs:>3}  {mem['expert_w']:>6.1f}G {mem['non_expert_w']:>6.2f}G "
+        print(f"{bs:>8} {bs * dp_attn:>11}  "
+              f"{mem['expert_w']:>6.1f}G {mem['non_expert_w']:>6.2f}G "
               f"{kv_gb_ssd:>8.2f}G {mem['idx']:>9.2f}G "
               f"{mem['cuda_scratch']:>7.1f}G {mem['total']:>8.1f}G "
               f"{'✓' if fits(mem['total']) else '✗':>6}  "
-              f"{kv_gb_ssd:>14.2f} GB")
+              f"{kv_gb_ssd:>11.2f} GB")
 
 
 def main():
@@ -232,9 +249,17 @@ def main():
     print_side_by_side()
     print_memory_headroom_ssd()
     print()
-    print("  HBM budget per GPU: 80 × 0.9 - 3 (scratch) = 69 GB usable for weights + cache")
+    print("  HBM budget per GPU: 80 × 0.9 − 3 (scratch) = 69 GB usable for weights + cache")
     print("  DP_attn (attention-parallel groups per stage) = EP/TP = 4")
-    print("  Cluster tok/s = DP_attn × bs / TPOT × 1000")
+    print()
+    print("  BS/rank vs BS cluster:")
+    print("    * BS/rank   — what the kernel sees: number of requests an attention rank batches together.")
+    print("                  TPOT is determined by this (compute and IO scale with BS/rank).")
+    print("    * BS cluster — total concurrent requests across the whole 16-GPU job:")
+    print("                  = DP_attn × BS/rank.   DP groups serve independent batches in parallel.")
+    print("    * Cluster tok/s = DP_attn × BS/rank / TPOT × 1000")
+    print("                    = BS cluster / TPOT × 1000")
+    print("    * DP multiplies concurrency, NOT latency — TPOT per request stays the same.")
 
 
 if __name__ == "__main__":
