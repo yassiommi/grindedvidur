@@ -520,18 +520,3 @@ is much less idx_io for IC to skip in the first place — at the floor
 
 ---
 
-## 13. Validation
-
-All 11 identity checks in `experiments/validate_pp2_tp.py` continue to
-pass under `absorb_mla=True` (the new default). The hand-derived values
-in the validator cover IO bytes/times, memory bytes, and the pipeline
-schedule walk — none of which change under absorption. The validator's
-`total_compute_ms` hand-reconstruction self-consistently uses the
-model's reported `block_c_ms`, so it tracks the new value automatically.
-
-Reproduce with:
-
-```
-python -m experiments.dsa_native_bs_sweep
-python -m experiments.validate_pp2_tp
-```
