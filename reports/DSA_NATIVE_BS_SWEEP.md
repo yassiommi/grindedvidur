@@ -1,14 +1,19 @@
 # DSA-Native (no IndexCache) Batch-Size Sweep at sl=128K
 
-**Config:** PP=2, TP=2, EP=8, FP8, sl=128K, HBM-resident, all-F (DSA),
-MLA absorption **enabled** (matches DeepSeek reference inference).
+**Config:** PP=2, TP=2, EP=8, FP8, sl=128K, all-F (DSA), MLA absorption
+**enabled** (matches DeepSeek reference inference).
+
+**Storage regimes compared:**
+1. **HBM** — MLA KV cache and DSA indexer K both resident in HBM
+2. **KV-on-SSD** — KV cache lives on local NVMe SSD per GPU (Gen4 single
+   drive at 7 GB/s and 4×Gen4 RAID at 28 GB/s); indexer K stays in HBM
 
 Source: `experiments/dsa_native_bs_sweep.py`, layer model in
 `experiments/analytical_layer.py` (`absorb_mla=True`).
 
 This report enumerates every variable, derives the memory and compute
 costs from first principles, walks the pipeline schedule, and presents
-the BS-sweep table.
+the BS-sweep tables for both storage regimes.
 
 ---
 
@@ -54,6 +59,9 @@ All values from `experiments/analytical_layer.py:72-96`.
 | HBM per GPU | 80 GB | H100 SXM5 |
 | Usable HBM fraction | 0.90 | fragmentation overhead |
 | CUDA scratch budget | 3 GB / rank | runtime context + small activations |
+| SSD floor latency | 50 µs / read | OS + driver submission overhead |
+| Gen4 single NVMe BW | 7 GB/s | typical sustained sequential |
+| 4× Gen4 RAID BW | 28 GB/s | aggregate across 4 drives |
 
 ---
 
@@ -246,12 +254,12 @@ in parallel with stage-0's compute.
 
 ---
 
-## 8. Memory budget per rank at sl=128K
+## 8. Memory budget per rank at sl=128K (HBM regime)
 
 Budget = `80 GB × 90% − 3 GB scratch = 69 GB available` for
 weights+cache.
 
-| BS | KV | IDX | Dense W | Expert W | Scratch | **Total** | Fits 72 GB? |
+| BS | KV | IDX | Dense W | Expert W | Scratch | **Total** | Fits? |
 |---:|---:|---:|---:|---:|---:|---:|:---:|
 |  1 |  2.18 G |  1.94 G | 3.41 G | 40.7 G | 3.0 G | **51.2 G** | ✓ |
 |  2 |  4.36 G |  3.88 G | 3.41 G | 40.7 G | 3.0 G | **55.3 G** | ✓ |
@@ -262,67 +270,132 @@ weights+cache.
 | 16 | 34.88 G | 31.00 G | 3.41 G | 40.7 G | 3.0 G | **113.0 G** | ✗ |
 | 24 | 52.31 G | 46.50 G | 3.41 G | 40.7 G | 3.0 G | **145.9 G** | ✗ |
 
-**Max fittable BS at sl=128K = 6 per attention rank.** Notice that
-KV+IDX scale together as 4.12 GB/BS (= 4.32 GB minus a small rounding;
-the table uses GiB = 2³⁰ B). The 25 GB cache budget covers about
-`25 / 4.12 ≈ 6` requests.
+KV+IDX grow together as 4.12 GB / BS (= 4.32 GB minus rounding;
+table uses GiB = 2³⁰ B). The 25 GB cache budget covers ~`25/4.12 ≈ 6`
+requests. **Max-fittable BS in HBM regime = 6.**
 
 ---
 
-## 9. TPOT sweep results
+## 9. Memory budget with KV on SSD
+
+Moving the MLA KV cache to local NVMe SSD removes the `kv` term from
+HBM. The DSA indexer K cache **stays in HBM** (it is hot-read every
+layer on F layers and is much smaller than the KV in any case).
+
+| BS | KV (SSD) | IDX | Dense W | Expert W | Scratch | **HBM total** | Fits? |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+|  1 |  2.18 G |  1.94 G | 3.41 G | 40.7 G | 3.0 G | **49.0 G** | ✓ |
+|  2 |  4.36 G |  3.88 G | 3.41 G | 40.7 G | 3.0 G | **51.0 G** | ✓ |
+|  4 |  8.72 G |  7.75 G | 3.41 G | 40.7 G | 3.0 G | **54.8 G** | ✓ |
+|  6 | 13.08 G | 11.62 G | 3.41 G | 40.7 G | 3.0 G | **58.7 G** | ✓ |
+|  8 | 17.44 G | 15.50 G | 3.41 G | 40.7 G | 3.0 G | **62.6 G** | ✓ |
+| 12 | 26.16 G | 23.25 G | 3.41 G | 40.7 G | 3.0 G | **70.3 G** | ✓ (just) |
+| 16 | 34.88 G | 31.00 G | 3.41 G | 40.7 G | 3.0 G | **78.1 G** | ✗ |
+| 24 | 52.31 G | 46.50 G | 3.41 G | 40.7 G | 3.0 G | **93.6 G** | ✗ |
+
+The KV column shows SSD consumption per request — the GPU doesn't see
+this. The new HBM bottleneck is the indexer K cache (it scales the same
+way as KV but is small enough that ceiling moves from BS=6 to **BS=12**).
+
+---
+
+## 10. TPOT sweep — both regimes
 
 All values from `experiments/dsa_native_bs_sweep.py`. Cluster
 tokens/s = `DP_attn × BS / TPOT × 1000` with `DP_attn = EP/TP = 4`.
 
-| BS | TPOT (ms) | tok/s / rank | cluster tok/s | fits? |
+### 10.1 HBM regime (KV + indexer both in HBM)
+
+| BS | TPOT (ms) | tok/s/rank | cluster tok/s | fits? |
 |---:|---:|---:|---:|:---:|
-|  1 | 14.74 |  67.9 |   271.4 | ✓ |
-|  2 | 17.93 | 111.6 |   446.2 | ✓ |
-|  4 | 24.15 | 165.6 |   662.6 | ✓ |
-|  6 | 30.19 | 198.7 |   794.9 | ✓ |
-|  8 | 36.08 | 221.8 |   887.0 | ✗ |
-| 12 | 47.31 | 253.6 | 1014.6 | ✗ |
-| 16 | 57.91 | 276.3 | 1105.2 | ✗ |
-| 24 | 77.49 | 309.7 | 1238.9 | ✗ |
+|  1 | 14.74 |  67.9 |   271 | ✓ |
+|  2 | 17.93 | 111.6 |   446 | ✓ |
+|  4 | 24.15 | 165.6 |   663 | ✓ |
+|  6 | **30.19** | 198.7 | **795** | ✓ |
+|  8 | 36.08 | 221.8 |   887 | ✗ |
+| 12 | 47.31 | 253.6 |  1015 | ✗ |
 
-**Throughput peaks at the memory wall: BS=6, ~795 cluster tok/s.**
-Beyond BS=6 every additional request overflows HBM at sl=128K.
+**HBM peak fit-able throughput: BS=6 → 795 cluster tok/s.**
 
-Compare to the pre-absorption model at BS=1 sl=128K (same config):
-the older block_c took 0.2353 ms vs the new 0.1390 ms; per-stage savings
-under TP=2 = (0.2353−0.1390)/2 × 31 = **1.49 ms / token**, taking BS=1
-TPOT from ~16.2 ms (pre-absorption) down to 14.74 ms.
+### 10.2 KV-on-SSD regime, 7 GB/s (Gen4 single drive)
+
+| BS | TPOT (ms) | tok/s/rank | cluster tok/s | fits? |
+|---:|---:|---:|---:|:---:|
+|  1 |  14.94 |  66.9 |  268 | ✓ |
+|  2 |  24.02 |  83.3 |  333 | ✓ |
+|  4 |  42.10 |  95.0 |  380 | ✓ |
+|  6 |  60.09 |  99.9 |  399 | ✓ |
+|  8 |  78.00 | 102.6 |  410 | ✓ |
+| 12 | **113.54** | 105.7 | **423** | ✓ |
+| 16 | 148.76 | 107.6 |  430 | ✗ |
+| 24 | 218.38 | 109.9 |  440 | ✗ |
+
+SSD bandwidth becomes the bottleneck almost immediately. At BS=12 the
+per-layer KV read is 17.3 MB → 2.5 ms / layer at 7 GB/s × 30 layers
+= 74 ms exposed IO per stage. The TPOT plateaus at ~423 tok/s
+regardless of BS.
+
+### 10.3 KV-on-SSD regime, 28 GB/s (4× Gen4 RAID)
+
+| BS | TPOT (ms) | tok/s/rank | cluster tok/s | fits? |
+|---:|---:|---:|---:|:---:|
+|  1 |  14.77 |  67.7 |  271 | ✓ |
+|  2 |  18.01 | 111.0 |  444 | ✓ |
+|  4 |  24.33 | 164.4 |  658 | ✓ |
+|  6 |  32.72 | 183.4 |  733 | ✓ |
+|  8 |  41.51 | 192.7 |  771 | ✓ |
+| 12 | **58.80** | 204.1 | **816** | ✓ |
+| 16 |  75.78 | 211.1 |  845 | ✗ |
+| 24 | 108.90 | 220.4 |  882 | ✗ |
+
+With 4× the SSD bandwidth, IO is no longer the dominant cost at small
+BS. **The extra batch headroom from moving KV off HBM (BS=12 vs BS=6)
+yields ~816 cluster tok/s — beating the HBM regime's max (795).**
+
+### 10.4 Side-by-side TPOT comparison
+
+| BS | HBM | SSD (7 GB/s) | SSD (28 GB/s) |
+|---:|---:|---:|---:|
+|  1 |  14.74 ms |  14.94 ms |  14.77 ms |
+|  2 |  17.93 ms |  24.02 ms |  18.01 ms |
+|  4 |  24.15 ms |  42.10 ms |  24.33 ms |
+|  6 |  30.19 ms |  60.09 ms |  32.72 ms |
+|  8 | overflow  |  78.00 ms |  41.51 ms |
+| 12 | overflow  | 113.54 ms |  58.80 ms |
+| 16 | overflow  | overflow  |  75.78 ms |
 
 ---
 
-## 10. Takeaways
+## 11. Takeaways
 
-1. **Removing the kv_up GEMM saves ~9 % of TPOT at BS=1** at this
-   config — non-trivial but not dramatic. The savings come from
-   eliminating a (2560·512·32768) GEMM per layer plus a 80-MB
-   decompressed-KV HBM read per layer. The absorbed-weight reads that
-   replace them (W^UK, W^UV) are BS-bounded and hit the HBM floor.
-2. **Memory is the bottleneck at sl=128K, not compute.** At BS=6 the
-   per-rank footprint is already 71.8 GB out of 72 GB usable. There is
-   no room to grow BS without an architectural change (longer PP,
-   smaller seq_len, FP4 experts, or KV offload).
-3. **The earlier "BS=85" hand-calc was off by 3.5×** because it divided
-   the MLA latent KV by TP (it doesn't shard) and ignored the indexer K
-   cache entirely. The real ceiling matching that math style is BS≈6 per
-   attention rank, or ~24 concurrent requests across 4 attention-DP
-   groups (still much less than 85).
-4. **DP_attn = 4 is the only multiplier you get from this 16-GPU layout.**
-   PP=2 splits layers; TP=2 splits non-expert weights but not KV/IDX. So
-   concurrent batch capacity = 4 × BS_per_rank.
-5. **For higher BS at sl=128K**, deploy options are: (a) FP4 expert
-   quantization halves Expert W and frees ~20 GB → enables BS≈10;
-   (b) PP=4 halves layers/stage → halves KV/IDX/token → enables BS≈12
-   but doubles the GPU count; (c) KV-on-SSD (covered in
-   `reports/KV_SSD_OFFLOAD_REPORT.md`) but pays the SSD bandwidth cost.
+1. **Removing the kv_up GEMM saves ~9 % of TPOT at BS=1.** Across the
+   sweep this savings holds roughly constant in absolute ms (1.5 ms / token)
+   so the relative win shrinks at higher BS.
+2. **In the HBM regime, memory caps BS at 6**, giving 795 cluster tok/s.
+3. **Moving KV to SSD doubles the BS ceiling to 12** because the KV
+   leaves HBM entirely. The new HBM bottleneck is the indexer K cache
+   (which scales the same way but is small enough to fit twice as much).
+4. **On a slow Gen4 single drive (7 GB/s)**, SSD reads dominate TPOT
+   and throughput plateaus at ~423 tok/s — worse than HBM regime despite
+   the larger fit-able batch.
+5. **On a 4× RAID (28 GB/s)**, the SSD regime *beats* the HBM regime at
+   peak: **816 cluster tok/s at BS=12 vs 795 at BS=6**. The extra batch
+   capacity outweighs the slightly higher per-token cost.
+6. **The earlier "BS=85" hand-calc was off by 3.5–7×** depending on regime
+   — they divided the MLA latent KV by TP (it doesn't shard) and ignored
+   the indexer K cache. The real ceilings are BS=6 (HBM) and BS=12 (SSD).
+7. **DP_attn = 4 is the only multiplier from this 16-GPU layout.** Cluster
+   batch capacity = 4 × BS_per_rank.
+8. **For higher BS at sl=128K**, deploy options are:
+   (a) **KV-on-SSD with fast RAID** — best ROI: 1.03× throughput vs HBM peak;
+   (b) FP4 expert quantization frees ~20 GB → enables BS≈10 in HBM;
+   (c) PP=4 halves layers/stage → halves cache/token but doubles GPU count;
+   (d) Indexer-K offload would further raise the BS ceiling but break
+       the producer/consumer model since indexer K is hot-read.
 
 ---
 
-## 11. Validation
+## 12. Validation
 
 All 11 identity checks in `experiments/validate_pp2_tp.py` continue to
 pass under `absorb_mla=True` (the new default). The hand-derived values
