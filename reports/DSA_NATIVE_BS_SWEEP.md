@@ -1,15 +1,12 @@
-# DSA-Native (no IndexCache) Batch-Size Sweep at sl=128K
+# DSA-Native Batch-Size Sweep at sl=128K
 
 **Config:** PP=2, TP=2, EP=8, FP8, sl=128K, all-F (DSA), MLA absorption
-**enabled** (matches DeepSeek reference inference).
+
 
 **Storage regimes compared:**
 1. **HBM** — MLA KV cache and DSA indexer K both resident in HBM
 2. **KV-on-SSD** — KV cache lives on a local 4× Gen4 NVMe RAID (28 GB/s)
    per GPU; indexer K stays in HBM
-
-Source: `experiments/dsa_native_bs_sweep.py`, layer model in
-`experiments/analytical_layer.py` (`absorb_mla=True`).
 
 This report enumerates every variable, derives the memory and compute
 costs from first principles, walks the pipeline schedule, and presents
@@ -18,8 +15,6 @@ the BS-sweep tables for both storage regimes.
 ---
 
 ## 1. Architecture & DSA constants
-
-All values from `experiments/analytical_layer.py:72-96`.
 
 | Name | Value | Meaning |
 |---|---:|---|
@@ -78,7 +73,7 @@ a TP/DP rank for attention.
 
 **MLA duplication tax:** TP shards the non-expert weights but **not** the
 MLA latent KV or the DSA indexer K cache. KV/IDX caches replicate across
-all TP ranks within a stage (`experiments/analytical_layer.py:356-360`).
+all TP ranks within a stage.
 
 ### 3.1 BS-per-rank vs BS-cluster (important terminology)
 
@@ -99,20 +94,13 @@ cluster tok/s = DP_attn × BS-per-rank / TPOT × 1000
              = BS-cluster / TPOT × 1000
 ```
 
-**DP multiplies concurrency, not latency.** Each request still
-experiences `TPOT` ms between tokens regardless of how many other DP
-groups are running in parallel. Dividing TPOT by DP is meaningless.
-
 For the tables below: **BS column = BS-per-rank; BS-cluster column = 4 × BS-per-rank**.
 
 ---
 
 ## 4. MLA absorption — what kv_up is and why we drop it
 
-### 4.1 Pre-absorption (naive)
-
-The model originally (and incorrectly, for inference) computed an
-explicit kv-up GEMM in `block_c` at every layer:
+### 4.1 Pre-absorption
 
 ```
 kv_up = gemm(BS·DSA_ATTENDED, KV_LORA_RANK → KV_UP_OUT_DIM)
@@ -179,8 +167,6 @@ Per stage (31 layers): **−1.49 ms / token**.
 
 ## 5. Memory accounting per rank
 
-Function: `per_rank_memory_bytes(pp, tp, ep, seq_len, bs, fp8)` at
-`experiments/analytical_layer.py:352`. Formulas (FP8):
 
 ```
 layers_per_stage = ceil(NUM_LAYERS / PP)              = ceil(61/2) = 31
@@ -192,7 +178,7 @@ DenseW = layers_per_stage · NON_EXPERT_W_PER_LAYER_B / TP / 2     (FP8)
 ExpW   = layers_per_stage · EXPERT_W_PER_LAYER_B      / EP / 2    (FP8)
 ```
 
-Constants from `analytical_layer.py:337-349`:
+Constants:
 
 ```
 NON_EXPERT_W_PER_LAYER_B (FP16 bytes) = 2 × (
@@ -233,8 +219,6 @@ At sl=128K: **32.9 kB × 128·1024 = 4.32 GB / request / GPU**.
 
 ## 6. Compute model per piece (FP8 BS=1, HBM)
 
-All other pieces are unchanged by absorption. Values from
-`analytical_layer.py:213-329`.
 
 | Piece | Formula | Time (FP8, BS=1) |
 |---|---|---:|
@@ -253,9 +237,6 @@ by TP; expert_gemm and ep_comms are not.
 ---
 
 ## 7. Pipeline schedule
-
-Function: `schedule_pp` (`dsa_native_bs_sweep.py:48`). Same producer/
-consumer template used across all reports in this project.
 
 ```
 Stage 0 (layers 0..30):
@@ -332,8 +313,8 @@ way as KV but is small enough that ceiling moves from **BS=6 per rank
 
 ## 10. TPOT sweep — both regimes
 
-All values from `experiments/dsa_native_bs_sweep.py`. **TPOT is per-request
-latency** (what one user experiences between consecutive output tokens).
+ **TPOT is per-request
+latency**.
 Cluster tok/s = `DP_attn × BS / TPOT × 1000` with `DP_attn = EP/TP = 4`.
 
 ### 10.1 HBM regime (KV + indexer both in HBM)
@@ -421,19 +402,3 @@ to ~707 cluster tok/s at BS=5 (vs HBM's 736 at the same BS).
        the producer/consumer model since indexer K is hot-read.
 
 ---
-
-## 12. Validation
-
-All 11 identity checks in `experiments/validate_pp2_tp.py` continue to
-pass under `absorb_mla=True` (the new default). The hand-derived values
-in the validator cover IO bytes/times, memory bytes, and the pipeline
-schedule walk — none of which change under absorption. The validator's
-`total_compute_ms` hand-reconstruction self-consistently uses the
-model's reported `block_c_ms`, so it tracks the new value automatically.
-
-Reproduce with:
-
-```
-python -m experiments.dsa_native_bs_sweep
-python -m experiments.validate_pp2_tp
-```
