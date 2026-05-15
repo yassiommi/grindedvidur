@@ -50,7 +50,6 @@ CUDA_SCRATCH_GB = 3
 BATCH_SIZES = [1, 2, 4, 6, 8, 12, 16, 24]
 SSD_FLOOR_MS = 0.050    # ~50 us OS + driver overhead per read submission
 SSD_BW_OPTIONS = [
-    ("Gen4 single",  7.0),
     ("4× Gen4 RAID", 28.0),
 ]
 

@@ -5,8 +5,8 @@
 
 **Storage regimes compared:**
 1. **HBM** — MLA KV cache and DSA indexer K both resident in HBM
-2. **KV-on-SSD** — KV cache lives on local NVMe SSD per GPU (Gen4 single
-   drive at 7 GB/s and 4×Gen4 RAID at 28 GB/s); indexer K stays in HBM
+2. **KV-on-SSD** — KV cache lives on a local 4× Gen4 NVMe RAID (28 GB/s)
+   per GPU; indexer K stays in HBM
 
 Source: `experiments/dsa_native_bs_sweep.py`, layer model in
 `experiments/analytical_layer.py` (`absorb_mla=True`).
@@ -60,8 +60,7 @@ All values from `experiments/analytical_layer.py:72-96`.
 | Usable HBM fraction | 0.90 | fragmentation overhead |
 | CUDA scratch budget | 3 GB / rank | runtime context + small activations |
 | SSD floor latency | 50 µs / read | OS + driver submission overhead |
-| Gen4 single NVMe BW | 7 GB/s | typical sustained sequential |
-| 4× Gen4 RAID BW | 28 GB/s | aggregate across 4 drives |
+| 4× Gen4 RAID BW | 28 GB/s | aggregate across 4 NVMe drives |
 
 ---
 
@@ -317,25 +316,7 @@ tokens/s = `DP_attn × BS / TPOT × 1000` with `DP_attn = EP/TP = 4`.
 
 **HBM peak fit-able throughput: BS=6 → 795 cluster tok/s.**
 
-### 10.2 KV-on-SSD regime, 7 GB/s (Gen4 single drive)
-
-| BS | TPOT (ms) | tok/s/rank | cluster tok/s | fits? |
-|---:|---:|---:|---:|:---:|
-|  1 |  14.94 |  66.9 |  268 | ✓ |
-|  2 |  24.02 |  83.3 |  333 | ✓ |
-|  4 |  42.10 |  95.0 |  380 | ✓ |
-|  6 |  60.09 |  99.9 |  399 | ✓ |
-|  8 |  78.00 | 102.6 |  410 | ✓ |
-| 12 | **113.54** | 105.7 | **423** | ✓ |
-| 16 | 148.76 | 107.6 |  430 | ✗ |
-| 24 | 218.38 | 109.9 |  440 | ✗ |
-
-SSD bandwidth becomes the bottleneck almost immediately. At BS=12 the
-per-layer KV read is 17.3 MB → 2.5 ms / layer at 7 GB/s × 30 layers
-= 74 ms exposed IO per stage. The TPOT plateaus at ~423 tok/s
-regardless of BS.
-
-### 10.3 KV-on-SSD regime, 28 GB/s (4× Gen4 RAID)
+### 10.2 KV-on-SSD regime, 28 GB/s (4× Gen4 RAID)
 
 | BS | TPOT (ms) | tok/s/rank | cluster tok/s | fits? |
 |---:|---:|---:|---:|:---:|
@@ -352,17 +333,17 @@ With 4× the SSD bandwidth, IO is no longer the dominant cost at small
 BS. **The extra batch headroom from moving KV off HBM (BS=12 vs BS=6)
 yields ~816 cluster tok/s — beating the HBM regime's max (795).**
 
-### 10.4 Side-by-side TPOT comparison
+### 10.3 Side-by-side TPOT comparison
 
-| BS | HBM | SSD (7 GB/s) | SSD (28 GB/s) |
-|---:|---:|---:|---:|
-|  1 |  14.74 ms |  14.94 ms |  14.77 ms |
-|  2 |  17.93 ms |  24.02 ms |  18.01 ms |
-|  4 |  24.15 ms |  42.10 ms |  24.33 ms |
-|  6 |  30.19 ms |  60.09 ms |  32.72 ms |
-|  8 | overflow  |  78.00 ms |  41.51 ms |
-| 12 | overflow  | 113.54 ms |  58.80 ms |
-| 16 | overflow  | overflow  |  75.78 ms |
+| BS | HBM | SSD (28 GB/s) |
+|---:|---:|---:|
+|  1 |  14.74 ms |  14.77 ms |
+|  2 |  17.93 ms |  18.01 ms |
+|  4 |  24.15 ms |  24.33 ms |
+|  6 |  30.19 ms |  32.72 ms |
+|  8 | overflow  |  41.51 ms |
+| 12 | overflow  |  58.80 ms |
+| 16 | overflow  |  75.78 ms |
 
 ---
 
@@ -375,18 +356,13 @@ yields ~816 cluster tok/s — beating the HBM regime's max (795).**
 3. **Moving KV to SSD doubles the BS ceiling to 12** because the KV
    leaves HBM entirely. The new HBM bottleneck is the indexer K cache
    (which scales the same way but is small enough to fit twice as much).
-4. **On a slow Gen4 single drive (7 GB/s)**, SSD reads dominate TPOT
-   and throughput plateaus at ~423 tok/s — worse than HBM regime despite
-   the larger fit-able batch.
-5. **On a 4× RAID (28 GB/s)**, the SSD regime *beats* the HBM regime at
-   peak: **816 cluster tok/s at BS=12 vs 795 at BS=6**. The extra batch
-   capacity outweighs the slightly higher per-token cost.
-6. **The earlier "BS=85" hand-calc was off by 3.5–7×** depending on regime
-   — they divided the MLA latent KV by TP (it doesn't shard) and ignored
-   the indexer K cache. The real ceilings are BS=6 (HBM) and BS=12 (SSD).
-7. **DP_attn = 4 is the only multiplier from this 16-GPU layout.** Cluster
+4. **On a 4× Gen4 NVMe RAID (28 GB/s)**, the SSD regime *beats* the HBM
+   regime at peak: **816 cluster tok/s at BS=12 vs 795 at BS=6**. The extra
+   batch capacity outweighs the slightly higher per-token cost (~7 ms
+   exposed SSD IO per stage at BS=12).
+5. **DP_attn = 4 is the only multiplier from this 16-GPU layout.** Cluster
    batch capacity = 4 × BS_per_rank.
-8. **For higher BS at sl=128K**, deploy options are:
+6. **For higher BS at sl=128K**, deploy options are:
    (a) **KV-on-SSD with fast RAID** — best ROI: 1.03× throughput vs HBM peak;
    (b) FP4 expert quantization frees ~20 GB → enables BS≈10 in HBM;
    (c) PP=4 halves layers/stage → halves cache/token but doubles GPU count;
