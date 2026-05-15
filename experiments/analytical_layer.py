@@ -91,9 +91,13 @@ DSA_TOPK             = 2048
 DSA_SLIDING          = 512
 DSA_ATTENDED         = DSA_TOPK + DSA_SLIDING                # 2560
 
+# Indexer K projection dim (DeepSeek's lightning indexer projects to a
+# smaller dim than MLA's latent: 128 vs 512).
+INDEXER_DIM          = 128
+
 # Cache bytes per token per layer
 MLA_KV_BYTES_PER_TOKEN  = (KV_LORA_RANK + QK_ROPE) * 2       # 1152 B (FP16)
-INDEXER_K_BYTES_PER_TOKEN = KV_LORA_RANK * 1                 # 512 B (FP8)
+INDEXER_K_BYTES_PER_TOKEN = INDEXER_DIM * 1                  # 128 B (FP8)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -341,7 +345,7 @@ NON_EXPERT_W_PER_LAYER_B = (
     + HIDDEN * KV_LORA_RANK
     + KV_LORA_RANK * NUM_HEADS * (QK_NOPE + V_HEAD)
     + NUM_HEADS * V_HEAD * HIDDEN
-    + HIDDEN * KV_LORA_RANK
+    + HIDDEN * INDEXER_DIM            # indexer K proj (128-dim, not 512)
     + HIDDEN * NUM_ROUTED_EXPERTS
     + 3 * HIDDEN * EXPERT_INTERMEDIATE
 ) * 2  # FP16

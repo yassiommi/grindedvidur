@@ -47,7 +47,7 @@ SEQ_LEN = 128 * 1024
 HBM_PER_GPU_GB = 80
 HBM_USABLE_FRAC = 0.90
 CUDA_SCRATCH_GB = 3
-BATCH_SIZES = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24]
+BATCH_SIZES = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48]
 SSD_FLOOR_MS = 0.050    # ~50 us OS + driver overhead per read submission
 SSD_BW_OPTIONS = [
     ("4× Gen4 RAID", 28.0),
