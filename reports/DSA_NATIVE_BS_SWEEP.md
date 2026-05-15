@@ -56,6 +56,9 @@ the BS-sweep tables for both storage regimes.
 | CUDA scratch budget | 3 GB / rank | runtime context + small activations |
 | SSD floor latency | 50 µs / read | OS + driver submission overhead |
 | 4× Gen4 RAID BW | 28 GB/s | aggregate across 4 NVMe drives |
+| HBM peak IOPS (576 B/op, KV) | 2,580 M/s | 1384 GB/s ÷ 576 B |
+| HBM peak IOPS (512 B/op, idx) | 2,902 M/s | 1384 GB/s ÷ 512 B |
+| SSD peak IOPS (576 B/op, KV) | 52.2 M/s | 28 GB/s ÷ 576 B |
 
 ---
 
@@ -301,34 +304,43 @@ Cluster tok/s = `BS / TPOT × 1000`.
 
 ### 10.1 HBM regime (KV + indexer both in HBM)
 
-| BS | TPOT (ms) | cluster tok/s | fits? |
-|---:|---:|---:|:---:|
-|   4 | 14.74 |   271 | ✓ |
-|   8 | 17.93 |   446 | ✓ |
-|  12 | 21.06 |   570 | ✓ |
-|  16 | 24.15 |   663 | ✓ |
-|  20 | 27.18 |   736 | ✓ |
-|  24 | **30.19** | **795** | ✓ |
-|  32 | 36.08 |   887 | ✗ |
-|  48 | 47.31 |  1015 | ✗ |
+KV IOPS = (BS/4 · 2560) ops / kv\_io\_s at 576 B/op. HBM peak = 2,580 M/s.
+Indexer K always saturates HBM at 2,902 M/s (512 B/op, not shown — constant).
+
+| BS | TPOT (ms) | per-layer (ms) | KV IOPS | cluster tok/s | fits? |
+|---:|---:|---:|---:|---:|:---:|
+|   4 | 14.74 | 0.242 |  170.7 M | 271 | ✓ |
+|   8 | 17.93 | 0.294 |  341.3 M | 446 | ✓ |
+|  12 | 21.06 | 0.345 |  512.0 M | 570 | ✓ |
+|  16 | 24.15 | 0.396 |  682.7 M | 663 | ✓ |
+|  20 | 27.18 | 0.446 |  853.3 M | 736 | ✓ |
+|  24 | **30.19** | **0.495** | **1,024 M** | **795** | ✓ |
+|  32 | 36.08 | 0.591 | 1,365 M |  887 | ✗ |
+|  48 | 47.31 | 0.776 | 2,048 M | 1015 | ✗ |
+
+KV reads in HBM are **always floor-limited** at sl=128K — even BS=48 cluster (12/rank) only
+reaches 2,048 M/s vs peak 2,580 M/s. The floor (0.015 ms) masks small KV payloads.
 
 **HBM peak fit-able throughput: BS=24 → 795 cluster tok/s.**
 The **"20–30 ms TPOT" operating window corresponds to BS=12–20 cluster.**
 
 ### 10.2 KV-on-SSD regime, 28 GB/s (4× Gen4 RAID)
 
-| BS | TPOT (ms) | cluster tok/s | fits? |
-|---:|---:|---:|:---:|
-|   4 |  14.77 |  271 | ✓ |
-|   8 |  18.01 |  444 | ✓ |
-|  12 |  21.20 |  566 | ✓ |
-|  16 |  24.33 |  658 | ✓ |
-|  20 |  28.29 |  707 | ✓ |
-|  24 |  32.72 |  734 | ✓ |
-|  32 |  41.51 |  771 | ✓ |
-|  48 | **58.80** | **816** | ✓ |
-|  64 |  75.78 |  845 | ✗ |
-|  96 | 108.90 |  882 | ✗ |
+KV IOPS = (BS/4 · 2560) ops / kv\_io\_s at 576 B/op. SSD peak = 52.2 M/s.
+The SSD is always at peak IOPS: floor-limited at BS=4 (51.2 M/s ≈ peak), BW-saturated at BS≥8 (exactly 52.2 M/s).
+
+| BS | TPOT (ms) | per-layer (ms) | KV IOPS | cluster tok/s | fits? |
+|---:|---:|---:|---:|---:|:---:|
+|   4 |  14.77 | 0.242 | 51.2 M | 271 | ✓ |
+|   8 |  18.01 | 0.295 | 52.2 M | 444 | ✓ |
+|  12 |  21.20 | 0.347 | 52.2 M | 566 | ✓ |
+|  16 |  24.33 | 0.399 | 52.2 M | 658 | ✓ |
+|  20 |  28.29 | 0.464 | 52.2 M | 707 | ✓ |
+|  24 |  32.72 | 0.536 | 52.2 M | 734 | ✓ |
+|  32 |  41.51 | 0.680 | 52.2 M | 771 | ✓ |
+|  48 | **58.80** | **0.964** | **52.2 M** | **816** | ✓ |
+|  64 |  75.78 | 1.242 | 52.2 M | 845 | ✗ |
+|  96 | 108.90 | 1.785 | 52.2 M | 882 | ✗ |
 
 **SSD peak fit-able throughput: BS=48 → 816 cluster tok/s**, beating
 the HBM regime's max (795) by doubling batch capacity.
@@ -372,18 +384,20 @@ overlap disappears and `block_a` becomes exposed latency. At higher BS
 the indexer K reads grow (proportional to BS×sl), eventually dominating
 and making IC's savings significant.
 
-| BS | DSA TPOT | IC TPOT | speedup | fits? |
-|---:|---:|---:|---:|:---:|
-|   4 | 14.74 ms | 15.42 ms | 0.96× | ✓ |
-|   8 | 17.93 ms | 18.50 ms | 0.97× | ✓ |
-|  12 | 21.06 ms | 21.52 ms | 0.98× | ✓ |
-|  16 | 24.15 ms | 24.50 ms | 0.99× | ✓ |
-|  20 | 27.18 ms | 27.42 ms | 0.99× | ✓ |
-|  24 | 30.19 ms | 30.32 ms | 1.00× | ✓ |
-|  32 | 36.08 ms | 35.98 ms | 1.00× | ✗ |
-|  48 | 47.31 ms | 46.76 ms | 1.01× | ✗ |
-|  64 | 57.91 ms | 56.87 ms | 1.02× | ✗ |
-|  96 | 77.49 ms | 75.20 ms | 1.03× | ✗ |
+Per-layer = TPOT / 61. Per-FSSS = TPOT × 4 / 61 (latency of one F+S+S+S group, 4 layers).
+
+| BS | DSA TPOT | DSA per-layer | IC TPOT | IC per-FSSS | speedup | fits? |
+|---:|---:|---:|---:|---:|---:|:---:|
+|   4 | 14.74 ms | 0.242 ms | 15.42 ms | 1.011 ms | 0.96× | ✓ |
+|   8 | 17.93 ms | 0.294 ms | 18.50 ms | 1.213 ms | 0.97× | ✓ |
+|  12 | 21.06 ms | 0.345 ms | 21.52 ms | 1.411 ms | 0.98× | ✓ |
+|  16 | 24.15 ms | 0.396 ms | 24.50 ms | 1.606 ms | 0.99× | ✓ |
+|  20 | 27.18 ms | 0.446 ms | 27.42 ms | 1.798 ms | 0.99× | ✓ |
+|  24 | 30.19 ms | 0.495 ms | 30.32 ms | 1.988 ms | 1.00× | ✓ |
+|  32 | 36.08 ms | 0.591 ms | 35.98 ms | 2.359 ms | 1.00× | ✗ |
+|  48 | 47.31 ms | 0.776 ms | 46.76 ms | 3.066 ms | 1.01× | ✗ |
+|  64 | 57.91 ms | 0.950 ms | 56.87 ms | 3.729 ms | 1.02× | ✗ |
+|  96 | 77.49 ms | 1.270 ms | 75.20 ms | 4.931 ms | 1.03× | ✗ |
 
 **In the HBM regime at sl=128K, IndexCache provides no meaningful
 speedup** within the fit-able range (BS≤24). The indexer K read per
@@ -398,18 +412,20 @@ dominates the schedule. IC's savings on idx_io (HBM, ~0.045 ms/layer at
 BS=4) become meaningful once SSD forces the schedule to run longer — the
 saved idx_io ms subtract directly from TPOT.
 
-| BS | DSA TPOT | IC TPOT | speedup | fits? |
-|---:|---:|---:|---:|:---:|
-|   4 |  14.77 ms | 15.46 ms | 0.96× | ✓ |
-|   8 |  18.01 ms | 18.58 ms | 0.97× | ✓ |
-|  12 |  21.20 ms | 21.66 ms | 0.98× | ✓ |
-|  16 |  24.33 ms | 24.68 ms | 0.99× | ✓ |
-|  20 |  28.29 ms | 27.65 ms | **1.02×** | ✓ |
-|  24 |  32.72 ms | 30.60 ms | **1.07×** | ✓ |
-|  32 |  41.51 ms | 36.35 ms | **1.14×** | ✓ |
-|  48 |  58.80 ms | 47.34 ms | **1.24×** | ✓ |
-|  64 |  75.78 ms | 58.91 ms | 1.29× | ✗ |
-|  96 | 108.90 ms | 82.91 ms | 1.31× | ✗ |
+Per-layer = TPOT / 61. Per-FSSS = TPOT × 4 / 61.
+
+| BS | DSA TPOT | DSA per-layer | IC TPOT | IC per-FSSS | speedup | fits? |
+|---:|---:|---:|---:|---:|---:|:---:|
+|   4 |  14.77 ms | 0.242 ms | 15.46 ms | 1.013 ms | 0.96× | ✓ |
+|   8 |  18.01 ms | 0.295 ms | 18.58 ms | 1.219 ms | 0.97× | ✓ |
+|  12 |  21.20 ms | 0.347 ms | 21.66 ms | 1.420 ms | 0.98× | ✓ |
+|  16 |  24.33 ms | 0.399 ms | 24.68 ms | 1.618 ms | 0.99× | ✓ |
+|  20 |  28.29 ms | 0.464 ms | 27.65 ms | 1.813 ms | **1.02×** | ✓ |
+|  24 |  32.72 ms | 0.536 ms | 30.60 ms | 2.006 ms | **1.07×** | ✓ |
+|  32 |  41.51 ms | 0.680 ms | 36.35 ms | 2.384 ms | **1.14×** | ✓ |
+|  48 |  58.80 ms | 0.964 ms | 47.34 ms | 3.104 ms | **1.24×** | ✓ |
+|  64 |  75.78 ms | 1.242 ms | 58.91 ms | 3.863 ms | 1.29× | ✗ |
+|  96 | 108.90 ms | 1.785 ms | 82.91 ms | 5.437 ms | 1.31× | ✗ |
 
 **In the KV-on-SSD regime, IndexCache wins meaningfully at BS≥20.**
 At the SSD fit ceiling (BS=48), IC delivers **1.24× speedup**
