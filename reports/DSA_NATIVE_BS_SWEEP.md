@@ -385,22 +385,27 @@ the indexer K reads grow (proportional to BS×sl), eventually dominating
 and making IC's savings significant.
 
 Per-layer = TPOT / 61. Per-FSSS = TPOT × 4 / 61 (latency of one F+S+S+S group, 4 layers).
-**FSSS IOPS** = ops in one FSSS group ÷ per-FSSS wall time. For an FSSS group there are
-4 KV reads (every layer) but only **1 idx read** (F only) — so IC drives ~1/4 the idx
-IOPS that DSA would over an equivalent 4-layer window.
+**Peak FSSS KV IOPS** = (4 KV reads × (BS/4) × 2560 ops) ÷ (time to load 4 layers of KV).
+Model: after the F-layer's top-k is computed, all 4 layers' KV are preloaded in one burst
+before any attention compute — peak IOPS is measured during this preload window only.
+HBM saturates at 2,580 M/s (peak HBM at 576 B/op); below saturation IOPS scales linearly
+with BS while the 0.015 ms floor still gates the read.
 
-| BS | DSA TPOT | DSA per-layer | IC TPOT | IC per-FSSS | FSSS KV IOPS | FSSS idx IOPS | speedup | fits? |
-|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-|   4 | 14.74 ms | 0.242 ms | 15.42 ms | 1.011 ms |  10.1 M | 129.6 M | 0.96× | ✓ |
-|   8 | 17.93 ms | 0.294 ms | 18.50 ms | 1.213 ms |  16.9 M | 216.1 M | 0.97× | ✓ |
-|  12 | 21.06 ms | 0.345 ms | 21.52 ms | 1.411 ms |  21.8 M | 278.6 M | 0.98× | ✓ |
-|  16 | 24.15 ms | 0.396 ms | 24.50 ms | 1.606 ms |  25.5 M | 326.4 M | 0.99× | ✓ |
-|  20 | 27.18 ms | 0.446 ms | 27.42 ms | 1.798 ms |  28.5 M | 364.5 M | 0.99× | ✓ |
-|  24 | 30.19 ms | 0.495 ms | 30.32 ms | 1.988 ms |  30.9 M | 395.6 M | 1.00× | ✓ |
-|  32 | 36.08 ms | 0.591 ms | 35.98 ms | 2.359 ms |  34.7 M | 444.5 M | 1.00× | ✗ |
-|  48 | 47.31 ms | 0.776 ms | 46.76 ms | 3.066 ms |  40.1 M | 512.9 M | 1.01× | ✗ |
-|  64 | 57.91 ms | 0.950 ms | 56.87 ms | 3.729 ms |  43.9 M | 562.4 M | 1.02× | ✗ |
-|  96 | 77.49 ms | 1.270 ms | 75.20 ms | 4.931 ms |  49.8 M | 637.9 M | 1.03× | ✗ |
+| BS | DSA TPOT | DSA per-layer | IC TPOT | IC per-FSSS | Peak FSSS KV IOPS | speedup | fits? |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+|   4 | 14.74 ms | 0.242 ms | 15.42 ms | 1.011 ms |   682.7 M | 0.96× | ✓ |
+|   8 | 17.93 ms | 0.294 ms | 18.50 ms | 1.213 ms | 1,365.3 M | 0.97× | ✓ |
+|  12 | 21.06 ms | 0.345 ms | 21.52 ms | 1.411 ms | 2,048.0 M | 0.98× | ✓ |
+|  16 | 24.15 ms | 0.396 ms | 24.50 ms | 1.606 ms | **2,580 M** (peak) | 0.99× | ✓ |
+|  20 | 27.18 ms | 0.446 ms | 27.42 ms | 1.798 ms | 2,580 M (peak) | 0.99× | ✓ |
+|  24 | 30.19 ms | 0.495 ms | 30.32 ms | 1.988 ms | 2,580 M (peak) | 1.00× | ✓ |
+|  32 | 36.08 ms | 0.591 ms | 35.98 ms | 2.359 ms | 2,580 M (peak) | 1.00× | ✗ |
+|  48 | 47.31 ms | 0.776 ms | 46.76 ms | 3.066 ms | 2,580 M (peak) | 1.01× | ✗ |
+|  64 | 57.91 ms | 0.950 ms | 56.87 ms | 3.729 ms | 2,580 M (peak) | 1.02× | ✗ |
+|  96 | 77.49 ms | 1.270 ms | 75.20 ms | 4.931 ms | 2,580 M (peak) | 1.03× | ✗ |
+
+The 4-layer combined KV preload crosses the floor→BW boundary at **BS=16 cluster** —
+above that, the burst hits HBM's peak KV IOPS (2,580 M/s).
 
 **In the HBM regime at sl=128K, IndexCache provides no meaningful
 speedup** within the fit-able range (BS≤24). The indexer K read per
@@ -416,22 +421,22 @@ BS=4) become meaningful once SSD forces the schedule to run longer — the
 saved idx_io ms subtract directly from TPOT.
 
 Per-layer = TPOT / 61. Per-FSSS = TPOT × 4 / 61.
-**FSSS KV IOPS** averages over the FSSS wall time; the SSD itself still bursts at peak
-52.2 M/s during each KV read (4 reads per cycle). **FSSS idx IOPS** is on HBM (idx never
-leaves HBM in this regime) — IC issues 1 idx read per cycle vs DSA's 4.
+**Peak FSSS KV IOPS** = 4 KV reads ÷ time to load 4 layers of KV from SSD.
+At 28 GB/s the 4-layer combined read is BW-saturated at every BS (5.9 MB at BS=4 already
+takes 196 µs vs the 50 µs floor), so peak IOPS = SSD's peak at 576 B = **52.2 M/s constant**.
 
-| BS | DSA TPOT | DSA per-layer | IC TPOT | IC per-FSSS | FSSS KV IOPS | FSSS idx IOPS | speedup | fits? |
-|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-|   4 |  14.77 ms | 0.242 ms | 15.46 ms | 1.013 ms |  10.1 M | 129.3 M | 0.96× | ✓ |
-|   8 |  18.01 ms | 0.295 ms | 18.58 ms | 1.219 ms |  16.8 M | 215.1 M | 0.97× | ✓ |
-|  12 |  21.20 ms | 0.347 ms | 21.66 ms | 1.420 ms |  21.6 M | 276.9 M | 0.98× | ✓ |
-|  16 |  24.33 ms | 0.399 ms | 24.68 ms | 1.618 ms |  25.3 M | 324.0 M | 0.99× | ✓ |
-|  20 |  28.29 ms | 0.464 ms | 27.65 ms | 1.813 ms |  28.2 M | 361.5 M | **1.02×** | ✓ |
-|  24 |  32.72 ms | 0.536 ms | 30.60 ms | 2.006 ms |  30.6 M | 392.0 M | **1.07×** | ✓ |
-|  32 |  41.51 ms | 0.680 ms | 36.35 ms | 2.384 ms |  34.4 M | 439.9 M | **1.14×** | ✓ |
-|  48 |  58.80 ms | 0.964 ms | 47.34 ms | 3.104 ms |  39.6 M | 506.7 M | **1.24×** | ✓ |
-|  64 |  75.78 ms | 1.242 ms | 58.91 ms | 3.863 ms |  42.4 M | 542.9 M | 1.29× | ✗ |
-|  96 | 108.90 ms | 1.785 ms | 82.91 ms | 5.437 ms |  45.2 M | 578.6 M | 1.31× | ✗ |
+| BS | DSA TPOT | DSA per-layer | IC TPOT | IC per-FSSS | Peak FSSS KV IOPS | speedup | fits? |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+|   4 |  14.77 ms | 0.242 ms | 15.46 ms | 1.013 ms | 52.2 M (peak) | 0.96× | ✓ |
+|   8 |  18.01 ms | 0.295 ms | 18.58 ms | 1.219 ms | 52.2 M (peak) | 0.97× | ✓ |
+|  12 |  21.20 ms | 0.347 ms | 21.66 ms | 1.420 ms | 52.2 M (peak) | 0.98× | ✓ |
+|  16 |  24.33 ms | 0.399 ms | 24.68 ms | 1.618 ms | 52.2 M (peak) | 0.99× | ✓ |
+|  20 |  28.29 ms | 0.464 ms | 27.65 ms | 1.813 ms | 52.2 M (peak) | **1.02×** | ✓ |
+|  24 |  32.72 ms | 0.536 ms | 30.60 ms | 2.006 ms | 52.2 M (peak) | **1.07×** | ✓ |
+|  32 |  41.51 ms | 0.680 ms | 36.35 ms | 2.384 ms | 52.2 M (peak) | **1.14×** | ✓ |
+|  48 |  58.80 ms | 0.964 ms | 47.34 ms | 3.104 ms | 52.2 M (peak) | **1.24×** | ✓ |
+|  64 |  75.78 ms | 1.242 ms | 58.91 ms | 3.863 ms | 52.2 M (peak) | 1.29× | ✗ |
+|  96 | 108.90 ms | 1.785 ms | 82.91 ms | 5.437 ms | 52.2 M (peak) | 1.31× | ✗ |
 
 **In the KV-on-SSD regime, IndexCache wins meaningfully at BS≥20.**
 At the SSD fit ceiling (BS=48), IC delivers **1.24× speedup**
