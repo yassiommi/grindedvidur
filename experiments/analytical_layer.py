@@ -211,39 +211,23 @@ class AnalyticalLayerCost:
 
 
 def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8,
-                       fp8: bool = False) -> AnalyticalLayerCost:
+                       fp8: bool = False,
+                       absorb_mla: bool = True) -> AnalyticalLayerCost:
     """One F (Full) decode layer at (seq_len, bs, mode), TP=1 baseline.
 
-    Hand-checked at BS=1 sl=200K offload:
-        idx_io  = 1 × 200K × 512 / 51.5 GBps ≈ 1.896 ms
-        kv_io   = 1 × 2560 × 1152 / 51.5 GBps ≈ 0.053 ms
-        block_a:
-          q_down  : 7168×1536 × 2 = 22.0 MB / HBM ≈ 0.0156 ms
-          q_up    : 1536×24576 × 2 = 75.5 MB / HBM ≈ 0.0533 ms
-          rope    : trivial   ≈ 0.015 ms (floor)
-          pre_norm: trivial   ≈ 0.015 ms (floor)
-          → block_a ≈ 0.0986 ms
-        block_c:
-          kv_up   : 2560×512×32768 (GEMM on attended) → 161 MB read ≈ 0.114 ms
-                   plus weight read 512×32768×2 = 32 MB ≈ 0.023 ms; max(comp, mem) ≈ 0.144 ms
-          attn    : 2560 × 32768 × 2 = 160 MB / HBM ≈ 0.114 ms
-          o_proj  : 16384×7168 × 2 = 224 MB / HBM ≈ 0.158 ms
-          residual: floor 0.015 ms
-          → block_c ≈ 0.43 ms
-        idx_comp = 0.005 ms (kernel floor) + 0.005 max(1, bs) (topk) = 0.01 ms
-        moe_shardable:
-          norm     : floor 0.015
-          router   : 7168×256 × 2 = 3.5 MB / HBM ≈ 0.015 (floor)
-          shared_e : 7168×6144 × 2 = 84 MB / HBM ≈ 0.058 ms
-          softmax+topk+residual: floors ~ 0.025
-          → ~0.113 ms
-        moe_expert_gemm: 84 MB / HBM ≈ 0.058 ms (1 active expert per rank avg)
-        moe_ep_comms   : 2 × 8 × 5 us = 0.08 ms
+    `absorb_mla=True` models DeepSeek's MLA absorption trick at inference:
+    the kv_up_proj GEMM is skipped because W^UK is applied on-the-fly to
+    Q (BS-bound) and W^UV is applied on-the-fly to the latent attention
+    output before o_proj. Attention dot products run in latent space, so
+    attn_core's HBM traffic collapses to a floor (the compressed latent
+    KV is already loaded by kv_io). Default True (matches DeepSeek
+    reference inference); pass False to recover the pre-absorption cost.
     """
     # FP8 path: weights, KV cache, decompressed-KV activations halve.
     # Indexer K is already FP8 in both paths.
     w_scale = 0.5 if fp8 else 1.0
     kv_bytes = (KV_LORA_RANK + QK_ROPE) * (1 if fp8 else 2)  # 576 B or 1152 B per token
+    w_bytes_per_elem = 1 if fp8 else 2
 
     # --- IO stream ---
     idx_io = io_ms(bs * seq_len * INDEXER_K_BYTES_PER_TOKEN, mode)
@@ -251,26 +235,41 @@ def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8,
 
     # --- Block A: Q projection on new BS token(s) (weights × w_scale) ---
     pre_norm = hbm_ms(bs * HIDDEN * 2 * 2)            # read + write activations (FP16)
-    q_down   = gemm_ms(bs, HIDDEN, Q_LORA_RANK) * w_scale + hbm_ms(0) * (1 - w_scale)
-    # The cleaner expression: GEMM time is max(compute, weight HBM read).
-    # At BS=1 we're memory-bound on weights, so halving weights halves time.
-    # We just multiply the result by w_scale (within the BS=1 regime which is
-    # what all our scenarios fall into for non-attended-token GEMMs).
-    q_down = gemm_ms(bs, HIDDEN, Q_LORA_RANK) * w_scale
-    q_up   = gemm_ms(bs, Q_LORA_RANK, Q_TOTAL_DIM) * w_scale
-    rope   = hbm_ms(bs * NUM_HEADS * QK_ROPE * 2 * 2)
-    kv_down = gemm_ms(bs, HIDDEN, KV_LORA_RANK + QK_ROPE) * w_scale
-    block_a = pre_norm + q_down + q_up + rope + kv_down
+    q_down   = gemm_ms(bs, HIDDEN, Q_LORA_RANK) * w_scale
+    q_up     = gemm_ms(bs, Q_LORA_RANK, Q_TOTAL_DIM) * w_scale
+    rope     = hbm_ms(bs * NUM_HEADS * QK_ROPE * 2 * 2)
+    kv_down  = gemm_ms(bs, HIDDEN, KV_LORA_RANK + QK_ROPE) * w_scale
+    block_a  = pre_norm + q_down + q_up + rope + kv_down
 
-    # --- Block C: kv_up_proj on attended + attn-core + o_proj ---
-    # kv_up_proj reads the decompressed KV (also FP8 in FP8 path) and writes
-    # the heads-expanded form. At BS=1 the GEMM is memory-bound on weights too.
-    kv_up = gemm_ms(bs * DSA_ATTENDED, KV_LORA_RANK, KV_UP_OUT_DIM) * w_scale
-    decompressed_kv_bytes = bs * DSA_ATTENDED * KV_UP_OUT_DIM * (1 if fp8 else 2)
-    attn_core = hbm_ms(decompressed_kv_bytes)
-    o_proj    = gemm_ms(bs, O_PROJ_IN_DIM, HIDDEN) * w_scale
-    residual  = hbm_ms(bs * HIDDEN * 2 * 2)
-    block_c   = kv_up + attn_core + o_proj + residual
+    # --- Block C: attention core + o_proj. Optional MLA absorption. ---
+    if absorb_mla:
+        # DeepSeek inference: kv_up_proj is skipped.
+        #   - W^UK is applied to q_nope (BS×NUM_HEADS×QK_NOPE → latent),
+        #     so attention dot-products run in latent space.
+        #   - W^UV is applied to score@V_latent before o_proj.
+        # The compressed latent KV is already loaded by kv_io; attn_core
+        # itself reads no extra HBM, only the BS-bound absorbed weights.
+        kv_up = 0.0
+        # Attention dot products in latent space: BS×NUM_HEADS×DSA_ATTENDED×KV_LORA_RANK
+        # FLOPs ≈ 335 MF at BS=1 → compute-floor-dominated.
+        attn_core = HBM_FLOOR_MS
+        # Absorbed-weight HBM reads (BS-bound, not attended-token-bound):
+        # W^UK weight bytes  = NUM_HEADS × QK_NOPE     × KV_LORA_RANK × elem
+        # W^UV weight bytes  = NUM_HEADS × KV_LORA_RANK × V_HEAD      × elem
+        w_uk_bytes = NUM_HEADS * QK_NOPE       * KV_LORA_RANK * w_bytes_per_elem
+        w_uv_bytes = NUM_HEADS * KV_LORA_RANK  * V_HEAD       * w_bytes_per_elem
+        absorbed_overhead = hbm_ms(w_uk_bytes) + hbm_ms(w_uv_bytes)
+    else:
+        # Pre-absorption baseline: explicit kv_up_proj GEMM, decompressed
+        # attention buffer.
+        kv_up = gemm_ms(bs * DSA_ATTENDED, KV_LORA_RANK, KV_UP_OUT_DIM) * w_scale
+        decompressed_kv_bytes = bs * DSA_ATTENDED * KV_UP_OUT_DIM * (1 if fp8 else 2)
+        attn_core = hbm_ms(decompressed_kv_bytes)
+        absorbed_overhead = 0.0
+
+    o_proj   = gemm_ms(bs, O_PROJ_IN_DIM, HIDDEN) * w_scale
+    residual = hbm_ms(bs * HIDDEN * 2 * 2)
+    block_c  = kv_up + attn_core + absorbed_overhead + o_proj + residual
 
     # --- Indexer compute (F only) ---
     # FP8 indexer matmul + topk; floors only
@@ -310,14 +309,16 @@ def analytical_layer_F(seq_len: int, bs: int, mode: str, ep: int = 8,
 
 
 def analytical_layer_S(seq_len: int, bs: int, mode: str, ep: int = 8,
-                       fp8: bool = False) -> AnalyticalLayerCost:
+                       fp8: bool = False,
+                       absorb_mla: bool = True) -> AnalyticalLayerCost:
     """One S (Shared) decode layer. Identical to F minus idx_io and idx_comp.
 
     The MLA-KV gather still happens — S layers attend to the F layer's
     selected top-k positions, so they still need those 2560 tokens of KV
-    decompressed.
+    in latent form (or decompressed if `absorb_mla=False`).
     """
-    f = analytical_layer_F(seq_len, bs, mode, ep, fp8=fp8)
+    f = analytical_layer_F(seq_len, bs, mode, ep, fp8=fp8,
+                           absorb_mla=absorb_mla)
     return AnalyticalLayerCost(
         idx_io_ms=0.0, kv_io_ms=f.kv_io_ms,
         block_a_ms=f.block_a_ms, block_c_ms=f.block_c_ms, idx_comp_ms=0.0,
