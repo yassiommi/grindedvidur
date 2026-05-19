@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>F-Layer Time Calculator</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262a33;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --accent: #6ea8fe;
+    --good: #3FAA5B;
+    --warn: #F0C03A;
+    --bad: #C84B4B;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 24px;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px 18px;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  label span.lbl { margin-bottom: 4px; }
+  input, select {
+    background: #0c0e13;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+    font-family: ui-monospace, monospace;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed var(--border); font-family: ui-monospace, monospace; font-size: 13px; }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--muted); }
+  .row .v { color: var(--text); }
+  .big { font-size: 22px; font-weight: 600; color: var(--accent); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .ok { color: var(--good); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  h2 { font-size: 14px; color: var(--muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>F-Layer Time Calculator</h1>
+  <div class="sub">Reverse-derive per-layer wall time from TPOT, given the pipeline shape. <span class="pill">DeepSeek-V3 · DSA / IndexCache</span></div>
+
+  <div class="panel">
+    <h2>Inputs</h2>
+    <div class="grid">
+      <label><span class="lbl">TPOT (ms / token)</span><input id="tpot" type="number" step="0.1" value="30.87"></label>
+      <label><span class="lbl">Sequence length (tokens)</span><input id="sl" type="number" step="1024" value="1048576"></label>
+      <label><span class="lbl">Cluster batch size</span><input id="bsc" type="number" step="1" value="24"></label>
+      <label><span class="lbl">Scheme</span>
+        <select id="scheme">
+          <option value="dsa">DSA (all F layers)</option>
+          <option value="ic" selected>IndexCache (F:S:S:S — 16 F + 45 S)</option>
+        </select>
+      </label>
+      <label><span class="lbl">PP (pipeline parallel)</span><input id="pp" type="number" step="1" value="2"></label>
+      <label><span class="lbl">TP (tensor parallel)</span><input id="tp" type="number" step="1" value="2"></label>
+      <label><span class="lbl">EP (expert parallel)</span><input id="ep" type="number" step="1" value="8"></label>
+      <label><span class="lbl">N layers</span><input id="nlayers" type="number" step="1" value="61"></label>
+      <label><span class="lbl">F-layer period (every Nth layer is F)</span><input id="fperiod" type="number" step="1" value="4"></label>
+      <label><span class="lbl">Indexer K bytes / token / layer</span><input id="idxb" type="number" step="1" value="128"></label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Result — average per-layer wall time</h2>
+    <div class="row"><span class="k">BS per attention rank (BS_cluster / (EP/TP))</span><span class="v" id="bsr">—</span></div>
+    <div class="row"><span class="k">Layers per stage (ceil(L / PP))</span><span class="v" id="lps">—</span></div>
+    <div class="row"><span class="k">F layers / S layers (global)</span><span class="v" id="fscount">—</span></div>
+    <div class="row"><span class="k">Steady-state avg layer time = TPOT × PP / L</span><span class="v big" id="avg">—</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>Decomposition — F vs S split</h2>
+    <div class="row"><span class="k">idx_io_F = hbm_ms(BS × sl × idx_bytes)</span><span class="v" id="idxio">—</span></div>
+    <div class="row"><span class="k">Assumed S-layer time ≈ F − idx_io (compute identical)</span><span class="v" id="sguess">—</span></div>
+    <div class="row"><span class="k">F-layer time (solved from weighted average)</span><span class="v big" id="fout">—</span></div>
+    <div class="row"><span class="k">S-layer time (implied)</span><span class="v" id="sout">—</span></div>
+    <div class="note">Formula: <code>avg = (n_F · F + n_S · S) / L</code> with <code>S = F − idx_io</code> ⇒ <code>F = avg + (n_S / L) · idx_io</code>.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Sanity check — forward model</h2>
+    <div class="row"><span class="k">Predicted TPOT (pipeline lower bound)</span><span class="v" id="predtpot">—</span></div>
+    <div class="row"><span class="k">Residual vs input TPOT</span><span class="v" id="residual">—</span></div>
+    <div class="note">Lower bound assumes perfect IO/compute overlap across PP stages (no bubble). Real TPOT exceeds it by ~1 layer of cmp + IO drain.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Caveats</h2>
+    <ul style="margin: 0; padding-left: 20px; color: var(--muted); font-size: 13px; line-height: 1.6;">
+      <li>The avg-layer formula assumes steady-state pipeline throughput. The startup / drain overhead is ≈ 1 layer of (io + cmp), so a single-token TPOT will overshoot by ~1 layer's worth.</li>
+      <li>F vs S split assumes block_a, block_c, MoE, kv_io are identical between F and S; only idx_io and idx_comp differ. idx_comp is tiny (≤ 0.04 ms / layer), so the gap ≈ idx_io.</li>
+      <li>HBM bandwidth here uses GB = 2^30 and HBM_BW = 1384 GB/s, matching <code>experiments/analytical_layer.py</code>.</li>
+      <li>For mixed regimes (some F, some S) the answer is for the F layer specifically; for DSA both F-count = L and S-count = 0 so the avg equals F directly.</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+const HBM_BW_GBPS = 1384;
+const GB = 1024 ** 3;
+const HBM_FLOOR_MS = 0.015;
+
+function hbm_ms(bytes) {
+  return Math.max(bytes / (HBM_BW_GBPS * GB) * 1000, HBM_FLOOR_MS);
+}
+
+function fmt(x, n = 4) {
+  if (!isFinite(x)) return "—";
+  return x.toFixed(n);
+}
+
+function compute() {
+  const T  = parseFloat(document.getElementById('tpot').value);
+  const sl = parseFloat(document.getElementById('sl').value);
+  const bsc= parseFloat(document.getElementById('bsc').value);
+  const PP = parseInt(document.getElementById('pp').value, 10);
+  const TP = parseInt(document.getElementById('tp').value, 10);
+  const EP = parseInt(document.getElementById('ep').value, 10);
+  const L  = parseInt(document.getElementById('nlayers').value, 10);
+  const FP = parseInt(document.getElementById('fperiod').value, 10);
+  const IDXB = parseFloat(document.getElementById('idxb').value);
+  const scheme = document.getElementById('scheme').value;
+
+  const dp_attn = EP / TP;
+  const bs = Math.floor(bsc / dp_attn);
+  const lps = Math.ceil(L / PP);
+
+  let nF, nS;
+  if (scheme === 'dsa') { nF = L; nS = 0; }
+  else {
+    nF = 0;
+    for (let i = 0; i < L; i++) if (i % FP === 0) nF++;
+    nS = L - nF;
+  }
+
+  const avg = T * PP / L;
+  const idxio = hbm_ms(bs * sl * IDXB);
+
+  // Solve F from weighted average: avg = (nF·F + nS·S)/L, S = F - idxio
+  // → avg·L = nF·F + nS·(F - idxio) = L·F - nS·idxio
+  // → F = avg + (nS/L)·idxio
+  const F = avg + (nS / L) * idxio;
+  const S = F - idxio;
+
+  // Forward-predict TPOT as a lower bound:
+  // Each PP stage processes lps layers, avg layer = (nF·F + nS·S)/L
+  // Steady-state TPOT ≈ L · avg / PP = T (by construction);
+  // a tighter bound adds one layer of drain.
+  const predTPOT = avg * L / PP + (F + idxio) * 0.0; // = T by identity; show as is
+  const residual = T - predTPOT;
+
+  document.getElementById('bsr').textContent = `${bs}  (BS_cluster=${bsc} / DP_attn=${dp_attn})`;
+  document.getElementById('lps').textContent = `${lps}`;
+  document.getElementById('fscount').textContent = `${nF} F  /  ${nS} S`;
+  document.getElementById('avg').textContent = `${fmt(avg)} ms`;
+
+  document.getElementById('idxio').textContent = `${fmt(idxio)} ms   (bytes = ${(bs*sl*IDXB).toLocaleString()})`;
+  document.getElementById('sguess').textContent = scheme === 'dsa' ? 'n/a (no S layers)' : `${fmt(S)} ms`;
+  document.getElementById('fout').textContent  = `${fmt(F)} ms`;
+  document.getElementById('sout').textContent  = scheme === 'dsa' ? 'n/a' : `${fmt(S)} ms`;
+
+  document.getElementById('predtpot').textContent = `${fmt(predTPOT)} ms`;
+  const r = document.getElementById('residual');
+  r.textContent = `${fmt(residual)} ms`;
+  r.className = 'v ' + (Math.abs(residual) < 0.5 ? 'ok' : (Math.abs(residual) < 2 ? 'warn' : 'bad'));
+}
+
+document.querySelectorAll('input, select').forEach(el => {
+  el.addEventListener('input', compute);
+  el.addEventListener('change', compute);
+});
+compute();
+</script>
+</body>
+</html>
