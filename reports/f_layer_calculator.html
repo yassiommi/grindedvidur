@@ -118,34 +118,25 @@
   </div>
 
   <div class="panel">
-    <h2>Per-layer I/O demand (one token decode)</h2>
-    <table style="width:100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 13px;">
-      <thead>
-        <tr style="color: var(--muted); text-align: right; border-bottom: 1px solid var(--border);">
-          <th style="text-align:left; padding: 6px 0;">Layer / tier</th>
-          <th style="padding: 6px 8px;">bytes</th>
-          <th style="padding: 6px 8px;">IOPS (storage)</th>
-          <th style="padding: 6px 8px;">io time</th>
-          <th style="padding: 6px 8px;">peak BW</th>
-          <th style="padding: 6px 8px;">peak IOPS/s</th>
-        </tr>
-      </thead>
-      <tbody id="iotable"></tbody>
-    </table>
-    <div class="note">IOPS is a storage-tier metric only (SSD/NVMe block reads). HBM is a memory bus — bandwidth applies, IOPS does not. IOPS is computed per-layer as ⌈layer_bytes / u⌉ (one batched read per layer issues that many block-level I/Os). Peak BW / IOPS-rate is the demand during the layer's IO window only.</div>
+    <h2>Per-layer I/O — GPU perspective</h2>
+    <div class="row"><span class="k">Wall-clock budget per layer = TPOT / L</span><span class="v" id="dt_layer">—</span></div>
+    <div class="row"><span class="k">KV bytes per layer per GPU (b · A · kv_bpt)</span><span class="v" id="kv_bytes_per_layer">—</span></div>
+    <div class="row"><span class="k">KV I/Os per layer per GPU (bytes / u)</span><span class="v" id="kv_iops_per_layer">—</span></div>
+    <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate per GPU = I/Os / (TPOT / L)</span><span class="v big" id="iops_rate_gpu">—</span></div>
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 6px; padding-top: 10px;"><span class="k">Indexer K bytes per F-layer per GPU (b · s · idx_bpt)</span><span class="v" id="idx_bytes_per_layer">—</span></div>
+    <div class="row"><span class="k">Required HBM BW per GPU on F layers = bytes / (TPOT / L)</span><span class="v" id="hbm_bw_per_layer">—</span></div>
+    <div class="note">IOPS counted per-layer, from the GPU's request side: each GPU issues one batched KV read per layer of ⌈layer_bytes / u⌉ I/Os, and must complete it within the per-layer time slice TPOT/L. (HBM-resident indexer shown for completeness, but HBM is a memory bus — bandwidth applies, IOPS does not.)</div>
   </div>
 
   <div class="panel">
-    <h2>Sustained demand per rank (averaged over TPOT)</h2>
-    <div class="row"><span class="k">HBM bytes / token (n_F · b · s · idx_bpt)</span><span class="v" id="hbmtot">—</span></div>
-    <div class="row"><span class="k">HBM IOPS / token</span><span class="v" id="hbmiopstot">—</span></div>
-    <div class="row"><span class="k">HBM sustained BW = bytes / TPOT</span><span class="v big" id="hbmbwsust">—</span></div>
-    <div class="row"><span class="k">HBM sustained IOPS/s</span><span class="v" id="hbmiopssust">—</span></div>
-    <div class="row" style="border-top: 1px solid var(--border); margin-top: 6px; padding-top: 10px;"><span class="k">SSD bytes / token (L · b · A · kv_bpt)</span><span class="v" id="ssdtot">—</span></div>
-    <div class="row"><span class="k">SSD IOPS / token (L · ⌈b·A·kv_bpt / u⌉ per layer)</span><span class="v" id="ssdiopstot">—</span></div>
-    <div class="row"><span class="k">SSD sustained BW = bytes / TPOT</span><span class="v big" id="ssdbwsust">—</span></div>
-    <div class="row"><span class="k">SSD sustained IOPS/s</span><span class="v" id="ssdiopssust">—</span></div>
-    <div class="note">Per rank. Multiply by DP_attn (=4 here) for stage-wide, or by total GPU count for cluster.</div>
+    <h2>Per-token aggregate (per GPU, summed across L layers)</h2>
+    <div class="row"><span class="k">Total KV bytes / token (L · b · A · kv_bpt)</span><span class="v" id="ssdtot">—</span></div>
+    <div class="row"><span class="k">Total KV I/Os / token (L · ⌈b·A·kv_bpt / u⌉)</span><span class="v" id="ssdiopstot">—</span></div>
+    <div class="row"><span class="k">Sustained KV BW per GPU = bytes / TPOT</span><span class="v big" id="ssdbwsust">—</span></div>
+    <div class="row"><span class="k">Sustained KV IOPS rate per GPU = IOPS / TPOT</span><span class="v big" id="ssdiopssust">—</span></div>
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 6px; padding-top: 10px;"><span class="k">Total indexer bytes / token (n_F · b · s · idx_bpt)</span><span class="v" id="hbmtot">—</span></div>
+    <div class="row"><span class="k">Sustained HBM BW per GPU = bytes / TPOT</span><span class="v" id="hbmbwsust">—</span></div>
+    <div class="note">Identical to the per-layer rate (per-GPU IOPS demand is uniform across layers since each layer reads the same KV slice). Useful for sizing the SSD: the device must deliver this rate for each attached GPU.</div>
   </div>
 
   <div class="panel">
@@ -255,58 +246,45 @@ function compute() {
   r.textContent = `${fmt(residual)} ms`;
   r.className = 'v ' + (Math.abs(residual) < 0.5 ? 'ok' : (Math.abs(residual) < 2 ? 'warn' : 'bad'));
 
-  // ── I/O bandwidth + IOPS ────────────────────────────────────────
-  // IOPS is computed per LAYER (one batched read per layer issues ⌈bytes/U⌉ block-level I/Os).
+  // ── I/O demand from the GPU side, per layer ─────────────────────
+  // Each GPU reads its own slice of KV (b · A · kv_bpt bytes) every layer.
+  // The wall-clock budget per layer at steady state is TPOT / L.
+  //   IOPS per layer per GPU = ⌈bytes / U⌉
+  //   Required IOPS rate per GPU = IOPS / (TPOT / L)
+  const Tsec     = T / 1000;
+  const dt_layer = T / L;                          // ms per layer at steady-state
+  const dt_layer_s = dt_layer / 1000;
 
-  // Per F layer — HBM has no IOPS concept (it's a memory bus, not a storage device).
-  const Fidx_bytes = bs * sl * IDXB;
-  const Fidx_time  = hbm_ms(Fidx_bytes, HBM_BW);
-  const Fidx_bw    = (Fidx_bytes / GB) / (Fidx_time / 1000);   // GB/s
+  const Fkv_bytes        = bs * A * KVB;            // bytes per layer per GPU
+  const Fkv_iops_layer   = Math.ceil(Fkv_bytes / U);
+  const required_iops_rate = Fkv_iops_layer / dt_layer_s;
+  const required_kv_bw     = (Fkv_bytes / GB) / dt_layer_s;     // GB/s
 
-  const Fkv_bytes = bs * A * KVB;
-  const Fkv_iops  = Math.ceil(Fkv_bytes / U);   // per-layer IOPS
-  const Fkv_time  = ssd_ms(Fkv_bytes, SSD_BW);
-  const Fkv_bw    = (Fkv_bytes / GB) / (Fkv_time / 1000);
-  const Fkv_iopsR = Fkv_iops / (Fkv_time / 1000);
+  const Fidx_bytes       = bs * sl * IDXB;          // F-layer indexer in HBM
+  const required_hbm_bw  = (Fidx_bytes / GB) / dt_layer_s;
 
-  const tbody = document.getElementById('iotable');
-  const rows = [
-    {label: 'F · indexer (HBM)', bytes: Fidx_bytes, iops: null,      time: Fidx_time, bw: Fidx_bw, iopsR: null,      peak: HBM_BW},
-    {label: 'F · KV (SSD)',      bytes: Fkv_bytes,  iops: Fkv_iops,  time: Fkv_time,  bw: Fkv_bw,  iopsR: Fkv_iopsR, peak: SSD_BW},
-    {label: 'S · KV (SSD)',      bytes: Fkv_bytes,  iops: Fkv_iops,  time: Fkv_time,  bw: Fkv_bw,  iopsR: Fkv_iopsR, peak: SSD_BW},
-  ];
-  tbody.innerHTML = rows.map(r => {
-    const util = r.peak ? ` <span class="${r.bw / r.peak > 0.95 ? 'warn' : ''}">(${(r.bw / r.peak * 100).toFixed(0)}%)</span>` : '';
-    const iopsCell  = r.iops  === null ? '<span style="color:var(--muted)">—</span>' : fmtCount(r.iops);
-    const iopsRCell = r.iopsR === null ? '<span style="color:var(--muted)">—</span>' : fmtCount(r.iopsR) + '/s';
-    return `<tr style="border-bottom: 1px dashed var(--border);">
-      <td style="text-align:left; padding:8px 0; color: var(--muted);">${r.label}</td>
-      <td style="text-align:right; padding:8px;">${fmtBytes(r.bytes)}</td>
-      <td style="text-align:right; padding:8px;">${iopsCell}</td>
-      <td style="text-align:right; padding:8px;">${fmt(r.time, 3)} ms</td>
-      <td style="text-align:right; padding:8px;">${fmt(r.bw, 1)} GB/s${util}</td>
-      <td style="text-align:right; padding:8px;">${iopsRCell}</td>
-    </tr>`;
-  }).join('');
+  document.getElementById('dt_layer').textContent          = `${fmt(dt_layer, 3)} ms  (TPOT ${fmt(T,2)} ms / L=${L})`;
+  document.getElementById('kv_bytes_per_layer').textContent = `${fmtBytes(Fkv_bytes)}`;
+  document.getElementById('kv_iops_per_layer').textContent  = `${fmtCount(Fkv_iops_layer)}  (${Fkv_iops_layer.toLocaleString()})`;
+  document.getElementById('iops_rate_gpu').textContent      = `${fmtCount(required_iops_rate)}/s  per GPU`;
+  document.getElementById('idx_bytes_per_layer').textContent= `${fmtBytes(Fidx_bytes)}`;
+  document.getElementById('hbm_bw_per_layer').textContent   = `${fmt(required_hbm_bw, 1)} GB/s  (${(required_hbm_bw/HBM_BW*100).toFixed(0)}% of HBM peak)`;
 
-  // Sustained per rank, averaged over TPOT. IOPS only for SSD; sums per-layer IOPS across layers.
-  const Tsec = T / 1000;
+  // Per-token aggregate (summed across L layers)
   const hbm_total_bytes = nF * bs * sl * IDXB;
-  const ssd_total_bytes = L  * bs * A  * KVB;
-  const ssd_total_iops  = L  * Fkv_iops;        // L layers × per-layer IOPS
+  const ssd_total_bytes = L  * Fkv_bytes;
+  const ssd_total_iops  = L  * Fkv_iops_layer;
 
-  const hbm_bw_sust    = (hbm_total_bytes / GB) / Tsec;
-  const ssd_bw_sust    = (ssd_total_bytes / GB) / Tsec;
-  const ssd_iops_sust  = ssd_total_iops / Tsec;
+  const hbm_bw_sust   = (hbm_total_bytes / GB) / Tsec;
+  const ssd_bw_sust   = (ssd_total_bytes / GB) / Tsec;
+  const ssd_iops_sust = ssd_total_iops / Tsec;
 
+  document.getElementById('ssdtot').textContent      = `${fmtBytes(ssd_total_bytes)}  (${L} layers × ${fmtBytes(Fkv_bytes)})`;
+  document.getElementById('ssdiopstot').textContent  = `${fmtCount(ssd_total_iops)}  (${ssd_total_iops.toLocaleString()})`;
+  document.getElementById('ssdbwsust').textContent   = `${fmt(ssd_bw_sust, 2)} GB/s per GPU  (${(ssd_bw_sust/SSD_BW*100).toFixed(0)}% of SSD peak ${SSD_BW} GB/s)`;
+  document.getElementById('ssdiopssust').textContent = `${fmtCount(ssd_iops_sust)}/s per GPU`;
   document.getElementById('hbmtot').textContent      = `${fmtBytes(hbm_total_bytes)}  (${nF} F layers)`;
-  document.getElementById('hbmiopstot').textContent  = `n/a — HBM has no IOPS (memory bus, not storage)`;
-  document.getElementById('hbmbwsust').textContent   = `${fmt(hbm_bw_sust, 1)} GB/s  (${(hbm_bw_sust/HBM_BW*100).toFixed(0)}% of HBM peak)`;
-  document.getElementById('hbmiopssust').textContent = `n/a`;
-  document.getElementById('ssdtot').textContent      = `${fmtBytes(ssd_total_bytes)}  (${L} layers)`;
-  document.getElementById('ssdiopstot').textContent  = `${fmtCount(ssd_total_iops)}`;
-  document.getElementById('ssdbwsust').textContent   = `${fmt(ssd_bw_sust, 2)} GB/s  (${(ssd_bw_sust/SSD_BW*100).toFixed(0)}% of SSD peak)`;
-  document.getElementById('ssdiopssust').textContent = `${fmtCount(ssd_iops_sust)}/s`;
+  document.getElementById('hbmbwsust').textContent   = `${fmt(hbm_bw_sust, 1)} GB/s per GPU  (${(hbm_bw_sust/HBM_BW*100).toFixed(0)}% of HBM peak)`;
 }
 
 document.querySelectorAll('input, select').forEach(el => {
