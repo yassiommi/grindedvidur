@@ -133,6 +133,12 @@
     <div class="grid">
       <label><span class="lbl">SSD bandwidth (GB/s)</span><input id="ssdbw" type="number" step="0.5" value="28"></label>
       <label><span class="lbl">SSD max IOPS</span><input id="ssdiops" type="number" step="100000" value="6000000"></label>
+      <label><span class="lbl">IOPS limit mode</span>
+        <select id="iopsmode">
+          <option value="on" selected>On (cap by max IOPS)</option>
+          <option value="off">Off (BW-only — matches feasibility plot)</option>
+        </select>
+      </label>
       <label><span class="lbl">HBM bandwidth (GB/s)</span><input id="hbmbw" type="number" step="1" value="1384"></label>
       <label><span class="lbl">KV residence</span>
         <select id="kvres">
@@ -217,9 +223,9 @@ const GB = 1024 ** 3;
 
 function hbm_ms(bytes, bw, floor) { return Math.max(bytes / (bw * GB) * 1000, floor); }
 
-function ssd_ms(bytes, iops_count, ssd_bw, ssd_iops, floor) {
+function ssd_ms(bytes, iops_count, ssd_bw, ssd_iops, floor, iops_on) {
   const t_bw   = bytes / (ssd_bw * GB) * 1000;
-  const t_iops = (iops_count / ssd_iops) * 1000;
+  const t_iops = iops_on ? (iops_count / ssd_iops) * 1000 : 0;
   return Math.max(t_bw, t_iops, floor);
 }
 
@@ -247,6 +253,7 @@ function readInputs() {
     tpot  : parseFloat(document.getElementById('tpot').value),
     SSD_BW   : parseFloat(document.getElementById('ssdbw').value),
     SSD_IOPS : parseFloat(document.getElementById('ssdiops').value),
+    IOPS_ON  : document.getElementById('iopsmode').value === 'on',
     HBM_BW   : parseFloat(document.getElementById('hbmbw').value),
     HBM_FLOOR: parseFloat(document.getElementById('hbmfloor').value),
     SSD_FLOOR: parseFloat(document.getElementById('ssdfloor').value),
@@ -289,7 +296,7 @@ function evaluate(sl, bsc, p) {
   if (p.kvres === 'hbm') {
     kv_io = hbm_ms(kv_bytes, p.HBM_BW, p.HBM_FLOOR);
   } else {
-    kv_io = ssd_ms(kv_bytes, kv_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR);
+    kv_io = ssd_ms(kv_bytes, kv_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR, p.IOPS_ON);
   }
 
   // Compute (per layer)
@@ -317,7 +324,7 @@ function evaluate(sl, bsc, p) {
   let bn;
   if (p.kvres === 'ssd') {
     const t_bw   = kv_bytes / (p.SSD_BW * GB) * 1000;
-    const t_iops = (kv_iops / p.SSD_IOPS) * 1000;
+    const t_iops = p.IOPS_ON ? (kv_iops / p.SSD_IOPS) * 1000 : 0;
     if (Math.max(t_bw, t_iops) < cmpS) bn = 'compute (S-layer)';
     else if (t_iops > t_bw)            bn = 'SSD IOPS';
     else                               bn = 'SSD BW';
