@@ -97,6 +97,9 @@
       <label><span class="lbl">I/O unit size (B)</span><input id="iou" type="number" step="1" value="512"></label>
       <label><span class="lbl">HBM bandwidth (GB/s)</span><input id="hbmbw" type="number" step="1" value="1384"></label>
       <label><span class="lbl">SSD bandwidth (GB/s)</span><input id="ssdbw" type="number" step="0.5" value="28"></label>
+      <label><span class="lbl">Top-k / indexer-compute time (ms / layer)</span><input id="t_topk" type="number" step="0.001" value="0.010"></label>
+      <label><span class="lbl">Attention compute time (ms / layer)</span><input id="t_attn" type="number" step="0.001" value="0.250"></label>
+      <label><span class="lbl">MoE time (ms / layer)</span><input id="t_moe" type="number" step="0.001" value="0.200"></label>
     </div>
   </div>
 
@@ -119,13 +122,16 @@
 
   <div class="panel">
     <h2>Per-layer I/O — GPU perspective</h2>
+    <div class="row"><span class="k">Per-layer wall budget = TPOT / L</span><span class="v" id="dt_layer">—</span></div>
     <div class="row"><span class="k">KV bytes per layer per GPU (b · A · kv_bpt)</span><span class="v" id="kv_bytes_per_layer">—</span></div>
-    <div class="row"><span class="k">KV I/O time per layer = ssd_ms(kv_bytes)</span><span class="v" id="dt_layer">—</span></div>
     <div class="row"><span class="k">KV I/Os per layer per GPU ⌈bytes / u⌉</span><span class="v" id="kv_iops_per_layer">—</span></div>
-    <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate per GPU = I/Os / kv_io_time</span><span class="v big" id="iops_rate_gpu">—</span></div>
+    <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">F-layer KV time budget = TPOT/L − idx_io − topk − attn − moe</span><span class="v" id="kv_budget_F">—</span></div>
+    <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate on F layers = I/Os / F_budget</span><span class="v big" id="iops_F">—</span></div>
+    <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">S-layer KV time budget = attn + moe of previous layer (prefetch slack)</span><span class="v" id="kv_budget_S">—</span></div>
+    <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate on S layers = I/Os / S_budget</span><span class="v big" id="iops_S">—</span></div>
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 6px; padding-top: 10px;"><span class="k">Indexer K bytes per F-layer per GPU (b · s · idx_bpt)</span><span class="v" id="idx_bytes_per_layer">—</span></div>
     <div class="row"><span class="k">Required HBM BW per GPU on F layers = bytes / hbm_ms(bytes)</span><span class="v" id="hbm_bw_per_layer">—</span></div>
-    <div class="note">IOPS counted per-layer, from the GPU's request side: each GPU issues ⌈kv_bytes / u⌉ I/Os per layer, and must complete them within the actual KV I/O time (ssd_ms — how long the SSD read itself takes). This excludes attention, MoE, and other compute that overlaps with the I/O. (HBM-resident indexer: HBM is a memory bus — bandwidth applies, IOPS does not.)</div>
+    <div class="note">Walking backwards from TPOT: each layer has TPOT/L of wall budget. On an <b>F layer</b>, KV must finish in whatever remains after the serial idx_io + topk + attn + moe — that's a tight squeeze. On an <b>S layer</b>, KV is prefetched during the <i>previous</i> layer's compute window (attn + moe), giving more slack ⇒ <b>S-layer IOPS &lt; F-layer IOPS</b>. (HBM-resident indexer: HBM is a memory bus — bandwidth applies, IOPS does not.)</div>
   </div>
 
   <div class="panel">
@@ -201,6 +207,9 @@ function compute() {
   const U    = parseFloat(document.getElementById('iou').value);
   const HBM_BW = parseFloat(document.getElementById('hbmbw').value);
   const SSD_BW = parseFloat(document.getElementById('ssdbw').value);
+  const T_TOPK = parseFloat(document.getElementById('t_topk').value);
+  const T_ATTN = parseFloat(document.getElementById('t_attn').value);
+  const T_MOE  = parseFloat(document.getElementById('t_moe').value);
   const scheme = document.getElementById('scheme').value;
 
   const dp_attn = EP / TP;
@@ -247,30 +256,45 @@ function compute() {
   r.className = 'v ' + (Math.abs(residual) < 0.5 ? 'ok' : (Math.abs(residual) < 2 ? 'warn' : 'bad'));
 
   // ── I/O demand from the GPU side, per layer ─────────────────────
-  // Each GPU reads its own KV slice (b · A · kv_bpt bytes) every layer.
-  // Time budget for IOPS = actual KV I/O time (ssd_ms), NOT TPOT/L.
-  // Reasoning: the SSD must deliver all I/Os within the window it is
-  // actually issuing I/Os — the attention/MoE compute is overlapped and
-  // does not relax the SSD deadline.
+  // Walking BACKWARDS from TPOT: each layer has TPOT/L of wall budget.
+  // F-layer KV budget = TPOT/L − idx_io − topk − attn − moe   (serial gap)
+  // S-layer KV budget = attn + moe  of previous layer          (prefetch slack)
   //   IOPS per layer per GPU = ⌈bytes / U⌉
-  //   Required IOPS rate per GPU = IOPS / ssd_ms(kv_bytes)
+  //   Required IOPS rate = IOPS / budget
   const Tsec = T / 1000;
+  const dt_layer_ms = T / L;
 
   const Fkv_bytes        = bs * A * KVB;            // bytes per layer per GPU
-  const Fkv_time_ms      = ssd_ms(Fkv_bytes, SSD_BW);  // actual KV I/O time
-  const Fkv_time_s       = Fkv_time_ms / 1000;
   const Fkv_iops_layer   = Math.ceil(Fkv_bytes / U);
-  const required_iops_rate = Fkv_iops_layer / Fkv_time_s;
-  const required_kv_bw     = (Fkv_bytes / GB) / Fkv_time_s;    // GB/s (= SSD_BW)
+
+  // F-layer: time left after the serial idx_io + topk + attn + moe
+  const F_kv_budget_ms = dt_layer_ms - idxio - T_TOPK - T_ATTN - T_MOE;
+  // S-layer: KV is prefetched during the prior layer's compute window
+  const S_kv_budget_ms = T_ATTN + T_MOE;
+
+  const iops_F = F_kv_budget_ms > 0 ? Fkv_iops_layer / (F_kv_budget_ms / 1000) : Infinity;
+  const iops_S = S_kv_budget_ms > 0 ? Fkv_iops_layer / (S_kv_budget_ms / 1000) : Infinity;
 
   const Fidx_bytes       = bs * sl * IDXB;          // F-layer indexer in HBM
   const Fidx_time_ms     = hbm_ms(Fidx_bytes, HBM_BW);
   const required_hbm_bw  = (Fidx_bytes / GB) / (Fidx_time_ms / 1000);
 
-  document.getElementById('dt_layer').textContent          = `${fmt(Fkv_time_ms, 3)} ms  (= ssd_ms(${fmtBytes(Fkv_bytes)}, ${SSD_BW} GB/s))`;
+  document.getElementById('dt_layer').textContent          = `${fmt(dt_layer_ms, 3)} ms  (TPOT ${fmt(T,2)} ms / L=${L})`;
   document.getElementById('kv_bytes_per_layer').textContent = `${fmtBytes(Fkv_bytes)}`;
   document.getElementById('kv_iops_per_layer').textContent  = `${fmtCount(Fkv_iops_layer)}  (${Fkv_iops_layer.toLocaleString()})`;
-  document.getElementById('iops_rate_gpu').textContent      = `${fmtCount(required_iops_rate)}/s  per GPU`;
+
+  const F_budget_txt = `${fmt(dt_layer_ms,3)} − ${fmt(idxio,3)} − ${fmt(T_TOPK,3)} − ${fmt(T_ATTN,3)} − ${fmt(T_MOE,3)} = ${fmt(F_kv_budget_ms,3)} ms`;
+  const fb = document.getElementById('kv_budget_F');
+  fb.textContent = F_budget_txt;
+  fb.className = 'v ' + (F_kv_budget_ms <= 0 ? 'bad' : (F_kv_budget_ms < 0.1 ? 'warn' : 'ok'));
+
+  document.getElementById('iops_F').textContent = isFinite(iops_F)
+      ? `${fmtCount(iops_F)}/s  per GPU`
+      : `∞  (F budget ≤ 0 — compute already exceeds TPOT/L)`;
+
+  document.getElementById('kv_budget_S').textContent = `${fmt(T_ATTN,3)} + ${fmt(T_MOE,3)} = ${fmt(S_kv_budget_ms,3)} ms`;
+  document.getElementById('iops_S').textContent      = `${fmtCount(iops_S)}/s  per GPU`;
+
   document.getElementById('idx_bytes_per_layer').textContent= `${fmtBytes(Fidx_bytes)}`;
   document.getElementById('hbm_bw_per_layer').textContent   = `${fmt(required_hbm_bw, 1)} GB/s  (${(required_hbm_bw/HBM_BW*100).toFixed(0)}% of HBM peak,  io_time=${fmt(Fidx_time_ms,3)} ms)`;
 
