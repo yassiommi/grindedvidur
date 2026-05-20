@@ -128,11 +128,11 @@
     <div class="row"><span class="k">KV I/Os per layer per GPU ⌈bytes / u⌉</span><span class="v" id="kv_iops_per_layer">—</span></div>
     <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">F-layer KV time budget = F − idx_io − topk − attn − moe</span><span class="v" id="kv_budget_F">—</span></div>
     <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate on F layers = I/Os / F_budget</span><span class="v big" id="iops_F">—</span></div>
-    <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">S-layer KV time budget = attn + moe of previous layer (prefetch slack)</span><span class="v" id="kv_budget_S">—</span></div>
+    <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">S-layer KV time budget = previous layer's full wall (prefetch slack)</span><span class="v" id="kv_budget_S">—</span></div>
     <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate on S layers = I/Os / S_budget</span><span class="v big" id="iops_S">—</span></div>
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 6px; padding-top: 10px;"><span class="k">Indexer K bytes per F-layer per GPU (b · s · idx_bpt)</span><span class="v" id="idx_bytes_per_layer">—</span></div>
     <div class="row"><span class="k">Required HBM BW per GPU on F layers = bytes / hbm_ms(bytes)</span><span class="v" id="hbm_bw_per_layer">—</span></div>
-    <div class="note">Walking backwards from TPOT: each layer has TPOT/L of wall budget. On an <b>F layer</b>, KV must finish in whatever remains after the serial idx_io + topk + attn + moe — that's a tight squeeze. On an <b>S layer</b>, KV is prefetched during the <i>previous</i> layer's compute window (attn + moe), giving more slack ⇒ <b>S-layer IOPS &lt; F-layer IOPS</b>. (HBM-resident indexer: HBM is a memory bus — bandwidth applies, IOPS does not.)</div>
+    <div class="note"><b>F-layer caveat:</b> the F-layer formula above (subtract everything from F-wall) assumes <b>no prefetch credit</b> — it applies to the <b>first F layer</b>, which has no predecessor to hide IO behind. <b>Non-first F layers</b> can prefetch <code>idx_io + kv_io</code> into the previous (S) layer's wall, getting a budget similar to S layers. Only the first F layer pays the full serial cost shown here.<br><br><b>S-layer:</b> KV is prefetched during the previous layer's wall (≈ avg layer time), so S has a much larger budget than the first F layer ⇒ <b>S IOPS &lt; F IOPS</b>. (HBM-resident indexer: HBM is a memory bus — bandwidth applies, IOPS does not.)</div>
   </div>
 
   <div class="panel">
@@ -273,8 +273,10 @@ function compute() {
   // — F layers are heavier than S layers, so the F-layer wall > TPOT/L. Using
   // TPOT/L here would over-subtract and yield negative budgets.
   const F_kv_budget_ms = F - idxio - T_TOPK - T_ATTN - T_MOE;
-  // S-layer: KV is prefetched during the prior layer's compute window
-  const S_kv_budget_ms = T_ATTN + T_MOE;
+  // S-layer: KV is prefetched into the previous layer's full wall.
+  // The previous layer to any S is either F or S; we use the avg layer
+  // wall (TPOT*PP/L) as the representative prefetch window.
+  const S_kv_budget_ms = avg;
 
   const iops_F = F_kv_budget_ms > 0 ? Fkv_iops_layer / (F_kv_budget_ms / 1000) : Infinity;
   const iops_S = S_kv_budget_ms > 0 ? Fkv_iops_layer / (S_kv_budget_ms / 1000) : Infinity;
@@ -297,7 +299,7 @@ function compute() {
       ? `${fmtCount(iops_F)}/s  per GPU`
       : `∞  (F budget ≤ 0 — compute already exceeds TPOT/L)`;
 
-  document.getElementById('kv_budget_S').textContent = `${fmt(T_ATTN,3)} + ${fmt(T_MOE,3)} = ${fmt(S_kv_budget_ms,3)} ms`;
+  document.getElementById('kv_budget_S').textContent = `prev_layer_wall ≈ avg = ${fmt(S_kv_budget_ms,3)} ms`;
   document.getElementById('iops_S').textContent      = `${fmtCount(iops_S)}/s  per GPU`;
 
   document.getElementById('idx_bytes_per_layer').textContent= `${fmtBytes(Fidx_bytes)}`;
