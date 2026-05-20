@@ -98,8 +98,8 @@
       <label><span class="lbl">HBM bandwidth (GB/s)</span><input id="hbmbw" type="number" step="1" value="1384"></label>
       <label><span class="lbl">SSD bandwidth (GB/s)</span><input id="ssdbw" type="number" step="0.5" value="28"></label>
       <label><span class="lbl">Top-k / indexer-compute time (ms / layer)</span><input id="t_topk" type="number" step="0.001" value="0.010"></label>
-      <label><span class="lbl">Attention compute time (ms / layer)</span><input id="t_attn" type="number" step="0.001" value="0.250"></label>
-      <label><span class="lbl">MoE time (ms / layer)</span><input id="t_moe" type="number" step="0.001" value="0.200"></label>
+      <label><span class="lbl">Attention compute time (ms / layer)</span><input id="t_attn" type="number" step="0.001" value="0.080"></label>
+      <label><span class="lbl">MoE time (ms / layer)</span><input id="t_moe" type="number" step="0.001" value="0.140"></label>
     </div>
   </div>
 
@@ -122,10 +122,11 @@
 
   <div class="panel">
     <h2>Per-layer I/O — GPU perspective</h2>
-    <div class="row"><span class="k">Per-layer wall budget = TPOT / L</span><span class="v" id="dt_layer">—</span></div>
+    <div class="row"><span class="k">Avg layer = TPOT / L</span><span class="v" id="dt_layer">—</span></div>
+    <div class="row"><span class="k">F-layer wall (solved) = avg + (nS/L) · idx_io</span><span class="v" id="F_wall">—</span></div>
     <div class="row"><span class="k">KV bytes per layer per GPU (b · A · kv_bpt)</span><span class="v" id="kv_bytes_per_layer">—</span></div>
     <div class="row"><span class="k">KV I/Os per layer per GPU ⌈bytes / u⌉</span><span class="v" id="kv_iops_per_layer">—</span></div>
-    <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">F-layer KV time budget = TPOT/L − idx_io − topk − attn − moe</span><span class="v" id="kv_budget_F">—</span></div>
+    <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">F-layer KV time budget = F − idx_io − topk − attn − moe</span><span class="v" id="kv_budget_F">—</span></div>
     <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate on F layers = I/Os / F_budget</span><span class="v big" id="iops_F">—</span></div>
     <div class="row" style="border-top: 1px dashed var(--border); padding-top: 10px;"><span class="k">S-layer KV time budget = attn + moe of previous layer (prefetch slack)</span><span class="v" id="kv_budget_S">—</span></div>
     <div class="row"><span class="k big" style="color:var(--accent);">Required IOPS rate on S layers = I/Os / S_budget</span><span class="v big" id="iops_S">—</span></div>
@@ -267,8 +268,11 @@ function compute() {
   const Fkv_bytes        = bs * A * KVB;            // bytes per layer per GPU
   const Fkv_iops_layer   = Math.ceil(Fkv_bytes / U);
 
-  // F-layer: time left after the serial idx_io + topk + attn + moe
-  const F_kv_budget_ms = dt_layer_ms - idxio - T_TOPK - T_ATTN - T_MOE;
+  // F-layer: time left in the F-layer wall after serial idx_io + topk + attn + moe.
+  // NOTE: we use the solved F-layer time (F), NOT TPOT/L. TPOT/L is the *average*
+  // — F layers are heavier than S layers, so the F-layer wall > TPOT/L. Using
+  // TPOT/L here would over-subtract and yield negative budgets.
+  const F_kv_budget_ms = F - idxio - T_TOPK - T_ATTN - T_MOE;
   // S-layer: KV is prefetched during the prior layer's compute window
   const S_kv_budget_ms = T_ATTN + T_MOE;
 
@@ -280,10 +284,11 @@ function compute() {
   const required_hbm_bw  = (Fidx_bytes / GB) / (Fidx_time_ms / 1000);
 
   document.getElementById('dt_layer').textContent          = `${fmt(dt_layer_ms, 3)} ms  (TPOT ${fmt(T,2)} ms / L=${L})`;
+  document.getElementById('F_wall').textContent            = `${fmt(F, 3)} ms`;
   document.getElementById('kv_bytes_per_layer').textContent = `${fmtBytes(Fkv_bytes)}`;
   document.getElementById('kv_iops_per_layer').textContent  = `${fmtCount(Fkv_iops_layer)}  (${Fkv_iops_layer.toLocaleString()})`;
 
-  const F_budget_txt = `${fmt(dt_layer_ms,3)} − ${fmt(idxio,3)} − ${fmt(T_TOPK,3)} − ${fmt(T_ATTN,3)} − ${fmt(T_MOE,3)} = ${fmt(F_kv_budget_ms,3)} ms`;
+  const F_budget_txt = `${fmt(F,3)} − ${fmt(idxio,3)} − ${fmt(T_TOPK,3)} − ${fmt(T_ATTN,3)} − ${fmt(T_MOE,3)} = ${fmt(F_kv_budget_ms,3)} ms`;
   const fb = document.getElementById('kv_budget_F');
   fb.textContent = F_budget_txt;
   fb.className = 'v ' + (F_kv_budget_ms <= 0 ? 'bad' : (F_kv_budget_ms < 0.1 ? 'warn' : 'ok'));
