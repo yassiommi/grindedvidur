@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Execution & TPOT Configurable Calculator</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262a33;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --accent: #6ea8fe;
+    --good: #3FAA5B;
+    --warn: #F0C03A;
+    --bad: #C84B4B;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 24px;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px 18px;
+  }
+  .grid2 {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px 18px;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  label span.lbl { margin-bottom: 4px; }
+  input, select {
+    background: #0c0e13;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+    font-family: ui-monospace, monospace;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed var(--border); font-family: ui-monospace, monospace; font-size: 13px; gap: 12px; }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--muted); }
+  .row .v { color: var(--text); text-align: right; }
+  .big { font-size: 22px; font-weight: 600; color: var(--accent); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.55; }
+  .ok { color: var(--good); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  h2 { font-size: 13px; color: var(--muted); margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+  details { background: #0c0e13; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; }
+  details > summary { cursor: pointer; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  details[open] { padding-bottom: 14px; }
+  details > .grid { margin-top: 12px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 820px) {
+    .grid, .grid2 { grid-template-columns: 1fr 1fr; }
+    .two-col { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Execution & TPOT Configurable Calculator</h1>
+  <div class="sub">Forward: TPOT from (sl, bs). Reverse: max bs or max sl from a TPOT target. Hardware-limited via SSD IOPS & BW. <span class="pill">DeepSeek-V3 · DSA / IndexCache</span></div>
+
+  <div class="panel">
+    <h2>Solve mode</h2>
+    <div class="grid2">
+      <label><span class="lbl">Mode</span>
+        <select id="mode">
+          <option value="forward" selected>Forward: (sl, bs) → TPOT</option>
+          <option value="max_bs">Reverse: (TPOT, sl) → max BS_cluster</option>
+          <option value="max_sl">Reverse: (TPOT, bs) → max sl</option>
+        </select>
+      </label>
+      <label><span class="lbl">Scheme</span>
+        <select id="scheme">
+          <option value="dsa">DSA (all F layers)</option>
+          <option value="ic" selected>IndexCache (F:S:S:S — 16 F + 45 S)</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Workload inputs</h2>
+    <div class="grid">
+      <label id="sl_wrap"><span class="lbl">Sequence length</span>
+        <select id="sl">
+          <option value="131072">128K</option>
+          <option value="204800">200K</option>
+          <option value="262144">256K</option>
+          <option value="393216">384K</option>
+          <option value="524288">512K</option>
+          <option value="786432">768K</option>
+          <option value="1048576" selected>1M</option>
+          <option value="2097152">2M</option>
+          <option value="4194304">4M</option>
+        </select>
+      </label>
+      <label id="bsc_wrap"><span class="lbl">Cluster batch size (BS_cluster)</span><input id="bsc" type="number" step="1" value="24"></label>
+      <label id="tpot_wrap"><span class="lbl">TPOT target (ms / token)</span><input id="tpot" type="number" step="0.1" value="30"></label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Hardware</h2>
+    <div class="grid">
+      <label><span class="lbl">SSD bandwidth (GB/s)</span><input id="ssdbw" type="number" step="0.5" value="28"></label>
+      <label><span class="lbl">SSD max IOPS</span><input id="ssdiops" type="number" step="100000" value="6000000"></label>
+      <label><span class="lbl">HBM bandwidth (GB/s)</span><input id="hbmbw" type="number" step="1" value="1384"></label>
+      <label><span class="lbl">KV residence</span>
+        <select id="kvres">
+          <option value="ssd" selected>SSD (NVMe)</option>
+          <option value="hbm">HBM (on-die)</option>
+        </select>
+      </label>
+      <label><span class="lbl">HBM floor (ms)</span><input id="hbmfloor" type="number" step="0.001" value="0.015"></label>
+      <label><span class="lbl">SSD floor (ms)</span><input id="ssdfloor" type="number" step="0.001" value="0.050"></label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Parallelism</h2>
+    <div class="grid">
+      <label><span class="lbl">PP (pipeline)</span><input id="pp" type="number" step="1" value="2"></label>
+      <label><span class="lbl">TP (tensor)</span><input id="tp" type="number" step="1" value="2"></label>
+      <label><span class="lbl">EP (expert)</span><input id="ep" type="number" step="1" value="8"></label>
+    </div>
+    <details>
+      <summary>Model architecture (advanced)</summary>
+      <div class="grid">
+        <label><span class="lbl">N layers</span><input id="nlayers" type="number" step="1" value="61"></label>
+        <label><span class="lbl">F-period</span><input id="fperiod" type="number" step="1" value="4"></label>
+        <label><span class="lbl">Indexer K bytes/token/layer</span><input id="idxb" type="number" step="1" value="128"></label>
+        <label><span class="lbl">KV bytes/token/layer</span><input id="kvb" type="number" step="1" value="576"></label>
+        <label><span class="lbl">KV tokens loaded per layer (top-k)</span><input id="att" type="number" step="1" value="2048"></label>
+        <label><span class="lbl">I/O unit (B)</span><input id="iou" type="number" step="1" value="512"></label>
+      </div>
+    </details>
+    <details>
+      <summary>Per-layer compute (ms — defaults: FP8 + MLA absorption)</summary>
+      <div class="grid">
+        <label><span class="lbl">block_a (Q/K/V projections)</span><input id="t_blocka" type="number" step="0.001" value="0.055"></label>
+        <label><span class="lbl">topk / idx_comp</span><input id="t_topk" type="number" step="0.001" value="0.010"></label>
+        <label><span class="lbl">attn + o_proj (block_c)</span><input id="t_attn" type="number" step="0.001" value="0.080"></label>
+        <label><span class="lbl">moe (router + experts + EP)</span><input id="t_moe" type="number" step="0.001" value="0.140"></label>
+      </div>
+      <div class="note">These are <i>compute-only</i> per-layer times. The model uses <code>F = max(io_F, compute_F)</code> and <code>S = max(io_S, compute_S)</code> where <code>compute = block_a + topk + attn + moe</code> (S drops topk). TP-shard the compute by dividing by TP if you want a per-rank view; defaults assume already-sharded.</div>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>Results</h2>
+    <div class="row"><span class="k">Per-attn-rank BS = BS_cluster / (EP / TP)</span><span class="v" id="bs">—</span></div>
+    <div class="row"><span class="k">F layers / S layers / total / layers per stage</span><span class="v" id="fscount">—</span></div>
+
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">idx_io (F only) = hbm_ms(BS × sl × idx_bpt)</span><span class="v" id="idxio">—</span></div>
+    <div class="row"><span class="k">kv_bytes / layer / GPU = BS × A × kv_bpt</span><span class="v" id="kvbytes">—</span></div>
+    <div class="row"><span class="k">kv_iops / layer / GPU = BS × A × ⌈kv_bpt / U⌉</span><span class="v" id="kviops">—</span></div>
+    <div class="row"><span class="k">kv_io = max(bytes/BW, iops/IOPS, floor)</span><span class="v" id="kvio">—</span></div>
+
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">compute_F  = block_a + topk + attn + moe</span><span class="v" id="cmpF">—</span></div>
+    <div class="row"><span class="k">compute_S  = block_a + attn + moe</span><span class="v" id="cmpS">—</span></div>
+    <div class="row"><span class="k">F_layer = max(idx_io + kv_io, compute_F)</span><span class="v" id="Flayer">—</span></div>
+    <div class="row"><span class="k">S_layer = max(kv_io, compute_S)</span><span class="v" id="Slayer">—</span></div>
+
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">avg per layer = (nF·F + nS·S) / L</span><span class="v" id="avg">—</span></div>
+    <div class="row"><span class="k big">TPOT  =  L · avg / PP</span><span class="v big" id="tpot_out">—</span></div>
+    <div class="row"><span class="k">Throughput (tok/s/cluster)  =  BS_cluster · 1000 / TPOT</span><span class="v" id="tps">—</span></div>
+
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">SSD BW used per GPU (sustained)</span><span class="v" id="ssd_bw_used">—</span></div>
+    <div class="row"><span class="k">SSD IOPS used per GPU (sustained)</span><span class="v" id="ssd_iops_used">—</span></div>
+    <div class="row"><span class="k">HBM BW used per GPU on F layers</span><span class="v" id="hbm_bw_used">—</span></div>
+    <div class="row"><span class="k">Bottleneck</span><span class="v" id="bottleneck">—</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>Model — quick reference</h2>
+    <div class="note">
+      <code>kv_io = max( kv_bytes / SSD_BW , kv_iops / SSD_IOPS , SSD_FLOOR )</code> — whichever of bandwidth, IOPS, or floor is the binding constraint dominates.<br>
+      <code>F = max(idx_io + kv_io, compute_F)</code> — F-layer IO chain is <code>idx_io → topk → kv_io</code>; we sum the IO and take the max against compute.<br>
+      <code>S = max(kv_io, compute_S)</code> — S-layer reuses prior F's top-k, no indexer IO of its own.<br>
+      <code>TPOT = avg_layer × L / PP</code> — steady-state pipeline (no startup/drain).<br>
+      Forward mode is direct. Reverse modes binary-search over the unknown until TPOT matches the target.
+    </div>
+  </div>
+</div>
+
+<script>
+const GB = 1024 ** 3;
+
+function hbm_ms(bytes, bw, floor) { return Math.max(bytes / (bw * GB) * 1000, floor); }
+
+function ssd_ms(bytes, iops_count, ssd_bw, ssd_iops, floor) {
+  const t_bw   = bytes / (ssd_bw * GB) * 1000;
+  const t_iops = (iops_count / ssd_iops) * 1000;
+  return Math.max(t_bw, t_iops, floor);
+}
+
+function fmt(x, n = 3) { return isFinite(x) ? x.toFixed(n) : '—'; }
+function fmtBytes(b) {
+  if (b >= GB)        return (b / GB).toFixed(2) + ' GB';
+  if (b >= 1024*1024) return (b / (1024*1024)).toFixed(2) + ' MB';
+  if (b >= 1024)      return (b / 1024).toFixed(2) + ' KB';
+  return b.toLocaleString() + ' B';
+}
+function fmtCount(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + ' G';
+  if (n >= 1e6) return (n/1e6).toFixed(2) + ' M';
+  if (n >= 1e3) return (n/1e3).toFixed(2) + ' K';
+  return n.toFixed(0);
+}
+
+function readInputs() {
+  return {
+    mode  : document.getElementById('mode').value,
+    scheme: document.getElementById('scheme').value,
+    kvres : document.getElementById('kvres').value,
+    sl    : parseFloat(document.getElementById('sl').value),
+    bsc   : parseFloat(document.getElementById('bsc').value),
+    tpot  : parseFloat(document.getElementById('tpot').value),
+    SSD_BW   : parseFloat(document.getElementById('ssdbw').value),
+    SSD_IOPS : parseFloat(document.getElementById('ssdiops').value),
+    HBM_BW   : parseFloat(document.getElementById('hbmbw').value),
+    HBM_FLOOR: parseFloat(document.getElementById('hbmfloor').value),
+    SSD_FLOOR: parseFloat(document.getElementById('ssdfloor').value),
+    PP : parseInt(document.getElementById('pp').value, 10),
+    TP : parseInt(document.getElementById('tp').value, 10),
+    EP : parseInt(document.getElementById('ep').value, 10),
+    L  : parseInt(document.getElementById('nlayers').value, 10),
+    FP : parseInt(document.getElementById('fperiod').value, 10),
+    IDXB: parseFloat(document.getElementById('idxb').value),
+    KVB : parseFloat(document.getElementById('kvb').value),
+    A   : parseFloat(document.getElementById('att').value),
+    U   : parseFloat(document.getElementById('iou').value),
+    t_blocka: parseFloat(document.getElementById('t_blocka').value),
+    t_topk  : parseFloat(document.getElementById('t_topk').value),
+    t_attn  : parseFloat(document.getElementById('t_attn').value),
+    t_moe   : parseFloat(document.getElementById('t_moe').value),
+  };
+}
+
+// Forward: given (sl, bsc) compute full TPOT + everything.
+function evaluate(sl, bsc, p) {
+  const dp_attn = p.EP / p.TP;
+  const bs = Math.max(1, Math.floor(bsc / dp_attn));
+
+  let nF, nS;
+  if (p.scheme === 'dsa') { nF = p.L; nS = 0; }
+  else {
+    nF = 0;
+    for (let i = 0; i < p.L; i++) if (i % p.FP === 0) nF++;
+    nS = p.L - nF;
+  }
+
+  // IO model
+  const idx_bytes = bs * sl * p.IDXB;
+  const idx_io    = hbm_ms(idx_bytes, p.HBM_BW, p.HBM_FLOOR);
+
+  const kv_bytes  = bs * p.A * p.KVB;
+  const kv_iops   = bs * p.A * Math.ceil(p.KVB / p.U);
+  let kv_io;
+  if (p.kvres === 'hbm') {
+    kv_io = hbm_ms(kv_bytes, p.HBM_BW, p.HBM_FLOOR);
+  } else {
+    kv_io = ssd_ms(kv_bytes, kv_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR);
+  }
+
+  // Compute (per layer)
+  const cmpF = p.t_blocka + p.t_topk + p.t_attn + p.t_moe;
+  const cmpS = p.t_blocka + p.t_attn + p.t_moe;
+
+  // Layer time
+  const F_layer = Math.max(idx_io + kv_io, cmpF);
+  const S_layer = Math.max(kv_io, cmpS);
+
+  const avg = (nF * F_layer + nS * S_layer) / p.L;
+  const tpot = p.L * avg / p.PP;
+  const tps  = (bsc * 1000) / tpot;
+
+  // Sustained per-GPU rates over the whole token window
+  const ssd_bytes_per_tok = p.L * kv_bytes;          // all layers fetch KV
+  const ssd_iops_per_tok  = p.L * kv_iops;
+  const hbm_bytes_F_tok   = nF * idx_bytes;
+
+  const ssd_bw_used   = (ssd_bytes_per_tok / GB) / (tpot / 1000);   // GB/s
+  const ssd_iops_used = ssd_iops_per_tok / (tpot / 1000);           // IOPS
+  const hbm_bw_used   = (hbm_bytes_F_tok / GB) / (tpot / 1000);
+
+  // Bottleneck
+  let bn;
+  if (p.kvres === 'ssd') {
+    const t_bw   = kv_bytes / (p.SSD_BW * GB) * 1000;
+    const t_iops = (kv_iops / p.SSD_IOPS) * 1000;
+    if (Math.max(t_bw, t_iops) < cmpS) bn = 'compute (S-layer)';
+    else if (t_iops > t_bw)            bn = 'SSD IOPS';
+    else                               bn = 'SSD BW';
+  } else {
+    bn = (idx_io + kv_io > cmpF) ? 'HBM BW' : 'compute';
+  }
+
+  return {
+    bs, nF, nS, lps: Math.ceil(p.L / p.PP),
+    idx_io, idx_bytes,
+    kv_bytes, kv_iops, kv_io,
+    cmpF, cmpS, F_layer, S_layer,
+    avg, tpot, tps,
+    ssd_bw_used, ssd_iops_used, hbm_bw_used,
+    bottleneck: bn,
+  };
+}
+
+function bsearch(lo, hi, target, evalFn) {
+  for (let i = 0; i < 40 && hi - lo > 1e-6; i++) {
+    const mid = (lo + hi) / 2;
+    const t = evalFn(mid);
+    if (t <= target) lo = mid;
+    else             hi = mid;
+  }
+  return lo;
+}
+
+function compute() {
+  const p = readInputs();
+
+  // Mode selects which output is the "answer" — but we always present the
+  // full breakdown for the resolved (sl, bsc) tuple.
+  let sl = p.sl, bsc = p.bsc;
+
+  // Visibility toggle
+  document.getElementById('sl_wrap').style.display   = (p.mode === 'max_sl')  ? 'none' : '';
+  document.getElementById('bsc_wrap').style.display  = (p.mode === 'max_bs')  ? 'none' : '';
+  document.getElementById('tpot_wrap').style.display = (p.mode === 'forward') ? 'none' : '';
+
+  if (p.mode === 'max_bs') {
+    // Binary search BS_cluster such that TPOT(bsc) = p.tpot
+    const f = (b) => evaluate(p.sl, b, p).tpot;
+    if (f(1) > p.tpot) { bsc = 0; }
+    else { bsc = bsearch(1, 8192, p.tpot, f); }
+    sl = p.sl;
+  } else if (p.mode === 'max_sl') {
+    const f = (s) => evaluate(s, p.bsc, p).tpot;
+    if (f(1024) > p.tpot) { sl = 0; }
+    else { sl = bsearch(1024, 8 * 1024 * 1024, p.tpot, f); }
+    bsc = p.bsc;
+  }
+
+  const r = evaluate(sl, bsc, p);
+
+  document.getElementById('bs').textContent      = `${r.bs}  (BS_cluster=${fmt(bsc,1)}, DP_attn=${p.EP/p.TP}, sl=${(sl/1024).toFixed(0)}K)`;
+  document.getElementById('fscount').textContent = `${r.nF} F / ${r.nS} S / L=${p.L} / lps=${r.lps}`;
+
+  document.getElementById('idxio').textContent  = `${fmt(r.idx_io)} ms   (${fmtBytes(r.idx_bytes)})`;
+  document.getElementById('kvbytes').textContent= fmtBytes(r.kv_bytes);
+  document.getElementById('kviops').textContent = `${fmtCount(r.kv_iops)}  (${r.kv_iops.toLocaleString()})`;
+  document.getElementById('kvio').textContent   = `${fmt(r.kv_io)} ms`;
+
+  document.getElementById('cmpF').textContent   = `${fmt(r.cmpF)} ms`;
+  document.getElementById('cmpS').textContent   = `${fmt(r.cmpS)} ms`;
+  document.getElementById('Flayer').textContent = `${fmt(r.F_layer)} ms`;
+  document.getElementById('Slayer').textContent = `${fmt(r.S_layer)} ms`;
+
+  document.getElementById('avg').textContent      = `${fmt(r.avg)} ms`;
+  document.getElementById('tpot_out').textContent = `${fmt(r.tpot, 2)} ms`;
+  document.getElementById('tps').textContent      = `${fmt(r.tps, 1)} tok/s`;
+
+  const ssd_bw_pct   = (r.ssd_bw_used   / p.SSD_BW   * 100);
+  const ssd_iops_pct = (r.ssd_iops_used / p.SSD_IOPS * 100);
+  const hbm_bw_pct   = (r.hbm_bw_used   / p.HBM_BW   * 100);
+
+  const cls = (pct) => pct < 70 ? 'ok' : (pct < 95 ? 'warn' : 'bad');
+
+  const e1 = document.getElementById('ssd_bw_used');
+  e1.textContent = `${fmt(r.ssd_bw_used, 2)} GB/s  (${ssd_bw_pct.toFixed(0)}% of ${p.SSD_BW} GB/s)`;
+  e1.className = 'v ' + cls(ssd_bw_pct);
+
+  const e2 = document.getElementById('ssd_iops_used');
+  e2.textContent = `${fmtCount(r.ssd_iops_used)}/s  (${ssd_iops_pct.toFixed(0)}% of ${fmtCount(p.SSD_IOPS)}/s)`;
+  e2.className = 'v ' + cls(ssd_iops_pct);
+
+  const e3 = document.getElementById('hbm_bw_used');
+  e3.textContent = `${fmt(r.hbm_bw_used, 1)} GB/s  (${hbm_bw_pct.toFixed(0)}% of ${p.HBM_BW} GB/s)`;
+  e3.className = 'v ' + cls(hbm_bw_pct);
+
+  document.getElementById('bottleneck').textContent = r.bottleneck;
+}
+
+document.querySelectorAll('input, select').forEach(el => {
+  el.addEventListener('input',  compute);
+  el.addEventListener('change', compute);
+});
+compute();
+</script>
+</body>
+</html>
