@@ -197,7 +197,7 @@
     <div class="row"><span class="k">S_layer = max(kv_io, compute_S)</span><span class="v" id="Slayer">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">avg per layer = (nF·F + nS·S) / L</span><span class="v" id="avg">—</span></div>
-    <div class="row"><span class="k big">TPOT  =  L · avg / PP</span><span class="v big" id="tpot_out">—</span></div>
+    <div class="row"><span class="k big">TPOT  =  L · avg  (all PP stages in serial per token)</span><span class="v big" id="tpot_out">—</span></div>
     <div class="row"><span class="k">Throughput (tok/s/cluster)  =  BS_cluster · 1000 / TPOT</span><span class="v" id="tps">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">SSD BW used per GPU (sustained)</span><span class="v" id="ssd_bw_used">—</span></div>
@@ -212,7 +212,7 @@
       <code>kv_io = max( kv_bytes / SSD_BW , kv_iops / SSD_IOPS , SSD_FLOOR )</code> — whichever of bandwidth, IOPS, or floor is the binding constraint dominates.<br>
       <code>F = max(idx_io + kv_io, compute_F)</code> — F-layer IO chain is <code>idx_io → topk → kv_io</code>; we sum the IO and take the max against compute.<br>
       <code>S = max(kv_io, compute_S)</code> — S-layer reuses prior F's top-k, no indexer IO of its own.<br>
-      <code>TPOT = avg_layer × L / PP</code> — steady-state pipeline (no startup/drain).<br>
+      <code>TPOT = avg_layer × L</code> — each token traverses all PP stages sequentially. PP divides memory per rank, not per-token latency.<br>
       Forward mode is direct. Reverse modes binary-search over the unknown until TPOT matches the target.
     </div>
   </div>
@@ -307,8 +307,11 @@ function evaluate(sl, bsc, p) {
   const F_layer = Math.max(idx_io + kv_io, cmpF);
   const S_layer = Math.max(kv_io, cmpS);
 
-  const avg = (nF * F_layer + nS * S_layer) / p.L;
-  const tpot = p.L * avg / p.PP;
+  const avg  = (nF * F_layer + nS * S_layer) / p.L;
+  // TPOT = L × avg  (no PP division).
+  // Each token must traverse all PP stages sequentially — PP reduces
+  // memory per rank but does NOT hide per-token latency.
+  const tpot = p.L * avg;
   const tps  = (bsc * 1000) / tpot;
 
   // Sustained per-GPU rates over the whole token window
