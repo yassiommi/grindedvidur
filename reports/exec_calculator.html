@@ -402,17 +402,30 @@ function compute() {
   document.getElementById('bsc_wrap').style.display  = (p.mode === 'max_bs')  ? 'none' : '';
   document.getElementById('tpot_wrap').style.display = (p.mode === 'forward') ? 'none' : '';
 
+  let infeasible = false;
   if (p.mode === 'max_bs') {
     // Binary search BS_cluster such that TPOT(bsc) = p.tpot
     const f = (b) => evaluate(p.sl, b, p).tpot;
-    if (f(1) > p.tpot) { bsc = 0; }
-    else { bsc = bsearch(1, 8192, p.tpot, f); }
+    if (f(1) > p.tpot) { bsc = 0; infeasible = true; }
+    else { bsc = Math.floor(bsearch(1, 8192, p.tpot, f)); }
     sl = p.sl;
   } else if (p.mode === 'max_sl') {
     const f = (s) => evaluate(s, p.bsc, p).tpot;
-    if (f(1024) > p.tpot) { sl = 0; }
-    else { sl = bsearch(1024, 8 * 1024 * 1024, p.tpot, f); }
+    if (f(1024) > p.tpot) { sl = 0; infeasible = true; }
+    else { sl = Math.floor(bsearch(1024, 8 * 1024 * 1024, p.tpot, f)); }
     bsc = p.bsc;
+  }
+
+  if (infeasible) {
+    document.getElementById('bs').textContent      = `infeasible — TPOT target ${p.tpot} ms unreachable at the smallest workload`;
+    document.getElementById('fscount').textContent = '—';
+    ['idxio','kvbytes','kviops','kvio','cmpF','cmpS','Flayer','Slayer','avg','tpot_out','tps',
+     'ssd_bw_used','ssd_iops_used','hbm_bw_used','bottleneck'].forEach(id => {
+       const el = document.getElementById(id);
+       el.textContent = '—';
+       el.className = 'v';
+     });
+    return;
   }
 
   const r = evaluate(sl, bsc, p);
