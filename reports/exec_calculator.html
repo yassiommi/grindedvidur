@@ -199,7 +199,7 @@
     <div class="row"><span class="k">S_layer = max(kv_io, compute_S)</span><span class="v" id="Slayer">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">avg per layer = (nF·F + nS·S) / L</span><span class="v" id="avg">—</span></div>
-    <div class="row"><span class="k big">TPOT (producer/consumer pipeline walk over PP stages)</span><span class="v big" id="tpot_out">—</span></div>
+    <div class="row"><span class="k big">TPOT (per output token, across PP stages)</span><span class="v big" id="tpot_out">—</span></div>
     <div class="row"><span class="k">Throughput (tok/s/cluster)  =  BS_cluster · 1000 / TPOT</span><span class="v" id="tps">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">SSD BW used per GPU (sustained)</span><span class="v" id="ssd_bw_used">—</span></div>
@@ -214,7 +214,7 @@
       <code>kv_io = max( kv_bytes / SSD_BW , kv_iops / SSD_IOPS , SSD_FLOOR )</code> — whichever of bandwidth, IOPS, or floor is the binding constraint dominates.<br>
       <code>F = max(idx_io + kv_io, compute_F)</code> — F-layer IO chain is <code>idx_io → topk → kv_io</code>; we sum the IO and take the max against compute.<br>
       <code>S = max(kv_io, compute_S)</code> — S-layer reuses prior F's top-k, no indexer IO of its own.<br>
-      <code>TPOT</code> — producer/consumer pipeline walk: stage 0 advances layer-by-layer (compute waits on cumulative IO); each later stage's IO can overlap with the previous stage's compute, then its own compute is added serially. Matches <code>schedule_pp</code> in the analytical model.<br>
+      <code>TPOT</code> — walked across PP stages: stage 0 advances layer-by-layer where compute waits on cumulative IO; each later stage's IO can overlap with the previous stage's compute, then its compute is added on top. Matches the analytical model's pipeline schedule.<br>
       Forward mode is direct. Reverse modes binary-search over the unknown until TPOT matches the target.
     </div>
   </div>
@@ -321,11 +321,11 @@ function evaluate(sl, bsc, p) {
     cmps.push(isF ? cmpF : cmpS);
   }
 
-  // Pipeline producer/consumer walk — same algorithm as
-  // experiments/generate_slide_figures.py:schedule_pp.
-  // Stage 0: walks layer-by-layer (compute waits for cumulative IO).
-  // Stages 1+: sums their IO (can overlap with prior stage's compute)
-  //            then adds the stage's compute serially.
+  // Pipeline walk across PP stages — same algorithm as the
+  // analytical model's pipeline schedule.
+  // Stage 0: walks layer-by-layer (compute waits on cumulative IO).
+  // Stages 1+: their IO can overlap with the prior stage's compute,
+  //            then their own compute is added on top.
   const lps = Math.ceil(p.L / p.PP);
   let cum_io = 0, end_comp = 0;
   for (let i = 0; i < Math.min(lps, p.L); i++) {
