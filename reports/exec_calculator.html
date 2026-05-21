@@ -142,8 +142,8 @@
       <label><span class="lbl">HBM bandwidth (GB/s)</span><input id="hbmbw" type="number" step="1" value="1384"></label>
       <label><span class="lbl">KV residence</span>
         <select id="kvres">
-          <option value="ssd" selected>SSD (NVMe)</option>
-          <option value="hbm">HBM (on-die)</option>
+          <option value="hbm" selected>HBM (on-die — MLA latent default)</option>
+          <option value="ssd">SSD (NVMe — full-KV offload)</option>
         </select>
       </label>
       <label><span class="lbl">HBM floor (ms)</span><input id="hbmfloor" type="number" step="0.001" value="0.015"></label>
@@ -170,13 +170,13 @@
       </div>
     </details>
     <details>
-      <summary>Per-layer compute (ms — defaults: FP8 + MLA absorption)</summary>
+      <summary>Per-layer compute model (ms — defaults: FP8 + MLA absorption, TP=2)</summary>
       <div class="grid">
-        <label><span class="lbl">block_a (Q/K/V projections)</span><input id="t_blocka" type="number" step="0.001" value="0.055"></label>
-        <label><span class="lbl">topk / idx_comp</span><input id="t_topk" type="number" step="0.001" value="0.010"></label>
-        <label><span class="lbl">attn + o_proj (block_c)</span><input id="t_attn" type="number" step="0.001" value="0.080"></label>
-        <label><span class="lbl">moe (router + experts + EP)</span><input id="t_moe" type="number" step="0.001" value="0.140"></label>
+        <label><span class="lbl">BS-independent compute / layer (block_a, block_c, EP comms — weight-bound)</span><input id="c_flat" type="number" step="0.001" value="0.190"></label>
+        <label><span class="lbl">BS-scaling compute / layer / BS (MoE expert GEMM + dispatch)</span><input id="c_perbs" type="number" step="0.001" value="0.048"></label>
+        <label><span class="lbl">topk / idx_comp (F-only overhead)</span><input id="t_topk" type="number" step="0.001" value="0.010"></label>
       </div>
+      <div class="note">Compute is modeled as <code>cmp_per_layer = c_flat + c_per_bs × bs</code>. At BS=1 FP8 TP=2 the analytical model gives ≈ 0.24 ms; at BS=6 it gives ≈ 0.49 ms — the linear fit (0.19 + 0.048·BS) is within ~3% across the BS=1–24 range.<br>If you change TP, scale both <code>c_flat</code> and <code>c_per_bs</code> roughly by (2/TP); FP16 doubles both.</div>
       <div class="note">These are <i>compute-only</i> per-layer times. The model uses <code>F = max(io_F, compute_F)</code> and <code>S = max(io_S, compute_S)</code> where <code>compute = block_a + topk + attn + moe</code> (S drops topk). TP-shard the compute by dividing by TP if you want a per-rank view; defaults assume already-sharded.</div>
     </details>
   </div>
@@ -191,8 +191,8 @@
     <div class="row"><span class="k">kv_iops / layer / GPU = BS × A × ⌈kv_bpt / U⌉</span><span class="v" id="kviops">—</span></div>
     <div class="row"><span class="k">kv_io = max(bytes/BW, iops/IOPS, floor)</span><span class="v" id="kvio">—</span></div>
 
-    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">compute_F  = block_a + topk + attn + moe</span><span class="v" id="cmpF">—</span></div>
-    <div class="row"><span class="k">compute_S  = block_a + attn + moe</span><span class="v" id="cmpS">—</span></div>
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">compute_F  = c_flat + c_per_bs · BS + topk</span><span class="v" id="cmpF">—</span></div>
+    <div class="row"><span class="k">compute_S  = c_flat + c_per_bs · BS</span><span class="v" id="cmpS">—</span></div>
     <div class="row"><span class="k">F_layer = max(idx_io + kv_io, compute_F)</span><span class="v" id="Flayer">—</span></div>
     <div class="row"><span class="k">S_layer = max(kv_io, compute_S)</span><span class="v" id="Slayer">—</span></div>
 
@@ -266,10 +266,9 @@ function readInputs() {
     KVB : parseFloat(document.getElementById('kvb').value),
     A   : parseFloat(document.getElementById('att').value),
     U   : parseFloat(document.getElementById('iou').value),
-    t_blocka: parseFloat(document.getElementById('t_blocka').value),
+    c_flat  : parseFloat(document.getElementById('c_flat').value),
+    c_perbs : parseFloat(document.getElementById('c_perbs').value),
     t_topk  : parseFloat(document.getElementById('t_topk').value),
-    t_attn  : parseFloat(document.getElementById('t_attn').value),
-    t_moe   : parseFloat(document.getElementById('t_moe').value),
   };
 }
 
@@ -299,9 +298,12 @@ function evaluate(sl, bsc, p) {
     kv_io = ssd_ms(kv_bytes, kv_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR, p.IOPS_ON);
   }
 
-  // Compute (per layer)
-  const cmpF = p.t_blocka + p.t_topk + p.t_attn + p.t_moe;
-  const cmpS = p.t_blocka + p.t_attn + p.t_moe;
+  // Compute (per layer) — linear-in-bs model
+  // Calibrated from analytical_layer.py for FP8 + MLA absorption + TP=2:
+  //   cmp_layer = c_flat + c_per_bs * bs   (~3% accurate over BS=1..24)
+  const cmp_base = p.c_flat + p.c_perbs * bs;
+  const cmpF = cmp_base + p.t_topk;
+  const cmpS = cmp_base;
 
   // Layer time
   const F_layer = Math.max(idx_io + kv_io, cmpF);
