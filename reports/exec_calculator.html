@@ -170,13 +170,15 @@
       </div>
     </details>
     <details>
-      <summary>Per-layer compute model (ms — defaults: FP8 + MLA absorption, TP=2)</summary>
+      <summary>Per-layer compute model (ms — raw / before TP. defaults: FP8 + MLA absorption)</summary>
       <div class="grid">
-        <label><span class="lbl">BS-independent compute / layer (block_a, block_c, EP comms — weight-bound)</span><input id="c_flat" type="number" step="0.001" value="0.190"></label>
-        <label><span class="lbl">BS-scaling compute / layer / BS (MoE expert GEMM + dispatch)</span><input id="c_perbs" type="number" step="0.001" value="0.048"></label>
+        <label><span class="lbl">Shardable flat (block_a + block_c + moe_router) — divides by TP</span><input id="c_sh_flat"  type="number" step="0.001" value="0.281"></label>
+        <label><span class="lbl">Shardable per-BS (moe_shardable slope) — divides by TP</span><input id="c_sh_perbs" type="number" step="0.001" value="0.041"></label>
+        <label><span class="lbl">Unsharded flat (moe_ep_comms)</span><input id="c_un_flat"  type="number" step="0.001" value="0.080"></label>
+        <label><span class="lbl">Unsharded per-BS (moe_expert_gemm)</span><input id="c_un_perbs" type="number" step="0.001" value="0.022"></label>
         <label><span class="lbl">topk / idx_comp (F-only overhead)</span><input id="t_topk" type="number" step="0.001" value="0.010"></label>
       </div>
-      <div class="note">Compute is modeled as <code>cmp_per_layer = c_flat + c_per_bs × bs</code>. At BS=1 FP8 TP=2 the analytical model gives ≈ 0.24 ms; at BS=6 it gives ≈ 0.49 ms — the linear fit (0.19 + 0.048·BS) is within ~3% across the BS=1–24 range.<br>If you change TP, scale both <code>c_flat</code> and <code>c_per_bs</code> roughly by (2/TP); FP16 doubles both.</div>
+      <div class="note">Compute model: <code>cmp = (sh_flat + sh_perbs · BS) / TP + un_flat + un_perbs · BS</code>. Defaults calibrated for FP8 + MLA absorption against <code>analytical_layer.py</code> across BS=1–32, TP=1–8. For FP16 multiply all four by ~2.</div>
       <div class="note">These are <i>compute-only</i> per-layer times. The model uses <code>F = max(io_F, compute_F)</code> and <code>S = max(io_S, compute_S)</code> where <code>compute = block_a + topk + attn + moe</code> (S drops topk). TP-shard the compute by dividing by TP if you want a per-rank view; defaults assume already-sharded.</div>
     </details>
   </div>
@@ -191,13 +193,13 @@
     <div class="row"><span class="k">kv_iops / layer / GPU = BS × A × ⌈kv_bpt / U⌉</span><span class="v" id="kviops">—</span></div>
     <div class="row"><span class="k">kv_io = max(bytes/BW, iops/IOPS, floor)</span><span class="v" id="kvio">—</span></div>
 
-    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">compute_F  = c_flat + c_per_bs · BS + topk</span><span class="v" id="cmpF">—</span></div>
-    <div class="row"><span class="k">compute_S  = c_flat + c_per_bs · BS</span><span class="v" id="cmpS">—</span></div>
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">compute_F  = (sh_flat + sh·BS)/TP + un_flat + un·BS + topk</span><span class="v" id="cmpF">—</span></div>
+    <div class="row"><span class="k">compute_S  = (sh_flat + sh·BS)/TP + un_flat + un·BS</span><span class="v" id="cmpS">—</span></div>
     <div class="row"><span class="k">F_layer = max(idx_io + kv_io, compute_F)</span><span class="v" id="Flayer">—</span></div>
     <div class="row"><span class="k">S_layer = max(kv_io, compute_S)</span><span class="v" id="Slayer">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">avg per layer = (nF·F + nS·S) / L</span><span class="v" id="avg">—</span></div>
-    <div class="row"><span class="k big">TPOT  =  L · avg  (all PP stages in serial per token)</span><span class="v big" id="tpot_out">—</span></div>
+    <div class="row"><span class="k big">TPOT (producer/consumer pipeline walk over PP stages)</span><span class="v big" id="tpot_out">—</span></div>
     <div class="row"><span class="k">Throughput (tok/s/cluster)  =  BS_cluster · 1000 / TPOT</span><span class="v" id="tps">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">SSD BW used per GPU (sustained)</span><span class="v" id="ssd_bw_used">—</span></div>
@@ -212,7 +214,7 @@
       <code>kv_io = max( kv_bytes / SSD_BW , kv_iops / SSD_IOPS , SSD_FLOOR )</code> — whichever of bandwidth, IOPS, or floor is the binding constraint dominates.<br>
       <code>F = max(idx_io + kv_io, compute_F)</code> — F-layer IO chain is <code>idx_io → topk → kv_io</code>; we sum the IO and take the max against compute.<br>
       <code>S = max(kv_io, compute_S)</code> — S-layer reuses prior F's top-k, no indexer IO of its own.<br>
-      <code>TPOT = avg_layer × L</code> — each token traverses all PP stages sequentially. PP divides memory per rank, not per-token latency.<br>
+      <code>TPOT</code> — producer/consumer pipeline walk: stage 0 advances layer-by-layer (compute waits on cumulative IO); each later stage's IO can overlap with the previous stage's compute, then its own compute is added serially. Matches <code>schedule_pp</code> in the analytical model.<br>
       Forward mode is direct. Reverse modes binary-search over the unknown until TPOT matches the target.
     </div>
   </div>
@@ -266,9 +268,11 @@ function readInputs() {
     KVB : parseFloat(document.getElementById('kvb').value),
     A   : parseFloat(document.getElementById('att').value),
     U   : parseFloat(document.getElementById('iou').value),
-    c_flat  : parseFloat(document.getElementById('c_flat').value),
-    c_perbs : parseFloat(document.getElementById('c_perbs').value),
-    t_topk  : parseFloat(document.getElementById('t_topk').value),
+    c_sh_flat  : parseFloat(document.getElementById('c_sh_flat').value),
+    c_sh_perbs : parseFloat(document.getElementById('c_sh_perbs').value),
+    c_un_flat  : parseFloat(document.getElementById('c_un_flat').value),
+    c_un_perbs : parseFloat(document.getElementById('c_un_perbs').value),
+    t_topk     : parseFloat(document.getElementById('t_topk').value),
   };
 }
 
@@ -298,22 +302,50 @@ function evaluate(sl, bsc, p) {
     kv_io = ssd_ms(kv_bytes, kv_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR, p.IOPS_ON);
   }
 
-  // Compute (per layer) — linear-in-bs model
-  // Calibrated from analytical_layer.py for FP8 + MLA absorption + TP=2:
-  //   cmp_layer = c_flat + c_per_bs * bs   (~3% accurate over BS=1..24)
-  const cmp_base = p.c_flat + p.c_perbs * bs;
+  // Compute (per layer) — linear-in-bs, TP-aware
+  //   cmp = (sh_flat + sh_perbs * bs) / TP + un_flat + un_perbs * bs
+  // Shardable parts shrink with TP, unsharded (expert GEMM + EP comms) do not.
+  const cmp_base = (p.c_sh_flat + p.c_sh_perbs * bs) / p.TP
+                 + p.c_un_flat + p.c_un_perbs * bs;
   const cmpF = cmp_base + p.t_topk;
   const cmpS = cmp_base;
 
-  // Layer time
-  const F_layer = Math.max(idx_io + kv_io, cmpF);
-  const S_layer = Math.max(kv_io, cmpS);
+  // Per-layer io/cmp arrays
+  const io_F = idx_io + kv_io;
+  const io_S = kv_io;
+  const ios  = [];
+  const cmps = [];
+  for (let i = 0; i < p.L; i++) {
+    const isF = (p.scheme === 'dsa') || (i % p.FP === 0);
+    ios.push (isF ? io_F : io_S);
+    cmps.push(isF ? cmpF : cmpS);
+  }
 
+  // Pipeline producer/consumer walk — same algorithm as
+  // experiments/generate_slide_figures.py:schedule_pp.
+  // Stage 0: walks layer-by-layer (compute waits for cumulative IO).
+  // Stages 1+: sums their IO (can overlap with prior stage's compute)
+  //            then adds the stage's compute serially.
+  const lps = Math.ceil(p.L / p.PP);
+  let cum_io = 0, end_comp = 0;
+  for (let i = 0; i < Math.min(lps, p.L); i++) {
+    cum_io += ios[i];
+    end_comp = Math.max(end_comp, cum_io) + cmps[i];
+  }
+  for (let s = 1; s < p.PP; s++) {
+    const start = s * lps;
+    const stop  = Math.min(p.L, (s + 1) * lps);
+    if (start >= p.L) break;
+    let stage_io = 0, stage_cmp = 0;
+    for (let i = start; i < stop; i++) { stage_io += ios[i]; stage_cmp += cmps[i]; }
+    end_comp = Math.max(end_comp, stage_io) + stage_cmp;
+  }
+  const tpot = end_comp;
+
+  // Reporting values (for the result panel rows)
+  const F_layer = Math.max(io_F, cmpF);
+  const S_layer = Math.max(io_S, cmpS);
   const avg  = (nF * F_layer + nS * S_layer) / p.L;
-  // TPOT = L × avg  (no PP division).
-  // Each token must traverse all PP stages sequentially — PP reduces
-  // memory per rank but does NOT hide per-token latency.
-  const tpot = p.L * avg;
   const tps  = (bsc * 1000) / tpot;
 
   // Sustained per-GPU rates over the whole token window
