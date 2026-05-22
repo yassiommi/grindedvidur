@@ -140,10 +140,17 @@
         </select>
       </label>
       <label><span class="lbl">HBM bandwidth (GB/s)</span><input id="hbmbw" type="number" step="1" value="1384"></label>
+      <label><span class="lbl">NVLink BW per GPU (GB/s)</span><input id="nvbw" type="number" step="10" value="450"></label>
       <label><span class="lbl">KV residence</span>
         <select id="kvres">
           <option value="hbm" selected>HBM (on-die — MLA latent default)</option>
           <option value="ssd">SSD (NVMe — full-KV offload)</option>
+        </select>
+      </label>
+      <label><span class="lbl">KV sharing within PP stage</span>
+        <select id="kvshard">
+          <option value="off" selected>Off — each GPU loads full KV (MLA duplication tax)</option>
+          <option value="on">On — shard 1/G per GPU + (G-1)/G via NVLink</option>
         </select>
       </label>
       <label><span class="lbl">HBM floor (ms)</span><input id="hbmfloor" type="number" step="0.001" value="0.015"></label>
@@ -185,13 +192,13 @@
 
   <div class="panel">
     <h2>Results</h2>
-    <div class="row"><span class="k">Per-attn-rank BS = BS_cluster / (EP / TP)</span><span class="v" id="bs">—</span></div>
+    <div class="row"><span class="k big">BS (cluster batch size)</span><span class="v big" id="bs">—</span></div>
     <div class="row"><span class="k">F layers / S layers / total / layers per stage</span><span class="v" id="fscount">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">idx_io (F only) = hbm_ms(BS × sl × idx_bpt)</span><span class="v" id="idxio">—</span></div>
-    <div class="row"><span class="k">kv_bytes / layer / GPU = BS × A × kv_bpt</span><span class="v" id="kvbytes">—</span></div>
-    <div class="row"><span class="k">kv_iops / layer / GPU = BS × A × ⌈kv_bpt / U⌉</span><span class="v" id="kviops">—</span></div>
-    <div class="row"><span class="k">kv_io = max(bytes/BW, iops/IOPS, floor)</span><span class="v" id="kvio">—</span></div>
+    <div class="row"><span class="k">kv_bytes / layer (per stage, total) = BS × A × kv_bpt</span><span class="v" id="kvbytes">—</span></div>
+    <div class="row"><span class="k">kv_iops / layer (per stage, total) = BS × A × ⌈kv_bpt / U⌉</span><span class="v" id="kviops">—</span></div>
+    <div class="row"><span class="k">kv_io / GPU = max(local SSD/HBM load, NVLink fetch)</span><span class="v" id="kvio">—</span></div>
 
     <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">compute_F  = (sh_flat + sh·BS)/TP + un_flat + un·BS + topk</span><span class="v" id="cmpF">—</span></div>
     <div class="row"><span class="k">compute_S  = (sh_flat + sh·BS)/TP + un_flat + un·BS</span><span class="v" id="cmpS">—</span></div>
@@ -202,8 +209,9 @@
     <div class="row"><span class="k big">TPOT (per output token, across PP stages)</span><span class="v big" id="tpot_out">—</span></div>
     <div class="row"><span class="k">Throughput (tok/s/cluster)  =  BS_cluster · 1000 / TPOT</span><span class="v" id="tps">—</span></div>
 
-    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k">SSD BW used per GPU (sustained)</span><span class="v" id="ssd_bw_used">—</span></div>
-    <div class="row"><span class="k">SSD IOPS used per GPU (sustained)</span><span class="v" id="ssd_iops_used">—</span></div>
+    <div class="row" style="border-top: 1px solid var(--border); margin-top: 8px; padding-top: 10px;"><span class="k big">SSD BW used per GPU (sustained)</span><span class="v big" id="ssd_bw_used">—</span></div>
+    <div class="row"><span class="k big">SSD IOPS used per GPU (sustained)</span><span class="v big" id="ssd_iops_used">—</span></div>
+    <div class="row"><span class="k">NVLink BW used per GPU (sustained, receive)</span><span class="v" id="nv_bw_used">—</span></div>
     <div class="row"><span class="k">HBM BW used per GPU on F layers</span><span class="v" id="hbm_bw_used">—</span></div>
     <div class="row"><span class="k">Bottleneck</span><span class="v" id="bottleneck">—</span></div>
   </div>
@@ -257,8 +265,10 @@ function readInputs() {
     SSD_IOPS : parseFloat(document.getElementById('ssdiops').value),
     IOPS_ON  : document.getElementById('iopsmode').value === 'on',
     HBM_BW   : parseFloat(document.getElementById('hbmbw').value),
+    NV_BW    : parseFloat(document.getElementById('nvbw').value),
     HBM_FLOOR: parseFloat(document.getElementById('hbmfloor').value),
     SSD_FLOOR: parseFloat(document.getElementById('ssdfloor').value),
+    KV_SHARD : document.getElementById('kvshard').value === 'on',
     PP : parseInt(document.getElementById('pp').value, 10),
     TP : parseInt(document.getElementById('tp').value, 10),
     EP : parseInt(document.getElementById('ep').value, 10),
@@ -295,12 +305,26 @@ function evaluate(sl, bsc, p) {
 
   const kv_bytes  = bs * p.A * p.KVB;
   const kv_iops   = bs * p.A * Math.ceil(p.KVB / p.U);
-  let kv_io;
+
+  // KV sharding: G = GPUs per PP stage = world_size / PP. With PP × EP × TP
+  // counted as world, and EP spanning a stage, G ≈ EP (TP and DP_attn nested
+  // within). Each GPU loads kv_bytes/G locally and receives (G-1)/G via NVLink.
+  const G          = p.EP;
+  const local_frac = p.KV_SHARD ? (1 / G)         : 1;
+  const remote_frac= p.KV_SHARD ? ((G - 1) / G)   : 0;
+  const local_bytes  = kv_bytes * local_frac;
+  const local_iops   = kv_iops  * local_frac;
+  const remote_bytes = kv_bytes * remote_frac;
+
+  let kv_io_local;
   if (p.kvres === 'hbm') {
-    kv_io = hbm_ms(kv_bytes, p.HBM_BW, p.HBM_FLOOR);
+    kv_io_local = hbm_ms(local_bytes, p.HBM_BW, p.HBM_FLOOR);
   } else {
-    kv_io = ssd_ms(kv_bytes, kv_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR, p.IOPS_ON);
+    kv_io_local = ssd_ms(local_bytes, local_iops, p.SSD_BW, p.SSD_IOPS, p.SSD_FLOOR, p.IOPS_ON);
   }
+  const kv_io_nvlink = (remote_bytes > 0) ? hbm_ms(remote_bytes, p.NV_BW, p.HBM_FLOOR) : 0;
+  // Local IO and NVLink fetch run on different buses; effective kv_io is the max.
+  const kv_io = Math.max(kv_io_local, kv_io_nvlink);
 
   // Compute (per layer) — linear-in-bs, TP-aware
   //   cmp = (sh_flat + sh_perbs * bs) / TP + un_flat + un_perbs * bs
@@ -349,22 +373,28 @@ function evaluate(sl, bsc, p) {
   const tps  = (bsc * 1000) / tpot;
 
   // Sustained per-GPU rates over the whole token window
-  const ssd_bytes_per_tok = p.L * kv_bytes;          // all layers fetch KV
-  const ssd_iops_per_tok  = p.L * kv_iops;
+  // With sharding: each GPU pays local_frac of SSD traffic and remote_frac on NVLink.
+  const ssd_bytes_per_tok = p.L * local_bytes;       // local SSD/HBM load per GPU
+  const ssd_iops_per_tok  = p.L * local_iops;
+  const nv_bytes_per_tok  = p.L * remote_bytes;      // NVLink receive per GPU
   const hbm_bytes_F_tok   = nF * idx_bytes;
 
   const ssd_bw_used   = (ssd_bytes_per_tok / GB) / (tpot / 1000);   // GB/s
   const ssd_iops_used = ssd_iops_per_tok / (tpot / 1000);           // IOPS
-  const hbm_bw_used   = (hbm_bytes_F_tok / GB) / (tpot / 1000);
+  const nv_bw_used    = (nv_bytes_per_tok  / GB) / (tpot / 1000);
+  const hbm_bw_used   = (hbm_bytes_F_tok   / GB) / (tpot / 1000);
 
   // Bottleneck
   let bn;
   if (p.kvres === 'ssd') {
-    const t_bw   = kv_bytes / (p.SSD_BW * GB) * 1000;
-    const t_iops = p.IOPS_ON ? (kv_iops / p.SSD_IOPS) * 1000 : 0;
-    if (Math.max(t_bw, t_iops) < cmpS) bn = 'compute (S-layer)';
-    else if (t_iops > t_bw)            bn = 'SSD IOPS';
-    else                               bn = 'SSD BW';
+    const t_bw   = local_bytes / (p.SSD_BW * GB) * 1000;
+    const t_iops = p.IOPS_ON ? (local_iops / p.SSD_IOPS) * 1000 : 0;
+    const t_nv   = (remote_bytes > 0) ? (remote_bytes / (p.NV_BW * GB) * 1000) : 0;
+    const t_io   = Math.max(t_bw, t_iops, t_nv);
+    if (t_io < cmpS)                bn = 'compute (S-layer)';
+    else if (t_nv >= Math.max(t_bw,t_iops)) bn = 'NVLink';
+    else if (t_iops > t_bw)         bn = 'SSD IOPS';
+    else                            bn = 'SSD BW';
   } else {
     bn = (idx_io + kv_io > cmpF) ? 'HBM BW' : 'compute';
   }
@@ -375,8 +405,9 @@ function evaluate(sl, bsc, p) {
     kv_bytes, kv_iops, kv_io,
     cmpF, cmpS, F_layer, S_layer,
     avg, tpot, tps,
-    ssd_bw_used, ssd_iops_used, hbm_bw_used,
+    ssd_bw_used, ssd_iops_used, nv_bw_used, hbm_bw_used,
     bottleneck: bn,
+    G, local_bytes, remote_bytes,
   };
 }
 
@@ -420,7 +451,7 @@ function compute() {
     document.getElementById('bs').textContent      = `infeasible — TPOT target ${p.tpot} ms unreachable at the smallest workload`;
     document.getElementById('fscount').textContent = '—';
     ['idxio','kvbytes','kviops','kvio','cmpF','cmpS','Flayer','Slayer','avg','tpot_out','tps',
-     'ssd_bw_used','ssd_iops_used','hbm_bw_used','bottleneck'].forEach(id => {
+     'ssd_bw_used','ssd_iops_used','nv_bw_used','hbm_bw_used','bottleneck'].forEach(id => {
        const el = document.getElementById(id);
        el.textContent = '—';
        el.className = 'v';
@@ -430,7 +461,7 @@ function compute() {
 
   const r = evaluate(sl, bsc, p);
 
-  document.getElementById('bs').textContent      = `${r.bs}  (BS_cluster=${fmt(bsc,1)}, DP_attn=${p.EP/p.TP}, sl=${(sl/1024).toFixed(0)}K)`;
+  document.getElementById('bs').textContent      = `${Math.floor(bsc)}   (sl=${(sl/1024).toFixed(0)}K, per-rank bs=${r.bs}, DP_attn=${p.EP/p.TP})`;
   document.getElementById('fscount').textContent = `${r.nF} F / ${r.nS} S / L=${p.L} / lps=${r.lps}`;
 
   document.getElementById('idxio').textContent  = `${fmt(r.idx_io)} ms   (${fmtBytes(r.idx_bytes)})`;
@@ -464,6 +495,16 @@ function compute() {
   const e3 = document.getElementById('hbm_bw_used');
   e3.textContent = `${fmt(r.hbm_bw_used, 1)} GB/s  (${hbm_bw_pct.toFixed(0)}% of ${p.HBM_BW} GB/s)`;
   e3.className = 'v ' + cls(hbm_bw_pct);
+
+  const nv_bw_pct = (r.nv_bw_used / p.NV_BW * 100);
+  const e4 = document.getElementById('nv_bw_used');
+  if (r.nv_bw_used > 0) {
+    e4.textContent = `${fmt(r.nv_bw_used, 1)} GB/s  (${nv_bw_pct.toFixed(0)}% of ${p.NV_BW} GB/s)`;
+    e4.className = 'v ' + cls(nv_bw_pct);
+  } else {
+    e4.textContent = '— (KV sharing off)';
+    e4.className = 'v';
+  }
 
   document.getElementById('bottleneck').textContent = r.bottleneck;
 }
