@@ -452,7 +452,7 @@ function compute() {
   document.getElementById('sl_wrap').style.display   = (p.mode === 'max_sl')  ? 'none' : '';
   document.getElementById('bsc_wrap').style.display  = (p.mode === 'max_bs')  ? 'none' : '';
   document.getElementById('tpot_wrap').style.display = (p.mode === 'forward') ? 'none' : '';
-  document.getElementById('kvmerge_wrap').style.display = p.KV_SHARD ? '' : 'none';
+  document.getElementById('kvmerge_wrap').style.display = (p.KV_SHARD && p.kvres === 'ssd') ? '' : 'none';
 
   let infeasible = false;
   if (p.mode === 'max_bs') {
