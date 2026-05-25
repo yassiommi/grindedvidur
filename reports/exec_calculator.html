@@ -161,7 +161,14 @@
           <option value="on">On — shard 1/G per GPU + (G-1)/G via NVLink</option>
         </select>
       </label>
+      <label id="kvmerge_wrap"><span class="lbl">Local shard I/O (when sharing on)</span>
+        <select id="kvmerge">
+          <option value="off" selected>Per-token I/Os — IOPS-counted (no merge)</option>
+          <option value="on">Merge all I/O units — bandwidth-bound (IOPS → 0)</option>
+        </select>
+      </label>
     </div>
+    <div class="note">When sharing is on and KV lives on SSD, the local shard can be read either as scattered per-token I/Os (each 512 B unit counts against the IOPS cap) or coalesced into large sequential transfers — merging collapses IOPS to ~1 read/layer so the cost becomes pure bandwidth. Merging is optimistic: top-k positions are scattered, so true coalescing implies reading the shard sequentially (possible over-read) rather than gathering exact tokens.</div>
   </div>
 
   <div class="panel">
@@ -276,6 +283,7 @@ function readInputs() {
     HBM_FLOOR: parseFloat(document.getElementById('hbmfloor').value),
     SSD_FLOOR: parseFloat(document.getElementById('ssdfloor').value),
     KV_SHARD : document.getElementById('kvshard').value === 'on',
+    KV_MERGE : document.getElementById('kvmerge').value === 'on',
     PP : parseInt(document.getElementById('pp').value, 10),
     TP : parseInt(document.getElementById('tp').value, 10),
     EP : parseInt(document.getElementById('ep').value, 10),
@@ -319,8 +327,11 @@ function evaluate(sl, bsc, p) {
   const G          = p.EP;
   const local_frac = p.KV_SHARD ? (1 / G)         : 1;
   const remote_frac= p.KV_SHARD ? ((G - 1) / G)   : 0;
+  const merge_io   = p.KV_SHARD && p.KV_MERGE;     // coalesce local shard into sequential reads
   const local_bytes  = kv_bytes * local_frac;
-  const local_iops   = kv_iops  * local_frac;
+  // Merged: local shard reads as one contiguous transfer/layer → IOPS collapses to ~1, so the
+  // cost goes bandwidth-bound. Unmerged: per-token scattered I/Os, each 512 B unit IOPS-counted.
+  const local_iops   = merge_io ? 1 : kv_iops * local_frac;
   const remote_bytes = kv_bytes * remote_frac;
 
   let kv_io_local;
@@ -439,6 +450,7 @@ function compute() {
   document.getElementById('sl_wrap').style.display   = (p.mode === 'max_sl')  ? 'none' : '';
   document.getElementById('bsc_wrap').style.display  = (p.mode === 'max_bs')  ? 'none' : '';
   document.getElementById('tpot_wrap').style.display = (p.mode === 'forward') ? 'none' : '';
+  document.getElementById('kvmerge_wrap').style.display = p.KV_SHARD ? '' : 'none';
 
   let infeasible = false;
   if (p.mode === 'max_bs') {
