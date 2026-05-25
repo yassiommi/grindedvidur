@@ -226,7 +226,7 @@
     <div class="row"><span class="k big">SSD IOPS used per GPU (sustained)</span><span class="v big" id="ssd_iops_used">—</span></div>
     <div class="row"><span class="k">NVLink BW used per GPU (sustained, KV gather)</span><span class="v" id="nv_bw_used">—</span></div>
     <div class="row"><span class="k">NVLink time per token / GPU = KV gather + MoE EP-comms</span><span class="v" id="nv_time_used">—</span></div>
-    <div class="row"><span class="k">HBM BW used per GPU on F layers</span><span class="v" id="hbm_bw_used">—</span></div>
+    <div class="row"><span class="k">HBM BW used per GPU (idx-K on F + KV when in HBM)</span><span class="v" id="hbm_bw_used">—</span></div>
     <div class="row"><span class="k">Bottleneck</span><span class="v" id="bottleneck">—</span></div>
   </div>
 
@@ -392,15 +392,17 @@ function evaluate(sl, bsc, p) {
 
   // Sustained per-GPU rates over the whole token window
   // With sharding: each GPU pays local_frac of SSD traffic and remote_frac on NVLink.
-  const ssd_bytes_per_tok = p.L * local_bytes;       // local SSD/HBM load per GPU
-  const ssd_iops_per_tok  = p.L * local_iops;
+  const ssd_bytes_per_tok = (p.kvres === 'ssd') ? p.L * local_bytes : 0;  // SSD only when KV on SSD
+  const ssd_iops_per_tok  = (p.kvres === 'ssd') ? p.L * local_iops  : 0;
   const nv_bytes_per_tok  = p.L * remote_bytes;      // NVLink receive per GPU
-  const hbm_bytes_F_tok   = nF * idx_bytes;
+  // HBM reads: indexer-K on F layers (always in HBM), plus local KV every layer when KV is in HBM.
+  const hbm_kv_bytes_tok  = (p.kvres === 'hbm') ? p.L * local_bytes : 0;
+  const hbm_bytes_tok     = nF * idx_bytes + hbm_kv_bytes_tok;
 
   const ssd_bw_used   = (ssd_bytes_per_tok / GB) / (tpot / 1000);   // GB/s
   const ssd_iops_used = ssd_iops_per_tok / (tpot / 1000);           // IOPS
   const nv_bw_used    = (nv_bytes_per_tok  / GB) / (tpot / 1000);
-  const hbm_bw_used   = (hbm_bytes_F_tok   / GB) / (tpot / 1000);
+  const hbm_bw_used   = (hbm_bytes_tok   / GB) / (tpot / 1000);
 
   // Bottleneck
   let bn;
@@ -504,12 +506,18 @@ function compute() {
   const cls = (pct) => pct < 70 ? 'ok' : (pct < 95 ? 'warn' : 'bad');
 
   const e1 = document.getElementById('ssd_bw_used');
-  e1.textContent = `${fmt(r.ssd_bw_used, 2)} GB/s  (${ssd_bw_pct.toFixed(0)}% of ${p.SSD_BW} GB/s)`;
-  e1.className = 'v ' + cls(ssd_bw_pct);
-
   const e2 = document.getElementById('ssd_iops_used');
-  e2.textContent = `${fmtCount(r.ssd_iops_used)}/s  (${ssd_iops_pct.toFixed(0)}% of ${fmtCount(p.SSD_IOPS)}/s)`;
-  e2.className = 'v ' + cls(ssd_iops_pct);
+  if (p.kvres === 'ssd') {
+    e1.textContent = `${fmt(r.ssd_bw_used, 2)} GB/s  (${ssd_bw_pct.toFixed(0)}% of ${p.SSD_BW} GB/s)`;
+    e1.className = 'v ' + cls(ssd_bw_pct);
+    e2.textContent = `${fmtCount(r.ssd_iops_used)}/s  (${ssd_iops_pct.toFixed(0)}% of ${fmtCount(p.SSD_IOPS)}/s)`;
+    e2.className = 'v ' + cls(ssd_iops_pct);
+  } else {
+    e1.textContent = '— (KV in HBM — no SSD traffic)';
+    e1.className = 'v';
+    e2.textContent = '— (KV in HBM — HBM has no IOPS)';
+    e2.className = 'v';
+  }
 
   const e3 = document.getElementById('hbm_bw_used');
   e3.textContent = `${fmt(r.hbm_bw_used, 1)} GB/s  (${hbm_bw_pct.toFixed(0)}% of ${p.HBM_BW} GB/s)`;
