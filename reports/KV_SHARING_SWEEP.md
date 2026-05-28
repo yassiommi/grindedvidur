@@ -40,9 +40,17 @@
 - **SSD, no sharing**: collapses to 0 (even BS=1 misses target) past 1M sl.
 - All others tied at **BS_cluster ≈ 24** — this is the **compute ceiling** (MoE GEMM at BS=6/rank), not a KV-IO limit. The KV-IO differences don't show up in the max-BS metric at this TPOT target.
 
-## Headline
+### `must_merge_frontier.png` — Where merging becomes mandatory
+- **Green zone** (below the yellow line): safe — unmerged scattered I/Os meet target.
+- **Yellow zone** (between unmerged and merged ceilings): **must-merge** — unmerged SSD misses target, merging is the only way to stay in budget without HBM.
+- **Red zone** (above merged ceiling): even merged SSD fails — need to fall back to HBM.
+- Concretely: at sl ≤ 768K the must-merge zone is **BS=24–27**; at sl = 1M it widens to **BS=20–27**; past 2M, merging buys you ~4 BS over unmerged but both fall behind HBM.
 
-**Even SSD is not enough at scale.** With no sharing, IOPS is at 170 % of cap before you even start — the config is broken from sl=128K. With sharing alone, you reach ~100 % IOPS at ~24 batch — right at the cliff. Only **merging the per-token I/Os into sequential transfers** unblocks IOPS, after which **the SSD BW (28 GB/s) becomes the next ceiling** and diverges from HBM (1384 GB/s) past sl≈2M / BS≈64.
+## Headlines
+
+1. **Even SSD is not enough at scale.** With no sharing, IOPS is at 170 % of cap before you even start — the config is broken from sl=128K. With sharing alone, you reach ~100 % IOPS at ~24 batch — right at the cliff. Only **merging the per-token I/Os into sequential transfers** unblocks IOPS, after which **the SSD BW (28 GB/s) becomes the next ceiling** and diverges from HBM (1384 GB/s) past sl≈2M / BS≈64.
+
+2. **There is a specific serving regime where you have no choice but to merge.** Once BS_cluster crosses ~24 (at sl ≤ 768K) or ~20 (at sl ≥ 1M), unmerged sharded SSD misses the 30 ms target while merged still makes it. That's the must-merge zone in `must_merge_frontier.png` — yellow band. Below it, scattered per-token I/Os are fine; inside it, merging is mandatory; above it, even merging falls short and only HBM keeps up.
 
 The compute ceiling (MoE expert GEMM, unsharded across TP) caps useful BS at ≈24 for every config that gets that far — so the KV-IO win shows in *how late you hit the wall*, not the wall height itself.
 

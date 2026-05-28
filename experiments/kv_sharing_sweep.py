@@ -355,6 +355,68 @@ def plot_max_bs_at_tpot(hw: HW, tpot_target=30.0):
     return out
 
 
+def plot_must_merge_frontier(hw: HW, tpot_target=30.0):
+    """At what (sl, BS) point are you forced to merge the I/Os to stay
+    within the TPOT target? Plots, for each sl, the BS_cluster at which
+    ssd_shard (unmerged) crosses the TPOT target vs. ssd_shard_merge."""
+    sls = [128 * 1024, 200 * 1024, 256 * 1024, 384 * 1024,
+           512 * 1024, 768 * 1024, 1024 * 1024,
+           2 * 1024 * 1024, 4 * 1024 * 1024]
+
+    def crossover_bs(sl, cfg):
+        # largest BS with TPOT <= target; 0 if even BS=1 fails
+        lo, hi = 1, 4096
+        if evaluate(sl, 1, cfg, hw)["tpot"] > tpot_target:
+            return 0
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if evaluate(sl, mid, cfg, hw)["tpot"] <= tpot_target:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    unmerged = [crossover_bs(sl, "ssd_shard") for sl in sls]
+    merged   = [crossover_bs(sl, "ssd_shard_merge") for sl in sls]
+    hbm_lim  = [crossover_bs(sl, "hbm_shard") for sl in sls]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    x = [s / 1024 for s in sls]
+
+    # Shaded zones
+    # Safe (no merge needed): below the unmerged ceiling
+    ax.fill_between(x, 0, unmerged, color="#3FAA5B", alpha=0.18,
+                    label="Safe — no merge needed")
+    # Must-merge: between unmerged ceiling and merged ceiling
+    ax.fill_between(x, unmerged, merged, color="#F0C03A", alpha=0.30,
+                    label="MUST merge — unmerged misses target")
+    # Beyond merge: above merged ceiling, SSD can't help (need HBM)
+    top = max(max(merged), max(hbm_lim)) * 1.3
+    ax.fill_between(x, merged, [top] * len(x), color="#C84B4B", alpha=0.18,
+                    label="Even merged SSD fails — need HBM")
+
+    ax.plot(x, unmerged, color="#F0C03A", linewidth=2.5, marker="o",
+            markersize=6, label=f"ssd_shard (unmerged) — max BS at {tpot_target:.0f} ms")
+    ax.plot(x, merged, color="#A06CD5", linewidth=2.5, marker="^",
+            markersize=6, label=f"ssd_shard_merge — max BS at {tpot_target:.0f} ms")
+    ax.plot(x, hbm_lim, color="#2EBFD9", linewidth=2.2, linestyle="--", marker="D",
+            markersize=5, label=f"hbm_shard — max BS at {tpot_target:.0f} ms")
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Sequence length (K tokens, log)")
+    ax.set_ylabel(f"Max BS_cluster within {tpot_target:.0f} ms TPOT")
+    ax.set_title(
+        f"The must-merge zone — where unmerged SSD I/O can't keep up\n"
+        f"PP={hw.PP} TP={hw.TP} EP={hw.EP}, IndexCache, KV-on-SSD sharded")
+    ax.set_ylim(0, top)
+    ax.legend(loc="upper right", fontsize=8.5, framealpha=0.95)
+    fig.tight_layout()
+    out = os.path.join(OUTDIR, "must_merge_frontier.png")
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+    return out
+
+
 def main():
     hw = HW()
     paths = [
@@ -362,6 +424,7 @@ def main():
         plot_tpot_vs_bs(hw, sl=512 * 1024),
         plot_ssd_saturation(hw, bsc=24),
         plot_max_bs_at_tpot(hw, tpot_target=30.0),
+        plot_must_merge_frontier(hw, tpot_target=30.0),
     ]
     for p in paths:
         print(f"wrote {p}")
