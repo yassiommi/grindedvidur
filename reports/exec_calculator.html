@@ -129,6 +129,31 @@
   </div>
 
   <div class="panel">
+    <h2>KV Storage & Sharing</h2>
+    <div class="grid">
+      <label><span class="lbl">KV residence</span>
+        <select id="kvres">
+          <option value="hbm" selected>HBM (on-die — MLA latent default)</option>
+          <option value="ssd">SSD (NVMe — full-KV offload)</option>
+        </select>
+      </label>
+      <label id="kvshard_wrap"><span class="lbl">KV sharing within PP stage</span>
+        <select id="kvshard">
+          <option value="off" selected>Off — each GPU loads full KV (MLA duplication tax)</option>
+          <option value="on">On — shard 1/G per GPU + (G-1)/G via NVLink</option>
+        </select>
+      </label>
+      <label id="kvmerge_wrap"><span class="lbl">Local shard I/O (when sharing on)</span>
+        <select id="kvmerge">
+          <option value="off" selected>Per-token I/Os — IOPS-counted (no merge)</option>
+          <option value="on">Merge all I/O units — bandwidth-bound (IOPS → 0)</option>
+        </select>
+      </label>
+    </div>
+    <div class="note">When sharing is on and KV lives on SSD, the local shard can be read either as scattered per-token I/Os (each 512 B unit counts against the IOPS cap) or coalesced into large sequential transfers — merging collapses IOPS to ~1 read/layer so the cost becomes pure bandwidth. Merging is optimistic: top-k positions are scattered, so true coalescing implies reading the shard sequentially (possible over-read) rather than gathering exact tokens.</div>
+  </div>
+
+  <div class="panel">
     <h2>Hardware</h2>
     <div class="grid">
       <label><span class="lbl">SSD bandwidth (GB/s)</span><input id="ssdbw" type="number" step="0.5" value="28"></label>
@@ -144,31 +169,6 @@
       <label><span class="lbl">HBM floor (ms)</span><input id="hbmfloor" type="number" step="0.001" value="0.015"></label>
       <label><span class="lbl">SSD floor (ms)</span><input id="ssdfloor" type="number" step="0.001" value="0.050"></label>
     </div>
-  </div>
-
-  <div class="panel">
-    <h2>KV Storage & Sharing</h2>
-    <div class="grid">
-      <label><span class="lbl">KV residence</span>
-        <select id="kvres">
-          <option value="hbm" selected>HBM (on-die — MLA latent default)</option>
-          <option value="ssd">SSD (NVMe — full-KV offload)</option>
-        </select>
-      </label>
-      <label><span class="lbl">KV sharing within PP stage</span>
-        <select id="kvshard">
-          <option value="off" selected>Off — each GPU loads full KV (MLA duplication tax)</option>
-          <option value="on">On — shard 1/G per GPU + (G-1)/G via NVLink</option>
-        </select>
-      </label>
-      <label id="kvmerge_wrap"><span class="lbl">Local shard I/O (when sharing on)</span>
-        <select id="kvmerge">
-          <option value="off" selected>Per-token I/Os — IOPS-counted (no merge)</option>
-          <option value="on">Merge all I/O units — bandwidth-bound (IOPS → 0)</option>
-        </select>
-      </label>
-    </div>
-    <div class="note">When sharing is on and KV lives on SSD, the local shard can be read either as scattered per-token I/Os (each 512 B unit counts against the IOPS cap) or coalesced into large sequential transfers — merging collapses IOPS to ~1 read/layer so the cost becomes pure bandwidth. Merging is optimistic: top-k positions are scattered, so true coalescing implies reading the shard sequentially (possible over-read) rather than gathering exact tokens.</div>
   </div>
 
   <div class="panel">
@@ -282,7 +282,8 @@ function readInputs() {
     NV_BW    : parseFloat(document.getElementById('nvbw').value),
     HBM_FLOOR: parseFloat(document.getElementById('hbmfloor').value),
     SSD_FLOOR: parseFloat(document.getElementById('ssdfloor').value),
-    KV_SHARD : document.getElementById('kvshard').value === 'on',
+    KV_SHARD : document.getElementById('kvres').value !== 'hbm'
+            && document.getElementById('kvshard').value === 'on',
     KV_MERGE : document.getElementById('kvmerge').value === 'on',
     PP : parseInt(document.getElementById('pp').value, 10),
     TP : parseInt(document.getElementById('tp').value, 10),
@@ -452,6 +453,7 @@ function compute() {
   document.getElementById('sl_wrap').style.display   = (p.mode === 'max_sl')  ? 'none' : '';
   document.getElementById('bsc_wrap').style.display  = (p.mode === 'max_bs')  ? 'none' : '';
   document.getElementById('tpot_wrap').style.display = (p.mode === 'forward') ? 'none' : '';
+  document.getElementById('kvshard_wrap').style.display = (p.kvres === 'hbm') ? 'none' : '';
   document.getElementById('kvmerge_wrap').style.display = (p.KV_SHARD && p.kvres === 'ssd') ? '' : 'none';
 
   let infeasible = false;
