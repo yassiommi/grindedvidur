@@ -5,7 +5,6 @@ hits a wall and where HBM + sharing becomes the only viable path.
 
 Configs:
   hbm_full        — KV in HBM, no sharing (each GPU duplicates full KV)
-  hbm_shard       — KV in HBM, sharded across PP stage (1/G local + NVLink fetch)
   ssd_full        — KV on SSD, no sharing, per-token IOPS-counted
   ssd_shard       — KV on SSD, sharded, per-token IOPS-counted
   ssd_shard_merge — KV on SSD, sharded, IO units merged (BW-bound)
@@ -75,7 +74,6 @@ def ssd_ms(bytes_, iops_count, hw: HW):
 CONFIGS = {
     # (kvres, kvshard, kvmerge)
     "hbm_full":         ("hbm", False, False),
-    "hbm_shard":        ("hbm", True,  False),
     "ssd_full":         ("ssd", False, False),
     "ssd_shard":        ("ssd", True,  False),
     "ssd_shard_merge":  ("ssd", True,  True),
@@ -83,7 +81,6 @@ CONFIGS = {
 
 CONFIG_LABELS = {
     "hbm_full":        "HBM, no sharing",
-    "hbm_shard":       "HBM, sharded (NVLink fetch)",
     "ssd_full":        "SSD, no sharing",
     "ssd_shard":       "SSD, sharded (IOPS-counted)",
     "ssd_shard_merge": "SSD, sharded + merged (BW-bound)",
@@ -91,7 +88,6 @@ CONFIG_LABELS = {
 
 CONFIG_COLORS = {
     "hbm_full":        "#3FAA5B",  # green
-    "hbm_shard":       "#2EBFD9",  # cyan
     "ssd_full":        "#C84B4B",  # red
     "ssd_shard":       "#F0C03A",  # yellow
     "ssd_shard_merge": "#A06CD5",  # purple
@@ -100,7 +96,6 @@ CONFIG_COLORS = {
 CONFIG_STYLES = {
     # (linestyle, linewidth, marker)
     "hbm_full":        ("--", 2.2, "s"),
-    "hbm_shard":       ("--", 2.2, "D"),
     "ssd_full":        ("-",  2.4, "o"),
     "ssd_shard":       ("-",  2.0, "o"),
     "ssd_shard_merge": ("-",  2.0, "^"),
@@ -378,7 +373,6 @@ def plot_must_merge_frontier(hw: HW, tpot_target=30.0):
 
     unmerged = [crossover_bs(sl, "ssd_shard") for sl in sls]
     merged   = [crossover_bs(sl, "ssd_shard_merge") for sl in sls]
-    hbm_lim  = [crossover_bs(sl, "hbm_shard") for sl in sls]
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
     x = [s / 1024 for s in sls]
@@ -386,21 +380,19 @@ def plot_must_merge_frontier(hw: HW, tpot_target=30.0):
     # Shaded zones
     # Safe (no merge needed): below the unmerged ceiling
     ax.fill_between(x, 0, unmerged, color="#3FAA5B", alpha=0.18,
-                    label="Safe — no merge needed")
+                    label="Safe — scattered per-token I/Os meet target")
     # Must-merge: between unmerged ceiling and merged ceiling
     ax.fill_between(x, unmerged, merged, color="#F0C03A", alpha=0.30,
-                    label="MUST merge — unmerged misses target")
-    # Beyond merge: above merged ceiling, SSD can't help (need HBM)
-    top = max(max(merged), max(hbm_lim)) * 1.3
+                    label="MUST merge — unmerged misses target, merging saves you")
+    # Beyond merge: even merged SSD misses target at this BS
+    top = max(merged) * 1.3
     ax.fill_between(x, merged, [top] * len(x), color="#C84B4B", alpha=0.18,
-                    label="Even merged SSD fails — need HBM")
+                    label="Even merged SSD misses target — reduce BS, scale cluster, or move KV off SSD")
 
     ax.plot(x, unmerged, color="#F0C03A", linewidth=2.5, marker="o",
-            markersize=6, label=f"ssd_shard (unmerged) — max BS at {tpot_target:.0f} ms")
+            markersize=6, label=f"ssd_shard (unmerged) ceiling at {tpot_target:.0f} ms")
     ax.plot(x, merged, color="#A06CD5", linewidth=2.5, marker="^",
-            markersize=6, label=f"ssd_shard_merge — max BS at {tpot_target:.0f} ms")
-    ax.plot(x, hbm_lim, color="#2EBFD9", linewidth=2.2, linestyle="--", marker="D",
-            markersize=5, label=f"hbm_shard — max BS at {tpot_target:.0f} ms")
+            markersize=6, label=f"ssd_shard_merge ceiling at {tpot_target:.0f} ms")
 
     ax.set_xscale("log")
     ax.set_xlabel("Sequence length (K tokens, log)")

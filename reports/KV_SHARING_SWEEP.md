@@ -10,11 +10,10 @@
 
 | key | KV residence | Within-stage sharing | Local I/O mode |
 |---|---|---|---|
-| `hbm_full` | HBM | off (duplicates) | n/a |
-| `hbm_shard` | HBM | on (1/G local + (G-1)/G via NVLink) | n/a |
+| `hbm_full` | HBM | off | n/a |
 | `ssd_full` | SSD | off | per-token IOPS-counted |
-| `ssd_shard` | SSD | on | per-token IOPS-counted |
-| `ssd_shard_merge` | SSD | on | merged → bandwidth-bound |
+| `ssd_shard` | SSD | on (1/G local + (G-1)/G via NVLink) | per-token IOPS-counted |
+| `ssd_shard_merge` | SSD | on (1/G local + (G-1)/G via NVLink) | merged → bandwidth-bound |
 
 `G = EP = 8` GPUs per PP stage.
 
@@ -23,12 +22,12 @@
 ### `tpot_vs_sl.png` — TPOT vs sequence length at BS_cluster=24
 - **SSD, no sharing** (red): pinned at ~170 ms regardless of sl — IOPS saturated even at small sl.
 - **SSD, sharded IOPS-counted** (yellow): walks above the 30 ms target at sl≈1M; collapses fast past that.
-- **SSD, sharded + merged** (purple) and **both HBM** (green/cyan): tied until ~2M where SSD-merged starts to drift above HBM (SSD BW becomes binding).
+- **SSD, sharded + merged** (purple) and **HBM** (green): tied until ~2M where SSD-merged starts to drift above HBM (SSD BW becomes binding).
 
 ### `tpot_vs_bs.png` — TPOT vs BS_cluster at sl=512K
 - **SSD, no sharing**: misses 30 ms target even at BS=4. Useless.
 - **SSD, sharded IOPS-counted**: hits target at BS≈22, climbs IOPS-bound thereafter.
-- **SSD, sharded + merged** and both HBM lines: track each other up to BS≈24 (compute-bound regime — MoE GEMM is the floor for all of them), merged diverges slowly past BS=64.
+- **SSD, sharded + merged** and **HBM**: track each other up to BS≈24 (compute-bound regime — MoE GEMM is the floor for both), merged diverges slowly past BS=64.
 
 ### `ssd_saturation.png` — Where SSD runs out (BW and IOPS utilization)
 - **SSD, no sharing**: **~170 % of IOPS cap** — fundamentally infeasible.
@@ -42,13 +41,13 @@
 
 ### `must_merge_frontier.png` — Where merging becomes mandatory
 - **Green zone** (below the yellow line): safe — unmerged scattered I/Os meet target.
-- **Yellow zone** (between unmerged and merged ceilings): **must-merge** — unmerged SSD misses target, merging is the only way to stay in budget without HBM.
-- **Red zone** (above merged ceiling): even merged SSD fails — need to fall back to HBM.
-- Concretely: at sl ≤ 768K the must-merge zone is **BS=24–27**; at sl = 1M it widens to **BS=20–27**; past 2M, merging buys you ~4 BS over unmerged but both fall behind HBM.
+- **Yellow zone** (between unmerged and merged ceilings): **must-merge** — unmerged sharded SSD misses target, merging is the only way to stay in budget on the same SSD hardware.
+- **Red zone** (above merged ceiling): even merged sharded SSD misses target — to serve here you'd have to reduce BS, scale up the cluster, or move KV off SSD (faster SSD, more drives, or HBM).
+- Concretely: at sl ≤ 768K the must-merge band is **BS=24–27**; at sl = 1M it widens to **BS=20–27**; past 2M, merging still buys you ~4 BS over unmerged but the merged ceiling itself starts dropping (SSD BW becomes binding).
 
 ## Headlines
 
-1. **Even SSD is not enough at scale.** With no sharing, IOPS is at 170 % of cap before you even start — the config is broken from sl=128K. With sharing alone, you reach ~100 % IOPS at ~24 batch — right at the cliff. Only **merging the per-token I/Os into sequential transfers** unblocks IOPS, after which **the SSD BW (28 GB/s) becomes the next ceiling** and diverges from HBM (1384 GB/s) past sl≈2M / BS≈64.
+1. **Even SSD is not enough at scale.** With no sharing, IOPS is at 170 % of cap before you even start — the config is broken from sl=128K. With sharing alone, you reach ~100 % IOPS at ~24 batch — right at the cliff. Only **merging the per-token I/Os into sequential transfers** unblocks IOPS, after which **the SSD BW (28 GB/s) becomes the next ceiling** and starts to fall behind HBM (1384 GB/s) past sl≈2M / BS≈64.
 
 2. **There is a specific serving regime where you have no choice but to merge.** Once BS_cluster crosses ~24 (at sl ≤ 768K) or ~20 (at sl ≥ 1M), unmerged sharded SSD misses the 30 ms target while merged still makes it. That's the must-merge zone in `must_merge_frontier.png` — yellow band. Below it, scattered per-token I/Os are fine; inside it, merging is mandatory; above it, even merging falls short and only HBM keeps up.
 
